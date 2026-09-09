@@ -1,0 +1,35 @@
+[package]
+name = "kakune-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Local-first automation runtime for Kakune"
+license = "Apache-2.0"
+repository = "https://github.com/BraveOtter/kakune-core"
+
+[[bin]]
+name = "kakune"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8.9", features = ["json"] }
+clap = { version = "4.6.6", features = ["derive"] }
+futures-util = "0.3.31"
+rusqlite = { version = "0.40.2", features = ["bundled", "chrono"] }
+saphyr = "0.0.12"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+time = { version = "0.3.55", features = ["formatting", "macros", "parsing"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+uuid = { version = "1.22.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+http-body-util = "0.1.3"
+tower = "0.5.2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
