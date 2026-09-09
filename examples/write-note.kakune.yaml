@@ -1,0 +1,14 @@
+apiVersion: kakune/v1
+kind: Workflow
+metadata:
+  name: write-note
+spec:
+  triggers:
+    manual: {}
+  steps:
+    - id: write-note
+      plugin: "@kakune/core"
+      with:
+        action: write-file
+        path: notes/hello.txt
+        content: Hello from Kakune
