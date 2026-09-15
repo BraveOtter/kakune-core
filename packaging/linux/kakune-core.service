@@ -1,0 +1,19 @@
+[Unit]
+Description=Kakune Core local automation runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/kakune daemon --data-dir %h/.local/share/kakune
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=%h/.local/share/kakune
+
+[Install]
+WantedBy=default.target
