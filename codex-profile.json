@@ -1,0 +1,13 @@
+{
+  "id": "codex-personal",
+  "displayName": "Codex Personal",
+  "providerType": "codex",
+  "defaultModel": "gpt-5.6-luna",
+  "allowedModels": ["gpt-5.6-luna"],
+  "capabilities": ["text-generation"],
+  "auth": {
+    "type": "oauthSecret",
+    "secret_ref": "provider.codex-personal.oauth"
+  },
+  "config": {}
+}

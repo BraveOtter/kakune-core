@@ -6,27 +6,77 @@ rust-version = "1.98"
 description = "Local-first automation runtime for Kakune"
 license = "Apache-2.0"
 repository = "https://github.com/BraveOtter/kakune-core"
+homepage = "https://github.com/BraveOtter/kakune-core"
+keywords = ["automation", "workflow", "local-first"]
+categories = ["command-line-utilities", "development-tools"]
+default-run = "kakune"
+include = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "LICENSE",
+  "README.md",
+  "README.es.md",
+  "rust-toolchain.toml",
+  "src/**",
+  "tests/**",
+  "examples/**",
+  "scripts/**",
+  "packaging/**",
+]
 
 [[bin]]
 name = "kakune"
 path = "src/main.rs"
 
+[[bin]]
+name = "plugin-helper"
+path = "src/bin/plugin_helper.rs"
+
+[[bin]]
+name = "mcp-helper"
+path = "src/bin/mcp_helper.rs"
+
 [dependencies]
+aes-gcm = "0.10.3"
+argon2 = "0.5.3"
 axum = { version = "0.8.9", features = ["json"] }
 clap = { version = "4.6.6", features = ["derive"] }
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
+croner = "4.0.0"
+flate2 = "1.1.5"
 futures-util = "0.3.31"
-rusqlite = { version = "0.40.2", features = ["bundled", "chrono"] }
+hyper = { version = "1.11.1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1.20", features = ["server-auto", "service", "tokio"] }
+rustls = { version = "0.23.44", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }
+jsonschema = "0.33.0"
+keyring = "4.2.0"
+notify = "8.2.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["form", "json", "rustls", "stream"] }
+rusqlite = { version = "0.40.2", features = ["backup", "bundled", "chrono"] }
 saphyr = "0.0.12"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+serde_yaml = "0.9.34"
+sha2 = "0.10.9"
+subtle = "2.6.1"
 thiserror = "2.0.20"
 time = { version = "0.3.55", features = ["formatting", "macros", "parsing"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+tar = "0.4.44"
+tokio = { version = "1.53.1", features = ["io-util", "macros", "process", "rt-multi-thread", "net", "signal", "sync", "time"] }
 uuid = { version = "1.22.0", features = ["v4", "serde"] }
+webbrowser = "1.0.6"
+zeroize = "1.8.2"
+process-wrap = { version = "10.0.0", features = ["std", "tokio1"] }
 
 [dev-dependencies]
 http-body-util = "0.1.3"
 tower = "0.5.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_System_Threading"] }
+windows-service = "0.8.1"
 
 [lints.rust]
 unsafe_code = "forbid"
