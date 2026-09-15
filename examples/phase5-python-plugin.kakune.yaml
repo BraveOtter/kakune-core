@@ -1,0 +1,15 @@
+apiVersion: kakune/v1
+kind: Workflow
+metadata:
+  id: phase5-python-plugin
+  name: Phase 5 Python Plugin
+triggers:
+  - id: manual
+    type: kakune.trigger.manual@1
+entry: greet
+nodes:
+  - id: greet
+    type: kakune.python-hello@1
+    inputs:
+      name:
+        literal: Ada

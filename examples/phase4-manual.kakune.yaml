@@ -1,0 +1,45 @@
+apiVersion: kakune/v1
+kind: Workflow
+metadata:
+  id: phase4-manual
+  name: Phase 4 manual verification
+triggers:
+  - id: manual
+    type: kakune.trigger.manual@1
+entry: fork
+policy:
+  timeout: 10s
+  concurrency:
+    maxRuns: 1
+    overflow: queue
+    maxQueued: 1
+nodes:
+  - id: fork
+    type: kakune.flow.pass@1
+    on:
+      success: [left, right]
+  - id: left
+    type: kakune.flow.pass@1
+    on: { success: join }
+  - id: right
+    type: kakune.flow.pass@1
+    on: { success: join }
+  - id: join
+    type: kakune.flow.join@1
+    on: { success: decide }
+  - id: decide
+    type: kakune.flow.if@1
+    inputs:
+      condition: { literal: true }
+    on: { 'true': chosen, 'false': discarded }
+  - id: chosen
+    type: kakune.flow.pass@1
+    on: { success: merge }
+  - id: discarded
+    type: kakune.flow.pass@1
+    on: { success: merge }
+  - id: merge
+    type: kakune.flow.merge@1
+    on: { success: end }
+  - id: end
+    type: kakune.flow.end@1

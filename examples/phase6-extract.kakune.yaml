@@ -1,0 +1,31 @@
+apiVersion: kakune/v1
+kind: Workflow
+metadata:
+  id: phase6-extract
+  name: Phase 6 structured extraction
+triggers:
+  - id: manual
+    type: kakune.trigger.manual@1
+policy:
+  ai:
+    budgetTokens: 256
+entry: extract
+nodes:
+  - id: extract
+    type: kakune.ai.extract@1
+    inputs:
+      subscriptionKey: { secret: minimax-subscription-key }
+      model: { literal: MiniMax-M3 }
+      maxTokens: { literal: 128 }
+      prompt: { literal: "Extract a Spanish invoice number from: Factura F-42." }
+      schema:
+        literal:
+          type: object
+          additionalProperties: false
+          required: [invoiceNumber]
+          properties:
+            invoiceNumber: { type: string }
+    on:
+      success: end
+  - id: end
+    type: kakune.flow.end@1
