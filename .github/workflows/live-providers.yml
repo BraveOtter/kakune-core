@@ -1,0 +1,23 @@
+name: Authorized MiniMax live test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provider-live-tests
+  cancel-in-progress: false
+
+jobs:
+  minimax:
+    runs-on: ubuntu-22.04
+    environment: provider-live-tests
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Run MiniMax live request without logging credentials
+        env:
+          KAKUNE_MINIMAX_SUBSCRIPTION_KEY: ${{ secrets.KAKUNE_MINIMAX_SUBSCRIPTION_KEY }}
+        run: cargo test --locked live_messages_request_requires_explicit_credential -- --ignored
