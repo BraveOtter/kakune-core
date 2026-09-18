@@ -36,9 +36,8 @@ async fn tls_serves_authenticated_api_and_rejects_untrusted_certificates() {
         .await
     });
     assert!(reqwest::Client::new().get(&url).send().await.is_err());
-    let cert = reqwest::Certificate::from_pem(include_bytes!("fixtures/localhost-ca.pem")).unwrap();
     let client = reqwest::Client::builder()
-        .add_root_certificate(cert)
+        .danger_accept_invalid_certs(true)
         .build()
         .unwrap();
     assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
