@@ -19,7 +19,7 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "Version command failed with exit code $LASTEXITCODE" }
   & $binary init --data-dir $data
   if ($LASTEXITCODE -ne 0) { throw "Initialization failed with exit code $LASTEXITCODE" }
-  & $binary run $example --data-dir $data
+  & $binary --standalone run $example --data-dir $data
   if ($LASTEXITCODE -ne 0) { throw "Workflow smoke failed with exit code $LASTEXITCODE" }
   if (-not (Test-Path -LiteralPath (Join-Path $data "workspace/notes/hello.txt"))) {
     throw "The packaged binary did not create the expected workflow output"

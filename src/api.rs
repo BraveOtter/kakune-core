@@ -1380,14 +1380,13 @@ async fn create_execution(
             .to_string()
             .as_bytes(),
     );
-    if let Some(key) = key {
-        if let Some(execution) = state
+    if let Some(key) = key
+        && let Some(execution) = state
             .store
             .find_idempotent_execution(key, &hash)
             .map_err(execution_request_error)?
-        {
-            return Ok((StatusCode::OK, Json(execution)));
-        }
+    {
+        return Ok((StatusCode::OK, Json(execution)));
     }
     let source = state
         .store

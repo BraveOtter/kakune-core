@@ -1740,8 +1740,10 @@ impl Store {
         let plan_hash = artifacts::artifact_id(plan_json.as_bytes());
         self.with_connection(|connection| {
             let transaction = connection.transaction().map_err(database_error)?;
-            if let Some((key, hash)) = identity {
-                if let Some(record) = idempotent_execution(&transaction, key, hash)? { return Ok((record, false)); }
+            if let Some((key, hash)) = identity
+                && let Some(record) = idempotent_execution(&transaction, key, hash)?
+            {
+                return Ok((record, false));
             }
             let status = execution_admission(&transaction, workflow_name, policy.concurrency.as_ref())?;
             transaction
@@ -3651,6 +3653,34 @@ fn artifact_ids_in_value(value: &Value) -> Vec<String> {
     ids
 }
 
+fn idempotent_execution(
+    db: &Connection,
+    key: &str,
+    hash: &str,
+) -> Result<Option<ExecutionRecord>, String> {
+    let stored: Option<(String, String)> = db
+        .query_row(
+            "SELECT request_hash,execution_id FROM execution_idempotency WHERE request_key=?1",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(database_error)?;
+    let Some((previous, id)) = stored else {
+        return Ok(None);
+    };
+    if previous != hash {
+        return Err("idempotency key already used for a different request".into());
+    }
+    db.query_row(
+        "SELECT id,workflow_name,status,created_at,completed_at,error FROM executions WHERE id=?1",
+        [id],
+        execution_from_row,
+    )
+    .optional()
+    .map_err(database_error)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -4314,32 +4344,4 @@ mod tests {
         drop(store);
         fs::remove_dir_all(directory).expect("temporary data should be removed");
     }
-}
-
-fn idempotent_execution(
-    db: &Connection,
-    key: &str,
-    hash: &str,
-) -> Result<Option<ExecutionRecord>, String> {
-    let stored: Option<(String, String)> = db
-        .query_row(
-            "SELECT request_hash,execution_id FROM execution_idempotency WHERE request_key=?1",
-            [key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(database_error)?;
-    let Some((previous, id)) = stored else {
-        return Ok(None);
-    };
-    if previous != hash {
-        return Err("idempotency key already used for a different request".into());
-    }
-    db.query_row(
-        "SELECT id,workflow_name,status,created_at,completed_at,error FROM executions WHERE id=?1",
-        [id],
-        execution_from_row,
-    )
-    .optional()
-    .map_err(database_error)
 }
