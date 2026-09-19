@@ -182,7 +182,20 @@ triggers:
 
 Calendar timestamps are stored as UTC. Cron uses UTC by default and accepts an IANA `timezone`; local date/time timestamps require `timezone` and choose the first repeated DST hour by default (`dst: latest` selects the second). A nonexistent local DST time is rejected. The next due time and misfire policy are persisted. `misfire` accepts `skip`, `runOnce` (default), and `catchUp`; `catchUp` requires a bounded `maxCatchUp` from 1 to 100.
 
-Filesystem roots must be existing directories expressed as workspace-relative paths without `.` or `..`. Core resolves the path before watching and rejects roots, including symlinks, that escape the workspace. Watches are recursive. Supported events are `created`, `modified`, `removed`, and `renamed`; notifications for a trigger are coalesced with a trailing debounce of 10 to 60,000 ms (500 ms by default). The watcher channel is bounded; dropped notifications are retained as `scheduler.filesystem_overflow` durable events. Filesystem event paths are not exposed to workflow inputs in this milestone.
+Filesystem roots must be existing directories expressed as workspace-relative paths without `.` or `..`. Core resolves the path before watching and rejects roots, including symlinks, that escape the workspace. Watches are recursive. Supported events are `created`, `modified`, `removed`, and `renamed`; notifications for a trigger are coalesced with a trailing debounce of 10 to 60,000 ms (500 ms by default). The watcher channel is bounded; dropped notifications are retained as `scheduler.filesystem_overflow` durable events.
+
+Filesystem trigger values include `path`, the last workspace-relative path in the debounce window, and `paths`, the de-duplicated workspace-relative paths from that window. Map either value into a workflow input with `$trigger.path` or `$trigger.paths`; `path` can be passed directly to a filesystem node.
+
+```yaml
+triggers:
+  - id: incoming-file
+    type: kakune.trigger.filesystem@1
+    with:
+      root: inbox
+      events: [created, renamed]
+    map:
+      filePath: { from: $trigger.path }
+```
 
 ## External plugin nodes
 
