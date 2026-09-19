@@ -525,6 +525,7 @@ fn validate_keys(trigger: &WorkflowTrigger, allowed: &[&str]) -> Result<(), Stri
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FilesystemConfig {
+    workspace: PathBuf,
     root: PathBuf,
     events: BTreeSet<FilesystemEventKind>,
     debounce: Duration,
@@ -607,6 +608,7 @@ fn filesystem_config(
         return Err("with.debounceMs must be between 10 and 60000".to_string());
     }
     Ok(FilesystemConfig {
+        workspace,
         root,
         events,
         debounce,
@@ -724,18 +726,12 @@ impl FilesystemScheduler {
         {
             return;
         }
-        let paths: Vec<Value> = event
-            .paths
-            .iter()
-            .filter_map(|path| path.strip_prefix(&watcher.config.root).ok())
-            .map(|path| Value::String(path.to_string_lossy().replace('\\', "/")))
-            .collect();
         coalesce_pending(
             &mut self.pending,
             key,
             watcher.workflow.clone(),
             watcher.trigger.clone(),
-            serde_json::json!({ "type": "filesystem", "paths": paths }),
+            filesystem_trigger_values(&event, &watcher.config),
             now + watcher.config.debounce,
         );
     }
@@ -747,6 +743,18 @@ impl FilesystemScheduler {
     fn next_due(&self) -> Option<Instant> {
         self.pending.values().map(|pending| pending.due_at).min()
     }
+}
+
+fn filesystem_trigger_values(event: &Event, config: &FilesystemConfig) -> Value {
+    let paths = event
+        .paths
+        .iter()
+        .filter(|path| path.starts_with(&config.root))
+        .filter_map(|path| path.strip_prefix(&config.workspace).ok())
+        .map(|path| Value::String(path.to_string_lossy().replace('\\', "/")))
+        .collect::<Vec<_>>();
+    let path = paths.last().cloned().unwrap_or(Value::Null);
+    serde_json::json!({ "type": "filesystem", "path": path, "paths": paths })
 }
 
 fn new_filesystem_watcher(
@@ -796,6 +804,36 @@ fn coalesce_pending(
     trigger_values: Value,
     due_at: Instant,
 ) {
+    if let Some(existing) = pending.get_mut(&key) {
+        let paths = trigger_values
+            .get("paths")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let path = trigger_values.get("path").cloned();
+        let existing_paths = existing
+            .trigger_values
+            .as_object_mut()
+            .and_then(|values| values.get_mut("paths"))
+            .and_then(Value::as_array_mut)
+            .expect("filesystem trigger values always contain paths");
+        for candidate in paths {
+            if !existing_paths.contains(&candidate) {
+                existing_paths.push(candidate);
+            }
+        }
+        if let Some(path) = path {
+            existing
+                .trigger_values
+                .as_object_mut()
+                .expect("filesystem trigger values are objects")
+                .insert("path".to_string(), path);
+        }
+        existing.workflow = workflow;
+        existing.trigger = trigger;
+        existing.due_at = due_at;
+        return;
+    }
     pending.insert(
         key,
         PendingFilesystemTrigger {
@@ -823,17 +861,21 @@ fn take_due_pending(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::HashMap, fs, time::Duration};
 
-    use notify::{EventKind, event::CreateKind};
+    use notify::{Event, EventKind, event::CreateKind};
     use serde_json::json;
+    use tokio::time::Instant;
 
-    use crate::{Store, WorkflowDocument, workflow::WorkflowTrigger};
+    use crate::{
+        Store, WorkflowDocument,
+        workflow::{WorkflowBinding, WorkflowTrigger},
+    };
 
     use super::{
-        FilesystemEventKind, PendingFilesystemTrigger, coalesce_pending, cron_next_due,
-        filesystem_config, filesystem_event_matches, interval_seconds, schedule_trigger,
-        take_due_pending,
+        FilesystemConfig, FilesystemEventKind, PendingFilesystemTrigger, coalesce_pending,
+        cron_next_due, filesystem_config, filesystem_event_matches, filesystem_trigger_values,
+        interval_seconds, schedule_trigger, take_due_pending, trigger_inputs,
     };
 
     fn trigger(
@@ -1005,5 +1047,72 @@ mod tests {
             take_due_pending(&mut pending, now + std::time::Duration::from_secs(2)).len(),
             1
         );
+    }
+
+    #[test]
+    fn filesystem_paths_are_workspace_relative_and_coalesced() {
+        let workspace = std::env::temp_dir().join(format!(
+            "kakune-filesystem-trigger-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let inbox = workspace.join("inbox");
+        fs::create_dir_all(&inbox).expect("workspace should create");
+        let config = FilesystemConfig {
+            workspace: fs::canonicalize(&workspace).expect("workspace should resolve"),
+            root: fs::canonicalize(&inbox).expect("inbox should resolve"),
+            events: Default::default(),
+            debounce: Duration::from_millis(500),
+        };
+        let document = WorkflowDocument::parse("apiVersion: kakune/v1\nkind: Workflow\nmetadata:\n  id: sample\n  name: Sample\ntriggers:\n  - id: manual\n    type: kakune.trigger.manual@1\nentry: hello\nnodes:\n  - id: hello\n    type: kakune.log@1\n    inputs:\n      message: { literal: hello }\n")
+            .expect("workflow should parse");
+        let mut trigger = trigger("kakune.trigger.filesystem@1", Default::default());
+        trigger.map.insert(
+            "filePath".to_string(),
+            WorkflowBinding::From {
+                from: "$trigger.path".to_string(),
+            },
+        );
+        let first = filesystem_trigger_values(
+            &Event::new(EventKind::Create(CreateKind::File))
+                .add_path(config.root.join("first.txt")),
+            &config,
+        );
+        let second = filesystem_trigger_values(
+            &Event::new(EventKind::Create(CreateKind::File))
+                .add_path(config.root.join("second.txt")),
+            &config,
+        );
+        assert_eq!(first["path"], json!("inbox/first.txt"));
+        assert_eq!(
+            trigger_inputs(&trigger, &first).expect("trigger path should map"),
+            json!({ "filePath": "inbox/first.txt" })
+        );
+
+        let now = Instant::now();
+        let mut pending = HashMap::new();
+        coalesce_pending(
+            &mut pending,
+            "sample/incoming".to_string(),
+            document.clone(),
+            trigger.clone(),
+            first,
+            now,
+        );
+        coalesce_pending(
+            &mut pending,
+            "sample/incoming".to_string(),
+            document,
+            trigger,
+            second,
+            now,
+        );
+        let due = take_due_pending(&mut pending, now);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].trigger_values["path"], json!("inbox/second.txt"));
+        assert_eq!(
+            due[0].trigger_values["paths"],
+            json!(["inbox/first.txt", "inbox/second.txt"])
+        );
+        fs::remove_dir_all(workspace).expect("workspace should remove");
     }
 }
