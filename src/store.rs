@@ -1551,6 +1551,61 @@ impl Store {
         self.with_connection(|connection| schema_version(connection))
     }
 
+    /// Inserts a new workflow without replacing an existing workflow with the same ID.
+    pub fn create_workflow(
+        &self,
+        workflow: &WorkflowDocument,
+        source: &str,
+        status: &str,
+    ) -> Result<Option<WorkflowRecord>, String> {
+        if status == "enabled" {
+            crate::scheduler::validate_enabled_triggers(workflow, &self.workspace_dir()?)?;
+        }
+        let now = now()?;
+        let revision = Uuid::new_v4().to_string();
+        self.with_connection(|connection| {
+            let transaction = connection.transaction().map_err(database_error)?;
+            let inserted = transaction
+                .execute(
+                    "INSERT OR IGNORE INTO workflows (id, name, source, status, revision, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![workflow.metadata.id, workflow.metadata.name, source, status, revision, now],
+                )
+                .map_err(database_error)?;
+            if inserted == 0 {
+                return Ok(None);
+            }
+            transaction
+                .execute(
+                    "INSERT INTO workflow_revisions (id, workflow_id, source, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![revision, workflow.metadata.id, source, now],
+                )
+                .map_err(database_error)?;
+            let record = WorkflowRecord {
+                id: workflow.metadata.id.clone(),
+                name: workflow.metadata.name.clone(),
+                status: status.to_owned(),
+                revision,
+                updated_at: now,
+            };
+            append_event(
+                &transaction,
+                "workflow.created",
+                &record.id,
+                None,
+                serde_json::json!({
+                    "name": record.name,
+                    "status": record.status,
+                    "revision": record.revision,
+                }),
+                &record.updated_at,
+            )?;
+            transaction.commit().map_err(database_error)?;
+            Ok(Some(record))
+        })
+    }
+
     pub fn upsert_workflow(
         &self,
         workflow: &WorkflowDocument,
@@ -4160,6 +4215,46 @@ mod tests {
             events.last().expect("events should exist").sequence
         );
         drop(reopened);
+        fs::remove_dir_all(directory).expect("temporary data should be removed");
+    }
+
+    #[test]
+    fn creating_an_existing_workflow_id_does_not_replace_it() {
+        let directory = std::env::temp_dir().join(format!(
+            "kakune-create-workflow-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(directory.clone()).expect("store should open");
+        let source = "apiVersion: kakune/v1\nkind: Workflow\nmetadata:\n  id: unique-flow\n  name: Original\ntriggers:\n  - id: manual\n    type: kakune.trigger.manual@1\nentry: start\nnodes:\n  - id: start\n    type: kakune.flow.pass@1\n";
+        let workflow = WorkflowDocument::parse(source).expect("workflow should parse");
+        let created = store
+            .create_workflow(&workflow, source, "enabled")
+            .expect("first create should succeed")
+            .expect("workflow should be inserted");
+
+        let replacement = source.replace("Original", "Replacement");
+        let replacement_workflow =
+            WorkflowDocument::parse(&replacement).expect("replacement workflow should parse");
+        assert!(
+            store
+                .create_workflow(&replacement_workflow, &replacement, "enabled")
+                .expect("duplicate should be reported")
+                .is_none()
+        );
+        assert_eq!(
+            store.list_workflows().expect("workflows should list")[0].name,
+            "Original"
+        );
+        assert_eq!(
+            store
+                .list_workflow_revisions("unique-flow")
+                .expect("revisions should list")
+                .len(),
+            1
+        );
+        assert_eq!(created.name, "Original");
+
+        drop(store);
         fs::remove_dir_all(directory).expect("temporary data should be removed");
     }
 

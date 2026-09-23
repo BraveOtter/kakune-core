@@ -16,6 +16,80 @@ use reqwest::header::AUTHORIZATION;
 use serde_json::{Value, json};
 
 #[tokio::test]
+async fn workflow_create_rejects_duplicate_ids_without_overwriting_the_saved_source() {
+    let directory =
+        std::env::temp_dir().join(format!("kakune-create-api-{}", uuid::Uuid::new_v4()));
+    let store = Store::open(directory.clone()).expect("store should open");
+    let token = store
+        .ensure_bootstrap_token()
+        .expect("token should be created")
+        .expect("a new store needs a bootstrap token");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should have an address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, api::router(store))
+            .await
+            .expect("ephemeral Core should serve");
+    });
+    let client = reqwest::Client::new();
+    let endpoint = format!("http://{address}/api/v1/workflows");
+    let original = "apiVersion: kakune/v1\nkind: Workflow\nmetadata:\n  id: unique-flow\n  name: Original\ntriggers:\n  - id: manual\n    type: kakune.trigger.manual@1\nentry: start\nnodes:\n  - id: start\n    type: kakune.flow.pass@1\n";
+    let created = client
+        .post(&endpoint)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .json(&json!({ "source": original }))
+        .send()
+        .await
+        .expect("workflow create request should complete");
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let replacement = original.replace("Original", "Replacement");
+    let duplicate = client
+        .post(&endpoint)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .json(&json!({ "source": replacement }))
+        .send()
+        .await
+        .expect("duplicate workflow request should complete");
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+    let saved: Value = client
+        .get(&endpoint)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("workflow list request should complete")
+        .error_for_status()
+        .expect("workflow list should succeed")
+        .json()
+        .await
+        .expect("workflow list should be JSON");
+    assert_eq!(saved["items"][0]["name"], "Original");
+
+    drop(client);
+    server.abort();
+    let _ = server.await;
+    let mut cleanup_error = None;
+    for _ in 0..20 {
+        match fs::remove_dir_all(&directory) {
+            Ok(()) => return,
+            Err(error) => {
+                cleanup_error = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+    }
+    panic!(
+        "temporary Core data should be removed: {}",
+        cleanup_error.expect("cleanup should fail before panic")
+    );
+}
+
+#[tokio::test]
 async fn ephemeral_core_serves_a_consumer_over_http_and_sse() {
     let directory = std::env::temp_dir().join(format!("kakune-api-smoke-{}", uuid::Uuid::new_v4()));
     let store = Store::open(directory.clone()).expect("store should open");

@@ -1334,8 +1334,11 @@ async fn create_workflow(
         .ir;
     let record = state
         .store
-        .upsert_workflow(&workflow, &payload.source, "enabled")
-        .map_err(ApiError::internal)?;
+        .create_workflow(&workflow, &payload.source, "enabled")
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| {
+            ApiError::conflict(format!("workflow {} already exists", workflow.metadata.id))
+        })?;
     Ok((StatusCode::CREATED, Json(record)))
 }
 
