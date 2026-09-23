@@ -8,7 +8,21 @@ Kakune Core is the local-first runtime for Kakune workflows. It owns workflow va
 
 ## Install a release
 
-Download the archive for your tested platform from GitHub Releases, verify it against `SHA256SUMS`, then extract it and run `kakune init --data-dir <directory>`. Each release has an SPDX SBOM and GitHub provenance attestation; see [`packaging/README.md`](packaging/README.md) for verification and service installation details. Windows signing and macOS notarization are stated only when the corresponding release asset is signed.
+Install the latest release with PowerShell on Windows:
+
+```powershell
+irm https://raw.githubusercontent.com/BraveOtter/kakune-core/main/scripts/install.ps1 | iex
+```
+
+Or with a POSIX shell on macOS or Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/BraveOtter/kakune-core/main/scripts/install.sh | sh
+```
+
+The scripts select the platform build, verify its SHA-256 checksum, and install Kakune in a per-user directory. Current release builds are Windows x86_64, Linux x86_64 with glibc, and macOS Apple Silicon (arm64). Run the same command again to update. The Unix script accepts `--version 0.1.1` and `--install-dir <directory>` when downloaded and run locally; the PowerShell script accepts `-Version 0.1.1` and `-InstallDir <directory>`. After installation, run `kakune init --data-dir <directory>` (or `kakune init` to use the default data directory); on macOS or Linux, open a new terminal if `kakune` is not yet on PATH. If Kakune is running as a service, restart it after updating; the installer restarts the Windows `KakuneCore` service when it uses the same executable path.
+
+Each release has an SPDX SBOM and GitHub provenance attestation; see [`packaging/README.md`](packaging/README.md) for verification and service installation details. Windows signing and macOS notarization are stated only when the corresponding release asset is signed.
 
 ## Run locally
 
@@ -29,7 +43,7 @@ api:
   rateLimitRequestsPerMinute: 120
 ```
 
-Use `kakune daemon start`, `kakune daemon status`, and `kakune daemon stop` for a user-managed background process. `kakune context add|list|use|inspect|remove|import|export` stores only portable connection metadata and credential references in `<data-dir>/cli/contexts.json`; it never stores token values.
+Use `kakune daemon start`, `kakune daemon status`, and `kakune daemon stop` for a user-managed background process. `kakune init` creates the active local context and stores its credential in the OS credential manager. `kakune context add|list|use|inspect|remove|import|export` stores only portable connection metadata and credential references in `<data-dir>/cli/contexts.json`; it never stores token values.
 
 `kakune provider list|upsert|status|remove` manages non-secret provider profiles. A Codex profile uses `oauthSecret`, whose reference points to an encrypted ChatGPT Plus/Pro OAuth token. `kakune provider login <id>` opens a browser authorization flow directly and does not require, invoke, or read credentials from Codex CLI.
 
@@ -234,6 +248,7 @@ The versioned API is rooted at `/api/v1`:
 - `GET /api/v1/events` (durable SSE event replay)
 - `GET, POST /api/v1/auth/tokens`
 - `POST /api/v1/auth/tokens/{id}/revoke`
+- `POST /api/v1/auth/pair/claim`, `/status`, and `/exchange` (one-use GUI pairing)
 - `GET, POST /api/v1/providers`
 - `GET, PUT, DELETE /api/v1/providers/{id}`
 - `POST /api/v1/providers/{id}/diagnose`
@@ -246,7 +261,13 @@ The versioned API is rooted at `/api/v1`:
 - `GET, POST /api/v1/executions`
 - `GET /api/v1/executions/{id}`
 
-`kakune init` creates an initial `admin` Bearer token and prints it once. Token values are returned only from creation and the database stores SHA-256 digests. An `admin` token can create scoped, optionally expiring tokens: `read` permits queries and event replay, `run` permits execution creation, `manage` permits workflow mutations, and `admin` permits all operations including token management. Revocation takes effect immediately. Keep the Core bound to loopback until TLS and remote policy controls are implemented. External node registration is deliberately available only to embedding local callers, not through the HTTP API.
+`kakune init` provisions the initial `admin` credential in the operating system's credential manager and configures the local CLI context; normal local CLI use does not require copying a token. The database stores only SHA-256 token digests. If local access is lost, run `kakune auth recover --data-dir <directory>` on the Core machine to issue a new credential and revoke all previous active tokens. If the OS credential manager is unavailable, the command falls back to showing the new token once for use through `KAKUNE_TOKEN`.
+
+To connect a GUI, run `kakune auth pair --data-dir <directory>` in a Core terminal, scan its QR from the GUI, then approve the named device in that terminal. Updating an existing Core and restarting it once enables these endpoints; the database migration and pre-upgrade backup run automatically. The invitation expires after five minutes and can be claimed once. The resulting device token has `read`, `run`, and `manage` scopes by default; `--admin` explicitly grants full administration. For a GUI on another machine, provide its reachable HTTPS Core URL with `--endpoint https://core.example.com:8787`. Configure the Core's `api.allowedHosts` and, for browser-based GUIs, the GUI origin in `api.allowedOrigins` before pairing. The GUI should poll the pairing status until approval, exchange the approved claim for its token, and keep that token in its own OS credential manager. Use `kakune auth tokens --data-dir <directory>` to list credentials and `kakune auth revoke <token-id> --data-dir <directory>` to revoke one device. The pairing endpoints are unauthenticated by design, but require the high-entropy QR code, a GUI-generated claim secret, the local approval, and HTTPS for non-loopback endpoints.
+
+The QR payload uses `format: "kakune-pairing/v1"` and includes `endpoint`, `coreId`, `pairingCode`, `expiresAt`, and granted `scopes`. The GUI generates a fresh `claimSecret` from at least 32 random bytes, posts `{ pairingCode, claimSecret, deviceName }` to `/api/v1/auth/pair/claim`, then polls `/api/v1/auth/pair/status` with `{ pairingCode, claimSecret }`. After the local approval, it posts the same proof to `/api/v1/auth/pair/exchange`; the one-time response contains `coreId`, `token`, `tokenId`, `name`, and `scopes`. The GUI should verify `coreId` matches the QR before saving the token.
+
+An `admin` token can create scoped, optionally expiring tokens: `read` permits queries and event replay, `run` permits execution creation, `manage` permits workflow mutations, and `admin` permits all operations including token management. Revocation takes effect immediately. Keep the Core bound to loopback unless remote TLS, host, and origin policies are configured. External node registration is deliberately available only to embedding local callers, not through the HTTP API.
 
 `GET /api/v1/events` replays retained durable events in sequence order and then closes the stream in this milestone. Supply the last SSE event ID in `Last-Event-ID`, or as `?cursor=<eventId>`, to resume after that event. Each SSE data value is a version 1 envelope containing `eventVersion`, `coreId`, `eventId`, `sequence`, `timestamp`, `type`, `resourceId`, optional `executionId`, and `payload`.
 
