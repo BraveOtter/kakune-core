@@ -11,13 +11,13 @@ Kakune Core es el runtime local-first para los workflows de Kakune. Se encarga d
 Instala la ├║ltima release con PowerShell en Windows:
 
 ```powershell
-irm https://raw.githubusercontent.com/BraveOtter/kakune-core/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/BraveOtter/kakune-core/master/scripts/install.ps1 | iex
 ```
 
 O con una shell POSIX en macOS o Linux:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/BraveOtter/kakune-core/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/BraveOtter/kakune-core/master/scripts/install.sh | sh
 ```
 
 Los scripts seleccionan el binario de la plataforma, verifican su checksum SHA-256 e instalan Kakune en un directorio del usuario. Las releases actuales incluyen Windows x86_64, Linux x86_64 con glibc y macOS Apple Silicon (arm64). Ejecuta el mismo comando otra vez para actualizar. El script Unix acepta `--version 0.1.1` y `--install-dir <directorio>` si lo descargas y ejecutas localmente; el script de PowerShell acepta `-Version 0.1.1` y `-InstallDir <directorio>`. Tras instalar, ejecuta `kakune init --data-dir <directorio>` (o `kakune init` para usar el directorio de datos predeterminado); en macOS o Linux, abre una terminal nueva si `kakune` a├║n no aparece en PATH. Si Kakune funciona como servicio, rein├¡cialo despu├®s de actualizar; el instalador reinicia el servicio Windows `KakuneCore` cuando utiliza la misma ruta del ejecutable.
