@@ -124,6 +124,7 @@ fn run_service() -> Result<(), String> {
     let mut child = Command::new(executable)
         .args(["daemon", "--data-dir"])
         .arg(data_dir)
+        .env("KAKUNE_SERVICE_HOST", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

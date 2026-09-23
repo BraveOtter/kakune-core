@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    API_VERSION, AuthScope, PluginRegistry, ProviderAuth, ProviderProfile,
+    API_VERSION, AuthPairingStatus, AuthScope, PluginRegistry, ProviderAuth, ProviderProfile,
     ProviderProfileDiagnostic, ProviderProfileStatus, ProviderProfileUpsert, ProviderType, Store,
     WorkflowSourceUpdate,
     config::ApiConfig,
@@ -167,6 +167,9 @@ pub fn router_with_plugins_and_config(
     Router::new()
         .route("/health/live", get(health))
         .route("/health/ready", get(health))
+        .route("/api/v1/auth/pair/claim", post(claim_auth_pairing))
+        .route("/api/v1/auth/pair/status", post(auth_pairing_status))
+        .route("/api/v1/auth/pair/exchange", post(exchange_auth_pairing))
         .merge(protected)
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(from_fn_with_state(state.clone(), enforce_local_policy))
@@ -633,6 +636,7 @@ async fn info(State(state): State<Arc<AppState>>) -> Result<Json<CoreInfo>, ApiE
             "minimax".to_string(),
             "durable-events".to_string(),
             "native-core-plugin".to_string(),
+            "device-pairing".to_string(),
         ],
     }))
 }
@@ -737,6 +741,74 @@ async fn create_auth_token(
         .create_auth_token(request.name, request.scopes, request.expires_at)
         .map_err(ApiError::invalid)?;
     Ok((StatusCode::CREATED, Json(token)))
+}
+
+async fn claim_auth_pairing(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ClaimAuthPairingRequest>,
+) -> Result<Json<AuthPairingResponse>, ApiError> {
+    let status = state
+        .store
+        .claim_auth_pairing_code(
+            &request.pairing_code,
+            &request.claim_secret,
+            &request.device_name,
+        )
+        .map_err(pairing_api_error)?;
+    Ok(Json(AuthPairingResponse {
+        core_id: state.store.core_id().map_err(ApiError::internal)?,
+        status,
+    }))
+}
+
+async fn auth_pairing_status(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PairingProofRequest>,
+) -> Result<Json<AuthPairingResponse>, ApiError> {
+    let status = state
+        .store
+        .get_auth_pairing_status_for_claim(&request.pairing_code, &request.claim_secret)
+        .map_err(pairing_api_error)?;
+    Ok(Json(AuthPairingResponse {
+        core_id: state.store.core_id().map_err(ApiError::internal)?,
+        status,
+    }))
+}
+
+async fn exchange_auth_pairing(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PairingProofRequest>,
+) -> Result<(StatusCode, Json<AuthPairingExchangeResponse>), ApiError> {
+    let created = state
+        .store
+        .exchange_auth_pairing_code(&request.pairing_code, &request.claim_secret)
+        .map_err(pairing_api_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(AuthPairingExchangeResponse {
+            core_id: state.store.core_id().map_err(ApiError::internal)?,
+            token: created.token,
+            token_id: created.record.id,
+            name: created.record.name,
+            scopes: created.record.scopes,
+            expires_at: created.record.expires_at,
+        }),
+    ))
+}
+
+fn pairing_api_error(error: String) -> ApiError {
+    if error.starts_with("pairing QR code is invalid") {
+        ApiError::unauthorized(error)
+    } else if error.contains("already has a claim") || error.contains("awaiting Core user approval")
+    {
+        ApiError::conflict(error)
+    } else if error.contains("was rejected by the Core user") {
+        ApiError::forbidden(error)
+    } else if error.starts_with("deviceName") {
+        ApiError::invalid(error)
+    } else {
+        ApiError::internal(error)
+    }
 }
 
 async fn revoke_auth_token(
@@ -1551,6 +1623,39 @@ struct CreateAuthTokenRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClaimAuthPairingRequest {
+    pairing_code: String,
+    claim_secret: String,
+    device_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairingProofRequest {
+    pairing_code: String,
+    claim_secret: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthPairingResponse {
+    core_id: String,
+    status: AuthPairingStatus,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthPairingExchangeResponse {
+    core_id: String,
+    token: String,
+    token_id: String,
+    name: String,
+    scopes: Vec<AuthScope>,
+    expires_at: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct SetSecretRequest {
     name: String,
     value: String,
@@ -1693,7 +1798,7 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use crate::{PluginRegistry, Store, config::ApiConfig};
+    use crate::{AuthScope, PluginRegistry, Store, config::ApiConfig};
 
     use super::{router, router_with_plugins_and_config};
 
@@ -1766,6 +1871,128 @@ mod tests {
                 .expect("body should be utf-8")
                 .contains("coreId")
         );
+        std::fs::remove_dir_all(directory).expect("temporary data should be removed");
+    }
+
+    #[tokio::test]
+    async fn qr_pairing_endpoints_wait_for_local_approval_then_return_one_token() {
+        let directory =
+            std::env::temp_dir().join(format!("kakune-pairing-api-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(directory.clone()).expect("store should open");
+        let code = format!("kakune_pair_{}", uuid::Uuid::new_v4().simple());
+        let claim_secret = format!("gui_claim_{}", uuid::Uuid::new_v4().simple());
+        let expires_at = (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("expiration should format");
+        let invitation = store
+            .create_auth_pairing_code(&code, vec![AuthScope::Read, AuthScope::Run], expires_at)
+            .expect("pairing invitation should be stored");
+        let app = router(store.clone());
+        let claim = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/pair/claim")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "pairingCode": &code,
+                            "claimSecret": &claim_secret,
+                            "deviceName": "Kakune GUI test device",
+                        })
+                        .to_string(),
+                    ))
+                    .expect("claim request should build"),
+            )
+            .await
+            .expect("claim response should be produced");
+        assert_eq!(claim.status(), StatusCode::OK);
+        let claim_json: serde_json::Value = serde_json::from_slice(
+            &claim
+                .into_body()
+                .collect()
+                .await
+                .expect("claim body should collect")
+                .to_bytes(),
+        )
+        .expect("claim response should be JSON");
+        assert_eq!(claim_json["status"]["state"], "awaitingApproval");
+
+        let pending_exchange = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/pair/exchange")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "pairingCode": &code,
+                            "claimSecret": &claim_secret,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("exchange request should build"),
+            )
+            .await
+            .expect("pending exchange response should be produced");
+        assert_eq!(pending_exchange.status(), StatusCode::CONFLICT);
+
+        assert!(
+            store
+                .decide_auth_pairing(&invitation.id, true)
+                .expect("local approval should succeed")
+        );
+        let exchange = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/pair/exchange")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "pairingCode": &code,
+                            "claimSecret": &claim_secret,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("exchange request should build"),
+            )
+            .await
+            .expect("exchange response should be produced");
+        assert_eq!(exchange.status(), StatusCode::CREATED);
+        let exchange_json: serde_json::Value = serde_json::from_slice(
+            &exchange
+                .into_body()
+                .collect()
+                .await
+                .expect("exchange body should collect")
+                .to_bytes(),
+        )
+        .expect("exchange response should be JSON");
+        let token = exchange_json["token"]
+            .as_str()
+            .expect("exchange response should contain a token");
+        assert!(
+            store
+                .authorize_scope(token, AuthScope::Run)
+                .expect("paired token should authorize its requested scope")
+        );
+
+        let replay = app
+            .oneshot(
+                Request::post("/api/v1/auth/pair/exchange")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "pairingCode": &code,
+                            "claimSecret": &claim_secret,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("replay request should build"),
+            )
+            .await
+            .expect("replay response should be produced");
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+
+        drop(store);
         std::fs::remove_dir_all(directory).expect("temporary data should be removed");
     }
 

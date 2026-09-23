@@ -288,6 +288,32 @@ pub struct CreatedAuthToken {
     pub record: AuthTokenRecord,
 }
 
+#[derive(Clone, Debug)]
+pub struct CreatedAuthPairingCode {
+    pub id: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AuthPairingState {
+    AwaitingClaim,
+    AwaitingApproval,
+    Approved,
+    Rejected,
+    Consumed,
+    Expired,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthPairingStatus {
+    pub id: String,
+    pub expires_at: String,
+    pub requested_device: Option<String>,
+    pub state: AuthPairingState,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretRecord {
@@ -852,6 +878,305 @@ impl Store {
                 )
                 .map_err(database_error)?;
             Ok(changed == 1)
+        })
+    }
+
+    /// Revokes every active API token except the credential just provisioned for local recovery.
+    pub fn revoke_other_auth_tokens(&self, keep_id: &str) -> Result<u64, String> {
+        self.with_connection(|connection| {
+            let revoked = connection
+                .execute(
+                    "UPDATE auth_tokens SET revoked_at = ?1
+                     WHERE revoked_at IS NULL AND id != ?2",
+                    params![now()?, keep_id],
+                )
+                .map_err(database_error)?;
+            Ok(revoked as u64)
+        })
+    }
+
+    pub fn create_auth_pairing_code(
+        &self,
+        code: &str,
+        scopes: Vec<AuthScope>,
+        expires_at: String,
+    ) -> Result<CreatedAuthPairingCode, String> {
+        if code.len() < 32 || code.len() > 256 {
+            return Err("pairing code must be 32-256 characters".to_string());
+        }
+        let scopes = unique_scopes(scopes)?;
+        let expires_at =
+            normalize_expiration(Some(expires_at))?.expect("pairing expiration was supplied");
+        let id = Uuid::new_v4().to_string();
+        let created_at = now()?;
+        let code_hash = token_hash(code);
+        self.with_connection(|connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM auth_pairing_codes
+                     WHERE julianday(expires_at) <= julianday(?1, '-1 day')",
+                    [&created_at],
+                )
+                .map_err(database_error)?;
+            transaction
+                .execute(
+                    "INSERT INTO auth_pairing_codes (
+                        id, code_hash, scopes, created_at, expires_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        id,
+                        code_hash,
+                        serde_json::to_string(&scopes)
+                            .map_err(|error| format!("cannot serialize pairing scopes: {error}"))?,
+                        created_at,
+                        expires_at,
+                    ],
+                )
+                .map_err(database_error)?;
+            transaction.commit().map_err(database_error)?;
+            Ok(CreatedAuthPairingCode { id, expires_at })
+        })
+    }
+
+    /// Claims an invitation for one GUI client, pending confirmation at the Core host.
+    pub fn claim_auth_pairing_code(
+        &self,
+        code: &str,
+        claim_secret: &str,
+        device_name: &str,
+    ) -> Result<AuthPairingStatus, String> {
+        if code.len() < 32
+            || code.len() > 256
+            || claim_secret.len() < 32
+            || claim_secret.len() > 256
+        {
+            return Err(pairing_code_rejected());
+        }
+        let device_name = device_name.trim();
+        if device_name.is_empty()
+            || device_name.len() > 120
+            || device_name.chars().any(char::is_control)
+        {
+            return Err("deviceName must be 1-120 characters".to_string());
+        }
+        let code_hash = token_hash(code);
+        let claim_secret_hash = token_hash(claim_secret);
+        self.with_connection(|connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            let pairing = transaction
+                .query_row(
+                    "SELECT id, expires_at, claim_secret_hash, requested_device, decision, consumed_at
+                     FROM auth_pairing_codes WHERE code_hash = ?1",
+                    [&code_hash],
+                    auth_pairing_status_from_row,
+                )
+                .optional()
+                .map_err(database_error)?
+                .ok_or_else(pairing_code_rejected)?;
+            if matches!(
+                pairing.state,
+                AuthPairingState::Expired | AuthPairingState::Consumed
+            ) {
+                return Err(pairing_code_rejected());
+            }
+            let stored_claim_hash: Option<String> = transaction
+                .query_row(
+                    "SELECT claim_secret_hash FROM auth_pairing_codes WHERE id = ?1",
+                    [&pairing.id],
+                    |row| row.get(0),
+                )
+                .map_err(database_error)?;
+            if let Some(stored_claim_hash) = stored_claim_hash {
+                if !bool::from(stored_claim_hash.as_bytes().ct_eq(claim_secret_hash.as_bytes())) {
+                    return Err("pairing invitation already has a claim".to_string());
+                }
+            } else {
+                transaction
+                    .execute(
+                        "UPDATE auth_pairing_codes
+                         SET claim_secret_hash = ?1, requested_device = ?2, claimed_at = ?3
+                         WHERE id = ?4 AND claim_secret_hash IS NULL",
+                        params![claim_secret_hash, device_name, now()?, pairing.id],
+                    )
+                    .map_err(database_error)?;
+            }
+            let status = transaction
+                .query_row(
+                    "SELECT id, expires_at, claim_secret_hash, requested_device, decision, consumed_at
+                     FROM auth_pairing_codes WHERE id = ?1",
+                    [&pairing.id],
+                    auth_pairing_status_from_row,
+                )
+                .map_err(database_error)?;
+            transaction.commit().map_err(database_error)?;
+            Ok(status)
+        })
+    }
+
+    pub fn get_auth_pairing_status(&self, id: &str) -> Result<Option<AuthPairingStatus>, String> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT id, expires_at, claim_secret_hash, requested_device, decision, consumed_at
+                     FROM auth_pairing_codes WHERE id = ?1",
+                    [id],
+                    auth_pairing_status_from_row,
+                )
+                .optional()
+                .map_err(database_error)
+        })
+    }
+
+    pub fn get_auth_pairing_status_for_claim(
+        &self,
+        code: &str,
+        claim_secret: &str,
+    ) -> Result<AuthPairingStatus, String> {
+        if code.len() < 32
+            || code.len() > 256
+            || claim_secret.len() < 32
+            || claim_secret.len() > 256
+        {
+            return Err(pairing_code_rejected());
+        }
+        let code_hash = token_hash(code);
+        let claim_secret_hash = token_hash(claim_secret);
+        self.with_connection(|connection| {
+            let status = connection
+                .query_row(
+                    "SELECT id, expires_at, claim_secret_hash, requested_device, decision, consumed_at
+                     FROM auth_pairing_codes WHERE code_hash = ?1",
+                    [&code_hash],
+                    auth_pairing_status_from_row,
+                )
+                .optional()
+                .map_err(database_error)?
+                .ok_or_else(pairing_code_rejected)?;
+            let stored_claim_hash: Option<String> = connection
+                .query_row(
+                    "SELECT claim_secret_hash FROM auth_pairing_codes WHERE id = ?1",
+                    [&status.id],
+                    |row| row.get(0),
+                )
+                .map_err(database_error)?;
+            if !stored_claim_hash.is_some_and(|hash| {
+                bool::from(hash.as_bytes().ct_eq(claim_secret_hash.as_bytes()))
+            }) {
+                return Err(pairing_code_rejected());
+            }
+            Ok(status)
+        })
+    }
+
+    pub fn decide_auth_pairing(&self, id: &str, approved: bool) -> Result<bool, String> {
+        self.with_connection(|connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            let status = transaction
+                .query_row(
+                    "SELECT id, expires_at, claim_secret_hash, requested_device, decision, consumed_at
+                     FROM auth_pairing_codes WHERE id = ?1",
+                    [id],
+                    auth_pairing_status_from_row,
+                )
+                .optional()
+                .map_err(database_error)?
+                .ok_or_else(pairing_code_rejected)?;
+            if status.state != AuthPairingState::AwaitingApproval {
+                return Ok(false);
+            }
+            let decision = if approved { "approved" } else { "rejected" };
+            let changed = transaction
+                .execute(
+                    "UPDATE auth_pairing_codes SET decision = ?1
+                     WHERE id = ?2 AND decision IS NULL AND consumed_at IS NULL",
+                    params![decision, id],
+                )
+                .map_err(database_error)?;
+            transaction.commit().map_err(database_error)?;
+            Ok(changed == 1)
+        })
+    }
+
+    /// Exchanges an approved, claimed invitation for a device-scoped token exactly once.
+    pub fn exchange_auth_pairing_code(
+        &self,
+        code: &str,
+        claim_secret: &str,
+    ) -> Result<CreatedAuthToken, String> {
+        if code.len() < 32
+            || code.len() > 256
+            || claim_secret.len() < 32
+            || claim_secret.len() > 256
+        {
+            return Err(pairing_code_rejected());
+        }
+        let code_hash = token_hash(code);
+        let claim_secret_hash = token_hash(claim_secret);
+        self.with_connection(|connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            let pairing = transaction
+                .query_row(
+                    "SELECT id, expires_at, scopes, claim_secret_hash, requested_device, decision, consumed_at
+                     FROM auth_pairing_codes WHERE code_hash = ?1",
+                    [&code_hash],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(database_error)?
+                .ok_or_else(pairing_code_rejected)?;
+            let (id, expires_at, scopes_json, stored_claim_hash, device_name, decision, consumed_at) =
+                pairing;
+            let valid_claim = stored_claim_hash.is_some_and(|hash| {
+                bool::from(hash.as_bytes().ct_eq(claim_secret_hash.as_bytes()))
+            });
+            if !valid_claim || consumed_at.is_some() || is_expired(Some(&expires_at))? {
+                return Err(pairing_code_rejected());
+            }
+            if decision.as_deref() == Some("rejected") {
+                return Err("pairing request was rejected by the Core user".to_string());
+            }
+            if decision.as_deref() != Some("approved") {
+                return Err("pairing request is awaiting Core user approval".to_string());
+            }
+            let device_name = device_name
+                .ok_or_else(|| "approved pairing request has no device name".to_string())?;
+            let changed = transaction
+                .execute(
+                    "UPDATE auth_pairing_codes SET consumed_at = ?1
+                     WHERE id = ?2 AND consumed_at IS NULL AND decision = 'approved'",
+                    params![now()?, id],
+                )
+                .map_err(database_error)?;
+            if changed != 1 {
+                return Err(pairing_code_rejected());
+            }
+            let created = create_auth_token(
+                &transaction,
+                device_name,
+                parse_scopes(&scopes_json)?,
+                None,
+            )?;
+            transaction.commit().map_err(database_error)?;
+            Ok(created)
         })
     }
 
@@ -2490,7 +2815,7 @@ fn execution_admission(
     Ok("queued".to_string())
 }
 
-const LATEST_SCHEMA_VERSION: u32 = 14;
+const LATEST_SCHEMA_VERSION: u32 = 15;
 
 fn migrate(
     connection: &mut Connection,
@@ -2526,6 +2851,7 @@ fn migrate(
             10 => add_execution_traces(&transaction)?,
             11 => add_retention_fields(&transaction)?,
             12 => add_secret_backend(&transaction)?,
+            15 => add_auth_pairing_codes(&transaction)?,
             14 => transaction.execute_batch("CREATE TABLE execution_idempotency (request_key TEXT PRIMARY KEY, request_hash TEXT NOT NULL, execution_id TEXT NOT NULL REFERENCES executions(id) ON DELETE CASCADE);").map_err(database_error)?,
             13 => transaction
                 .execute_batch(
@@ -2724,6 +3050,26 @@ fn add_execution_artifact_links(transaction: &rusqlite::Transaction<'_>) -> Resu
             node_id TEXT NOT NULL, artifact_id TEXT NOT NULL REFERENCES artifacts(id),
             PRIMARY KEY (execution_id, node_id, artifact_id)
           );",
+        )
+        .map_err(database_error)
+}
+
+fn add_auth_pairing_codes(transaction: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    transaction
+        .execute_batch(
+            "CREATE TABLE auth_pairing_codes (
+                id TEXT PRIMARY KEY,
+                code_hash TEXT NOT NULL UNIQUE,
+                scopes TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                claim_secret_hash TEXT,
+                requested_device TEXT,
+                claimed_at TEXT,
+                decision TEXT CHECK(decision IS NULL OR decision IN ('approved', 'rejected')),
+                consumed_at TEXT
+             );
+             CREATE INDEX auth_pairing_codes_expiration ON auth_pairing_codes(expires_at);",
         )
         .map_err(database_error)
 }
@@ -3179,6 +3525,41 @@ fn auth_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthTokenRec
         expires_at: row.get(4)?,
         revoked_at: row.get(5)?,
     })
+}
+
+fn auth_pairing_status_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthPairingStatus> {
+    let id = row.get::<_, String>(0)?;
+    let expires_at = row.get::<_, String>(1)?;
+    let claim_secret_hash = row.get::<_, Option<String>>(2)?;
+    let requested_device = row.get::<_, Option<String>>(3)?;
+    let decision = row.get::<_, Option<String>>(4)?;
+    let consumed_at = row.get::<_, Option<String>>(5)?;
+    let expiration = OffsetDateTime::parse(&expires_at, &Rfc3339).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let state = if consumed_at.is_some() {
+        AuthPairingState::Consumed
+    } else if expiration <= OffsetDateTime::now_utc() {
+        AuthPairingState::Expired
+    } else if claim_secret_hash.is_none() {
+        AuthPairingState::AwaitingClaim
+    } else {
+        match decision.as_deref() {
+            Some("approved") => AuthPairingState::Approved,
+            Some("rejected") => AuthPairingState::Rejected,
+            _ => AuthPairingState::AwaitingApproval,
+        }
+    };
+    Ok(AuthPairingStatus {
+        id,
+        expires_at,
+        requested_device,
+        state,
+    })
+}
+
+fn pairing_code_rejected() -> String {
+    "pairing QR code is invalid, expired, or already used".to_string()
 }
 
 fn token_hash(token: &str) -> String {
@@ -4001,6 +4382,121 @@ mod tests {
                 .authorize_scope(expired, super::AuthScope::Read)
                 .expect("expired token should not authorize")
         );
+        drop(store);
+        fs::remove_dir_all(directory).expect("temporary data should be removed");
+    }
+
+    #[test]
+    fn local_auth_recovery_revokes_previous_tokens_and_keeps_the_new_one() {
+        let directory = std::env::temp_dir().join(format!(
+            "kakune-token-recovery-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(directory.clone()).expect("store should open");
+        let previous = store
+            .create_auth_token(
+                "previous admin".to_string(),
+                vec![super::AuthScope::Admin],
+                None,
+            )
+            .expect("previous token should be created");
+        let recovery = store
+            .create_auth_token(
+                "local recovery".to_string(),
+                vec![super::AuthScope::Admin],
+                None,
+            )
+            .expect("recovery token should be created");
+
+        assert_eq!(
+            store
+                .revoke_other_auth_tokens(&recovery.record.id)
+                .expect("previous tokens should be revoked"),
+            1
+        );
+        assert!(
+            !store
+                .authorize_scope(&previous.token, super::AuthScope::Admin)
+                .expect("previous token authorization should be checked")
+        );
+        assert!(
+            store
+                .authorize_scope(&recovery.token, super::AuthScope::Admin)
+                .expect("recovery token authorization should be checked")
+        );
+
+        drop(store);
+        fs::remove_dir_all(directory).expect("temporary data should be removed");
+    }
+
+    #[test]
+    fn qr_pairing_requires_local_approval_and_can_be_exchanged_once() {
+        let directory =
+            std::env::temp_dir().join(format!("kakune-pairing-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(directory.clone()).expect("store should open");
+        let code = format!("kakune_pair_{}", uuid::Uuid::new_v4().simple());
+        let claim_secret = format!("gui_claim_{}", uuid::Uuid::new_v4().simple());
+        let expires_at = (time::OffsetDateTime::now_utc() + time::Duration::minutes(5))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("expiration should format");
+        let invitation = store
+            .create_auth_pairing_code(
+                &code,
+                vec![
+                    super::AuthScope::Read,
+                    super::AuthScope::Run,
+                    super::AuthScope::Manage,
+                ],
+                expires_at,
+            )
+            .expect("pairing code should be created");
+
+        let claimed = store
+            .claim_auth_pairing_code(&code, &claim_secret, "Kakune GUI on laptop")
+            .expect("client should be able to request pairing");
+        assert_eq!(claimed.state, super::AuthPairingState::AwaitingApproval);
+        let another_claim_secret = format!("gui_claim_{}", uuid::Uuid::new_v4().simple());
+        assert!(
+            store
+                .claim_auth_pairing_code(&code, &another_claim_secret, "Other device")
+                .expect_err("only one GUI may claim an invitation")
+                .contains("already has a claim")
+        );
+        assert!(
+            store
+                .exchange_auth_pairing_code(&code, &claim_secret)
+                .expect_err("pairing must wait for local approval")
+                .contains("awaiting Core user approval")
+        );
+        assert!(
+            store
+                .decide_auth_pairing(&invitation.id, true)
+                .expect("local approval should persist")
+        );
+        assert_eq!(
+            store
+                .get_auth_pairing_status_for_claim(&code, &claim_secret)
+                .expect("GUI should be able to poll pairing status")
+                .state,
+            super::AuthPairingState::Approved
+        );
+
+        let token = store
+            .exchange_auth_pairing_code(&code, &claim_secret)
+            .expect("approved invitation should issue a token");
+        assert_eq!(token.record.name, "Kakune GUI on laptop");
+        assert!(
+            store
+                .authorize_scope(&token.token, super::AuthScope::Run)
+                .expect("paired token should authorize its granted scopes")
+        );
+        assert!(
+            store
+                .exchange_auth_pairing_code(&code, &claim_secret)
+                .expect_err("pairing code must be one use")
+                .contains("invalid, expired, or already used")
+        );
+
         drop(store);
         fs::remove_dir_all(directory).expect("temporary data should be removed");
     }

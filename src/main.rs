@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{self, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitCode, Stdio},
@@ -10,10 +11,10 @@ use clap::{Args, Parser, Subcommand};
 #[cfg(windows)]
 mod windows_service_host;
 use kakune_core::{
-    ConnectionContext, ContextFile, CoreConfig, PluginRegistry, ProviderAuth, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileStatus, ProviderProfileUpsert, ProviderType,
-    RetentionPolicy, Store, analyze_workflow_with_plugins, api, default_contexts_path,
-    default_data_dir, load_installed_plugin_registry,
+    AuthPairingState, AuthScope, ConnectionContext, ContextFile, CoreConfig, PluginRegistry,
+    ProviderAuth, ProviderProfile, ProviderProfileDiagnostic, ProviderProfileStatus,
+    ProviderProfileUpsert, ProviderType, RetentionPolicy, Store, analyze_workflow_with_plugins,
+    api, default_contexts_path, default_data_dir, load_installed_plugin_registry,
     plugin_install::{self, PluginSource},
     run_workflow_with_plugins, start_scheduler,
 };
@@ -66,6 +67,11 @@ enum Command {
     Context {
         #[command(subcommand)]
         command: ContextCommand,
+    },
+    /// Recovers local API access and manages local authentication.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
     },
     /// Validates, enables, disables, and lists workflow YAML documents.
     Workflow {
@@ -239,6 +245,44 @@ enum ContextCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Replaces all active API tokens and restores this CLI's local connection.
+    Recover {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Starts a temporary QR pairing invitation and waits for local approval.
+    Pair {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Reachable HTTPS endpoint for a remote Core; defaults to the local listener.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Allow the paired device to administer tokens and plugins.
+        #[arg(long)]
+        admin: bool,
+        /// Invitation lifetime, from 30 to 600 seconds.
+        #[arg(long, default_value_t = 300)]
+        ttl_seconds: u64,
+    },
+    /// Lists device and API credentials without exposing token values.
+    Tokens {
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Revokes an API credential by its ID.
+    Revoke {
+        id: String,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum PluginCommand {
     /// Copies/downloads and statically inspects a plugin without executing it.
     Prepare {
@@ -344,24 +388,34 @@ async fn main() -> ExitCode {
 }
 
 async fn execute(cli: Cli) -> Result<(), String> {
-    if !cli.standalone && (cli.context.is_some() || matches!(&cli.command, Command::Run { .. })) {
+    let context_file = cli.context_file.clone();
+    if !cli.standalone
+        && !matches!(&cli.command, Command::Auth { .. })
+        && (cli.context.is_some() || matches!(&cli.command, Command::Run { .. }))
+    {
         return execute_remote(&cli).await;
     }
     match cli.command {
         Command::Init { data_dir, config } => {
             let data_dir = data_dir.unwrap_or_else(default_data_dir);
             let loaded = CoreConfig::load_or_create(&data_dir, config)?;
-            let store = Store::open(data_dir)?;
+            let store = Store::open(data_dir.clone())?;
             println!(
                 "Initialized Kakune data directory at {}",
                 store.data_dir().display()
             );
             println!("Configuration: {}", loaded.path.display());
-            if let Some(token) = store.ensure_bootstrap_token()? {
-                println!("Initial API token (store it securely; it is shown only once): {token}");
-            }
+            let contexts_file = context_file
+                .clone()
+                .unwrap_or_else(|| default_contexts_path(data_dir));
+            configure_local_connection(
+                &store,
+                &contexts_file,
+                &loaded.config.api,
+                loaded.config.listen_addr()?,
+            )?;
         }
-        Command::Daemon(options) => execute_daemon(options).await?,
+        Command::Daemon(options) => execute_daemon(options, context_file).await?,
         Command::Storage { command } => execute_storage(command)?,
         Command::Service { command } => execute_service(command)?,
         Command::Doctor { data_dir, config } => {
@@ -377,6 +431,7 @@ async fn execute(cli: Cli) -> Result<(), String> {
             print_json(&store.operational_metrics()?)?;
         }
         Command::Context { command } => execute_context(command)?,
+        Command::Auth { command } => execute_auth(command, context_file)?,
         Command::Workflow { command } => match command {
             WorkflowCommand::Validate { workflow, data_dir } => {
                 let source = std::fs::read_to_string(&workflow)
@@ -731,7 +786,7 @@ fn provider_status_name(status: &ProviderProfileStatus) -> &'static str {
     }
 }
 
-async fn execute_daemon(options: DaemonArgs) -> Result<(), String> {
+async fn execute_daemon(options: DaemonArgs, context_file: Option<PathBuf>) -> Result<(), String> {
     let data_dir = options.data_dir.unwrap_or_else(default_data_dir);
     let mut loaded = CoreConfig::load_or_create(&data_dir, options.config.clone())?;
     if options.tls_cert.is_some() {
@@ -749,15 +804,36 @@ async fn execute_daemon(options: DaemonArgs) -> Result<(), String> {
         return Err("non-loopback listeners require TLS certificate and key".to_string());
     }
     match options.action {
-        Some(DaemonAction::Start) => {
-            start_background_daemon(&data_dir, &loaded.path, listen, &loaded.config.api)
-        }
+        Some(DaemonAction::Start) => start_background_daemon(
+            &data_dir,
+            &loaded.path,
+            context_file
+                .clone()
+                .unwrap_or_else(|| default_contexts_path(data_dir.clone())),
+            listen,
+            &loaded.config.api,
+        ),
         Some(DaemonAction::Stop) => stop_background_daemon(&data_dir),
         Some(DaemonAction::Status) => {
             println!("{}", daemon_status(&data_dir)?);
             Ok(())
         }
-        None => serve_daemon(data_dir, loaded.config, listen).await,
+        None => {
+            let is_managed_child = std::env::var_os("KAKUNE_DAEMON_MANAGED").is_some()
+                || std::env::var_os("KAKUNE_SERVICE_HOST").is_some();
+            if !is_managed_child {
+                let store = Store::open(data_dir.clone())?;
+                configure_local_connection(
+                    &store,
+                    &context_file
+                        .clone()
+                        .unwrap_or_else(|| default_contexts_path(data_dir.clone())),
+                    &loaded.config.api,
+                    listen,
+                )?;
+            }
+            serve_daemon(data_dir, loaded.config, listen).await
+        }
     }
 }
 
@@ -771,9 +847,7 @@ async fn serve_daemon(
     if recovered > 0 {
         eprintln!("Recovered {recovered} incomplete execution(s) after a previous Core shutdown.");
     }
-    if let Some(token) = store.ensure_bootstrap_token()? {
-        println!("Initial API token (store it securely; it is shown only once): {token}");
-    }
+    let _ = store.ensure_bootstrap_token()?;
     let plugins = load_installed_plugin_registry(&store)?;
     for execution in store.queued_executions()? {
         let store = store.clone();
@@ -803,6 +877,7 @@ async fn serve_daemon(
 fn start_background_daemon(
     data_dir: &Path,
     config: &Path,
+    contexts_file: PathBuf,
     listen: SocketAddr,
     api_config: &kakune_core::config::ApiConfig,
 ) -> Result<(), String> {
@@ -810,13 +885,11 @@ fn start_background_daemon(
     if daemon_is_running(data_dir)? {
         return Err("Kakune daemon is already running".to_string());
     }
+    configure_local_connection(&store, &contexts_file, api_config, listen)?;
     let pid_path = daemon_pid_path(data_dir);
     if pid_path.exists() {
         fs::remove_file(&pid_path)
             .map_err(|error| format!("cannot remove stale daemon PID file: {error}"))?;
-    }
-    if let Some(token) = store.ensure_bootstrap_token()? {
-        println!("Initial API token (store it securely; it is shown only once): {token}");
     }
     let log_path = data_dir.join("daemon.log");
     let log = fs::OpenOptions::new()
@@ -1037,8 +1110,379 @@ fn execute_context(command: ContextCommand) -> Result<(), String> {
     Ok(())
 }
 
+fn execute_auth(command: AuthCommand, context_file: Option<PathBuf>) -> Result<(), String> {
+    match command {
+        AuthCommand::Recover { data_dir, config } => {
+            let data_dir = data_dir.unwrap_or_else(default_data_dir);
+            let loaded = CoreConfig::load_or_create(&data_dir, config)?;
+            let listen = loaded.config.listen_addr()?;
+            let store = Store::open(data_dir.clone())?;
+            let contexts_file =
+                context_file.unwrap_or_else(|| default_contexts_path(data_dir.clone()));
+            recover_local_auth(&store, &contexts_file, &loaded.config.api, listen)?;
+        }
+        AuthCommand::Pair {
+            data_dir,
+            config,
+            endpoint,
+            admin,
+            ttl_seconds,
+        } => {
+            pair_local_gui(data_dir, config, endpoint, admin, ttl_seconds)?;
+        }
+        AuthCommand::Tokens { data_dir } => {
+            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
+            for token in store.list_auth_tokens()? {
+                let status = if token.revoked_at.is_some() {
+                    "revoked"
+                } else {
+                    "active"
+                };
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    token.id,
+                    token.name,
+                    auth_scope_names(&token.scopes),
+                    status,
+                    token.expires_at.as_deref().unwrap_or("never")
+                );
+            }
+        }
+        AuthCommand::Revoke { id, data_dir } => {
+            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
+            if !store.revoke_auth_token(&id)? {
+                return Err(format!("active token {id} was not found"));
+            }
+            println!("Revoked token {id}.");
+        }
+    }
+    Ok(())
+}
+
+fn auth_scope_names(scopes: &[AuthScope]) -> String {
+    scopes
+        .iter()
+        .map(|scope| match scope {
+            AuthScope::Read => "read",
+            AuthScope::Run => "run",
+            AuthScope::Manage => "manage",
+            AuthScope::Admin => "admin",
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+const CLI_KEYRING_SERVICE: &str = "dev.kakune.cli";
+
+fn local_credential_ref(core_id: &str) -> String {
+    format!("keychain:kakune/core/{core_id}")
+}
+
+fn cli_credential_entry(reference: &str) -> Result<keyring::Entry, String> {
+    let username = reference.strip_prefix("keychain:").unwrap_or(reference);
+    keyring::Entry::new(CLI_KEYRING_SERVICE, username)
+        .map_err(|error| format!("cannot access the OS credential manager: {error}"))
+}
+
+fn configure_local_connection(
+    store: &Store,
+    contexts_file: &Path,
+    api_config: &kakune_core::config::ApiConfig,
+    listen: SocketAddr,
+) -> Result<(), String> {
+    let token = store.ensure_bootstrap_token()?;
+    let core_id = store.core_id()?;
+    let reference = local_credential_ref(&core_id);
+    let credential_available = match cli_credential_entry(&reference) {
+        Ok(entry) => match token.as_deref() {
+            Some(token) => match entry.set_password(token) {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!("Kakune could not save the local credential securely: {error}");
+                    false
+                }
+            },
+            None => entry.get_password().is_ok(),
+        },
+        Err(error) => {
+            if token.is_none() {
+                eprintln!("Kakune could not read the local credential: {error}");
+            } else {
+                eprintln!("Kakune could not save the local credential securely: {error}");
+            }
+            false
+        }
+    };
+    let context_credential_ref = if credential_available || token.is_none() {
+        Some(reference)
+    } else {
+        None
+    };
+    save_local_context(
+        contexts_file,
+        &core_id,
+        &local_endpoint(api_config, listen),
+        context_credential_ref,
+    )?;
+
+    if credential_available {
+        println!(
+            "Local CLI connection configured for {}.",
+            local_endpoint(api_config, listen)
+        );
+    } else if let Some(token) = token {
+        println!(
+            "Initial API token (OS credential manager unavailable; set KAKUNE_TOKEN to use it): {token}"
+        );
+    } else {
+        println!(
+            "No local credential is available. Run `kakune auth recover` on this machine to reconnect."
+        );
+    }
+    Ok(())
+}
+
+fn recover_local_auth(
+    store: &Store,
+    contexts_file: &Path,
+    api_config: &kakune_core::config::ApiConfig,
+    listen: SocketAddr,
+) -> Result<(), String> {
+    let created = store.create_auth_token(
+        "Local recovery".to_string(),
+        vec![kakune_core::AuthScope::Admin],
+        None,
+    )?;
+    let core_id = store.core_id()?;
+    let reference = local_credential_ref(&core_id);
+    let credential_available = match cli_credential_entry(&reference) {
+        Ok(entry) => match entry.set_password(&created.token) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("Kakune could not save the recovered credential securely: {error}");
+                false
+            }
+        },
+        Err(error) => {
+            eprintln!("Kakune could not save the recovered credential securely: {error}");
+            false
+        }
+    };
+    save_local_context(
+        contexts_file,
+        &core_id,
+        &local_endpoint(api_config, listen),
+        credential_available.then_some(reference),
+    )?;
+    let revoked = store.revoke_other_auth_tokens(&created.record.id)?;
+    println!("Local API access recovered; revoked {revoked} previous active token(s).");
+    println!(
+        "Local CLI connection configured for {}.",
+        local_endpoint(api_config, listen)
+    );
+    if !credential_available {
+        println!(
+            "Recovery token (OS credential manager unavailable; set KAKUNE_TOKEN): {}",
+            created.token
+        );
+    }
+    Ok(())
+}
+
+fn pair_local_gui(
+    data_dir: Option<PathBuf>,
+    config: Option<PathBuf>,
+    endpoint: Option<String>,
+    admin: bool,
+    ttl_seconds: u64,
+) -> Result<(), String> {
+    if !(30..=600).contains(&ttl_seconds) {
+        return Err("pairing invitation lifetime must be 30-600 seconds".to_string());
+    }
+    let data_dir = data_dir.unwrap_or_else(default_data_dir);
+    let loaded = CoreConfig::load_or_create(&data_dir, config)?;
+    let listen = loaded.config.listen_addr()?;
+    let endpoint = validate_pairing_endpoint(
+        &endpoint.unwrap_or_else(|| local_endpoint(&loaded.config.api, listen)),
+    )?;
+    let store = Store::open(data_dir)?;
+    let core_id = store.core_id()?;
+    let ttl_seconds = i64::try_from(ttl_seconds)
+        .map_err(|_| "pairing invitation lifetime is out of range".to_string())?;
+    let expires_at = (time::OffsetDateTime::now_utc() + time::Duration::seconds(ttl_seconds))
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|error| format!("cannot format pairing expiration: {error}"))?;
+    let code = format!("kakune_pair_{}", uuid::Uuid::new_v4().simple());
+    let scopes = if admin {
+        vec![AuthScope::Admin]
+    } else {
+        vec![AuthScope::Read, AuthScope::Run, AuthScope::Manage]
+    };
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "format": "kakune-pairing/v1",
+        "endpoint": endpoint,
+        "coreId": core_id,
+        "pairingCode": code,
+        "expiresAt": expires_at,
+        "scopes": auth_scope_names(&scopes).split(',').collect::<Vec<_>>(),
+    }))
+    .map_err(|error| format!("cannot encode pairing QR payload: {error}"))?;
+    let qr = qrcode::QrCode::new(&payload)
+        .map_err(|error| format!("cannot create pairing QR code: {error}"))?;
+    let invitation = store.create_auth_pairing_code(&code, scopes.clone(), expires_at.clone())?;
+
+    println!("Scan this QR code in Kakune GUI to request a connection:");
+    println!(
+        "{}",
+        qr.render::<qrcode::render::unicode::Dense1x2>().build()
+    );
+    println!("Core: {endpoint}");
+    println!("Permissions: {}", auth_scope_names(&scopes));
+    println!("Expires: {expires_at}");
+    println!("Waiting for a device request. Confirm it here before access is granted.");
+
+    loop {
+        let status = store
+            .get_auth_pairing_status(&invitation.id)?
+            .ok_or_else(|| "pairing invitation disappeared from the Core store".to_string())?;
+        match status.state {
+            AuthPairingState::AwaitingClaim | AuthPairingState::Approved => {}
+            AuthPairingState::AwaitingApproval => {
+                let device = status
+                    .requested_device
+                    .as_deref()
+                    .unwrap_or("unnamed device");
+                print!(
+                    "Allow {device:?} to connect with [{}] permissions? [y/N] ",
+                    auth_scope_names(&scopes)
+                );
+                io::stdout()
+                    .flush()
+                    .map_err(|error| format!("cannot flush pairing prompt: {error}"))?;
+                let mut answer = String::new();
+                io::stdin()
+                    .read_line(&mut answer)
+                    .map_err(|error| format!("cannot read pairing approval: {error}"))?;
+                let approved = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+                if !store.decide_auth_pairing(&invitation.id, approved)? {
+                    println!(
+                        "Pairing request could not be confirmed; the invitation may have expired."
+                    );
+                    return Ok(());
+                }
+                if !approved {
+                    println!("Pairing request rejected.");
+                    return Ok(());
+                }
+                println!("Approved. Waiting for the GUI to finish connecting...");
+            }
+            AuthPairingState::Rejected => {
+                println!("Pairing request rejected.");
+                return Ok(());
+            }
+            AuthPairingState::Consumed => {
+                println!(
+                    "GUI connected successfully. Manage or revoke its token with `kakune auth tokens`."
+                );
+                return Ok(());
+            }
+            AuthPairingState::Expired => {
+                println!("Pairing QR code expired without completing a connection.");
+                return Ok(());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
+fn validate_pairing_endpoint(endpoint: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(endpoint).map_err(|_| "invalid pairing endpoint URL")?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("pairing endpoint must not contain credentials, a query, or a fragment".into());
+    }
+    let local = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if url.scheme() != "https" && !(url.scheme() == "http" && local) {
+        return Err("pairing with a non-loopback Core requires an HTTPS endpoint".to_string());
+    }
+    if url.host_str().is_none() {
+        return Err("pairing endpoint must include a host".to_string());
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn save_local_context(
+    contexts_file: &Path,
+    core_id: &str,
+    endpoint: &str,
+    credential_ref: Option<String>,
+) -> Result<(), String> {
+    let mut contexts = ContextFile::load(contexts_file)?;
+    let local = ConnectionContext {
+        id: "local".to_string(),
+        name: "Local Kakune Core".to_string(),
+        endpoint: endpoint.to_string(),
+        expected_core_id: Some(core_id.to_string()),
+        color: None,
+        credential_ref,
+    };
+    if let Some(existing) = contexts
+        .contexts
+        .iter_mut()
+        .find(|context| context.id == "local")
+    {
+        *existing = local;
+    } else {
+        contexts.contexts.push(local);
+    }
+    if contexts.active_context_id.is_none() {
+        contexts.active_context_id = Some("local".to_string());
+    }
+    contexts.save(contexts_file)
+}
+
+fn local_endpoint(api_config: &kakune_core::config::ApiConfig, listen: SocketAddr) -> String {
+    let listen = if listen.ip().is_unspecified() {
+        let loopback = if listen.is_ipv4() { "127.0.0.1" } else { "::1" };
+        SocketAddr::new(
+            loopback.parse().expect("loopback address is valid"),
+            listen.port(),
+        )
+    } else {
+        listen
+    };
+    let scheme = if api_config.tls_cert.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    format!("{scheme}://{listen}")
+}
+
 fn contexts_path(explicit: Option<PathBuf>) -> PathBuf {
     explicit.unwrap_or_else(|| default_contexts_path(default_data_dir()))
+}
+
+fn cli_contexts_path(cli: &Cli) -> PathBuf {
+    cli.context_file.clone().unwrap_or_else(|| {
+        let data_dir = match &cli.command {
+            Command::Run {
+                data_dir: Some(data_dir),
+                ..
+            } => data_dir.clone(),
+            _ => default_data_dir(),
+        };
+        default_contexts_path(data_dir)
+    })
 }
 
 async fn shutdown_signal() {
@@ -1067,11 +1511,7 @@ async fn shutdown_signal() {
 async fn execute_remote(cli: &Cli) -> Result<(), String> {
     use reqwest::Method;
     use serde_json::json;
-    let contexts = ContextFile::load(
-        &cli.context_file
-            .clone()
-            .unwrap_or_else(|| default_contexts_path(default_data_dir())),
-    )?;
+    let contexts = ContextFile::load(&cli_contexts_path(cli))?;
     let selected = cli.context.as_ref().or(contexts.active_context_id.as_ref());
     let local = ConnectionContext {
         id: "local".into(),
@@ -1094,13 +1534,12 @@ async fn execute_remote(cli: &Cli) -> Result<(), String> {
     let token = match &context.credential_ref {
         Some(reference) if reference.starts_with("env:") => std::env::var(&reference[4..])
             .map_err(|_| "context token environment variable is missing".to_string())?,
-        Some(reference) => keyring::Entry::new(
-            "dev.kakune.cli",
-            reference.strip_prefix("keychain:").unwrap_or(reference),
-        )
-        .map_err(|error| error.to_string())?
-        .get_password()
-        .map_err(|_| "context token is unavailable in the credential store".to_string())?,
+        Some(reference) => cli_credential_entry(reference)?
+            .get_password()
+            .map_err(|_| {
+                "context credential is unavailable; run `kakune auth recover` on the Core machine"
+                    .to_string()
+            })?,
         None => std::env::var("KAKUNE_TOKEN").map_err(|_| {
             "set KAKUNE_TOKEN or configure a context credential reference".to_string()
         })?,
@@ -1288,4 +1727,74 @@ async fn execute_remote(cli: &Cli) -> Result<(), String> {
         }
     };
     print_json(&value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContextFile, local_endpoint, save_local_context, validate_pairing_endpoint};
+    use kakune_core::config::ApiConfig;
+    use std::fs;
+
+    #[test]
+    fn local_connection_persists_only_credential_reference_and_selects_local_context() {
+        let directory = std::env::temp_dir().join(format!(
+            "kakune-local-context-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = directory.join("cli").join("contexts.json");
+
+        save_local_context(
+            &path,
+            "core-123",
+            "http://127.0.0.1:8787",
+            Some("keychain:kakune/core/core-123".to_string()),
+        )
+        .expect("local context should save");
+        let contexts = ContextFile::load(&path).expect("local context should reload");
+        let source = fs::read_to_string(&path).expect("context file should be readable");
+
+        assert_eq!(contexts.active_context_id.as_deref(), Some("local"));
+        assert_eq!(
+            contexts.contexts[0].expected_core_id.as_deref(),
+            Some("core-123")
+        );
+        assert_eq!(
+            contexts.contexts[0].credential_ref.as_deref(),
+            Some("keychain:kakune/core/core-123")
+        );
+        assert!(!source.contains("kakune_"));
+
+        fs::remove_dir_all(directory).expect("temporary context directory should be removed");
+    }
+
+    #[test]
+    fn local_connection_uses_loopback_for_wildcard_listeners() {
+        let config = ApiConfig::default();
+        assert_eq!(
+            local_endpoint(
+                &config,
+                "0.0.0.0:8787".parse().expect("IPv4 socket is valid")
+            ),
+            "http://127.0.0.1:8787"
+        );
+        assert_eq!(
+            local_endpoint(&config, "[::]:8787".parse().expect("IPv6 socket is valid")),
+            "http://[::1]:8787"
+        );
+    }
+
+    #[test]
+    fn remote_pairing_requires_https_but_loopback_can_use_http() {
+        assert_eq!(
+            validate_pairing_endpoint("http://127.0.0.1:8787")
+                .expect("loopback endpoint should be accepted"),
+            "http://127.0.0.1:8787"
+        );
+        assert!(validate_pairing_endpoint("http://192.168.1.20:8787").is_err());
+        assert_eq!(
+            validate_pairing_endpoint("https://core.example.com:8787/")
+                .expect("HTTPS endpoint should be accepted"),
+            "https://core.example.com:8787"
+        );
+    }
 }

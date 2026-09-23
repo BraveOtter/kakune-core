@@ -31,13 +31,14 @@ pub use runtime::{
     run_workflow_with_plugins,
 };
 pub use store::{
-    AuthScope, AuthTokenRecord, BackupSummary, CreatedAuthToken, ExecutionRecord,
-    ExecutionTraceRecord, InstalledPluginRecord, NodeRunRecord, OperationalMetrics,
-    PreparedPluginInstallRecord, ProviderAuth, ProviderInvocationRecord, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileStatus, ProviderProfileUpsert, ProviderType,
-    ProviderUsageSummary, RetentionPolicy, RetentionReport, SecretRecord, Store, TraceArtifactLink,
-    TraceSpanRecord, WorkflowRecord, WorkflowRevisionComparison, WorkflowRevisionRecord,
-    WorkflowRevisionSource, WorkflowSourceRecord, WorkflowSourceUpdate,
+    AuthPairingState, AuthPairingStatus, AuthScope, AuthTokenRecord, BackupSummary,
+    CreatedAuthPairingCode, CreatedAuthToken, ExecutionRecord, ExecutionTraceRecord,
+    InstalledPluginRecord, NodeRunRecord, OperationalMetrics, PreparedPluginInstallRecord,
+    ProviderAuth, ProviderInvocationRecord, ProviderProfile, ProviderProfileDiagnostic,
+    ProviderProfileStatus, ProviderProfileUpsert, ProviderType, ProviderUsageSummary,
+    RetentionPolicy, RetentionReport, SecretRecord, Store, TraceArtifactLink, TraceSpanRecord,
+    WorkflowRecord, WorkflowRevisionComparison, WorkflowRevisionRecord, WorkflowRevisionSource,
+    WorkflowSourceRecord, WorkflowSourceUpdate,
 };
 pub use workflow::WorkflowDocument;
 
