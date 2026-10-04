@@ -15,5 +15,13 @@ Thumbs.db
 
 # Rust build and profiling by-products outside the root target directory.
 **/*.rs.bk
-*.profraw
-*.profdata
+*.prof*
+/debug/
+/release/
+*.rlib
+
+# Editor and temporary files.
+.vscode/
+.idea/
+*.tmp
+*.swp
