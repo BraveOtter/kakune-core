@@ -31,7 +31,29 @@ cargo run -- init --data-dir .\data
 cargo run -- daemon --data-dir .\data
 ```
 
-The daemon listens on `http://127.0.0.1:8787` by default. Its local data directory defaults to `%APPDATA%\Kakune` on Windows, or can be overridden with `KAKUNE_DATA_DIR`.
+The daemon listens on `http://127.0.0.1:8787` by default. Kakune selects its data directory from `KAKUNE_DATA_DIR` when set, then `%APPDATA%\Kakune`, `$XDG_DATA_HOME/kakune`, or `~/.local/share/kakune`. Override it per command with `--data-dir <directory>`.
+
+### General commands
+
+```text
+kakune init [--data-dir <directory>] [--config <file>] [--context-file <file>]
+kakune version
+kakune --version
+```
+
+`init` is local-only: it rejects `--context`, never starts the Core, and never contacts a remote endpoint. `--standalone` and `--ca` are accepted as compatibility no-ops. Unless overridden, the configuration is `<data-dir>/kakune.yaml` and the connection file is `<data-dir>/cli/contexts.json`; pass `--config` and the global `--context-file` option to select other paths.
+
+Initialization is complete only when the configuration, storage, installation identity, usable administrative client access, and compatible local connection metadata are all ready. First-use access must be saved to the OS credential manager, read back, and authorized locally. If secure saving, readback, or authorization fails, `init` reports partial setup and exits unsuccessfully; it never prints a token as a fallback. A retry never issues replacement access for an existing installation. If access must be restored, use explicit recovery with the same paths selected for initialization:
+
+```text
+kakune --context-file <contexts-file> auth recover --data-dir <directory> --config <config-file>
+```
+
+It is safe to repeat `init`: it creates only missing valid resources and preserves existing configuration, credential history, custom connection fields, unrelated contexts, and the active-context selection. It does not refresh custom endpoints or silently rotate/revoke credentials. Initial access is issued only for a genuinely new installation; recovery remains a separate, deliberate operation.
+
+`kakune version` and `kakune --version` report the same build version of the invoked executable. They do not inspect installation files, load connection metadata, or contact a Core.
+
+These commands have distinct purposes: `daemon` starts or manages the Core, `doctor` reports local configuration/storage/runtime diagnostics, and `auth recover` deliberately replaces active access when requested. Initialization does not run any of them implicitly.
 
 `init` creates `<data-dir>/kakune.yaml` if it does not exist. It configures the loopback listener, an explicit browser-origin allowlist, a 1 MiB request-body limit, and a 120 request/minute local API limit. Add trusted browser origins to `api.allowedOrigins`; requests that include any other `Origin` are rejected.
 
@@ -43,7 +65,7 @@ api:
   rateLimitRequestsPerMinute: 120
 ```
 
-Use `kakune daemon start`, `kakune daemon status`, and `kakune daemon stop` for a user-managed background process. `kakune init` creates the active local context and stores its credential in the OS credential manager. `kakune context add|list|use|inspect|remove|import|export` stores only portable connection metadata and credential references in `<data-dir>/cli/contexts.json`; it never stores token values.
+Use `kakune daemon start`, `kakune daemon status`, and `kakune daemon stop` for a user-managed background process. `kakune context add|list|use|inspect|remove|import|export` stores only portable connection metadata and credential references in `<data-dir>/cli/contexts.json`; it never stores token values.
 
 `kakune provider list|upsert|status|remove` manages non-secret provider profiles. A Codex profile uses `oauthSecret`, whose reference points to an encrypted ChatGPT Plus/Pro OAuth token. `kakune provider login <id>` opens a browser authorization flow directly and does not require, invoke, or read credentials from Codex CLI.
 
@@ -261,7 +283,7 @@ The versioned API is rooted at `/api/v1`:
 - `GET, POST /api/v1/executions`
 - `GET /api/v1/executions/{id}`
 
-`kakune init` provisions the initial `admin` credential in the operating system's credential manager and configures the local CLI context; normal local CLI use does not require copying a token. The database stores only SHA-256 token digests. If local access is lost, run `kakune auth recover --data-dir <directory>` on the Core machine to issue a new credential and revoke all previous active tokens. If the OS credential manager is unavailable, the command falls back to showing the new token once for use through `KAKUNE_TOKEN`.
+`kakune init` provisions initial administrative access in the operating system's credential manager and configures the local CLI context; normal local CLI use does not require copying a token. The database stores only SHA-256 token digests. If local access is lost, run `kakune auth recover --data-dir <directory>` on the Core machine to deliberately issue a new credential and revoke previous active tokens. Recovery remains distinct from initialization; if the OS credential manager is unavailable, the recovery command retains its existing behavior of showing the new token once for use through `KAKUNE_TOKEN`. Initialization never uses that plaintext fallback.
 
 To connect a GUI, run `kakune auth pair --data-dir <directory>` in a Core terminal, scan its QR from the GUI, then approve the named device in that terminal. Updating an existing Core and restarting it once enables these endpoints; the database migration and pre-upgrade backup run automatically. The invitation expires after five minutes and can be claimed once. The resulting device token has `read`, `run`, and `manage` scopes by default; `--admin` explicitly grants full administration. For a GUI on another machine, provide its reachable HTTPS Core URL with `--endpoint https://core.example.com:8787`. Configure the Core's `api.allowedHosts` and, for browser-based GUIs, the GUI origin in `api.allowedOrigins` before pairing. The GUI should poll the pairing status until approval, exchange the approved claim for its token, and keep that token in its own OS credential manager. Use `kakune auth tokens --data-dir <directory>` to list credentials and `kakune auth revoke <token-id> --data-dir <directory>` to revoke one device. The pairing endpoints are unauthenticated by design, but require the high-entropy QR code, a GUI-generated claim secret, the local approval, and HTTPS for non-loopback endpoints.
 
