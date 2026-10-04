@@ -1,11 +1,14 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -22,6 +25,7 @@ use crate::{
 pub struct Store {
     connection: Arc<Mutex<Connection>>,
     data_dir: Arc<PathBuf>,
+    initialization_issuance_eligible: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -426,6 +430,13 @@ pub struct PreparedPluginInstallRecord {
 
 impl Store {
     pub fn open(data_dir: PathBuf) -> Result<Self, String> {
+        Self::open_with_busy_timeout(data_dir, None)
+    }
+
+    fn open_with_busy_timeout(
+        data_dir: PathBuf,
+        busy_timeout: Option<std::time::Duration>,
+    ) -> Result<Self, String> {
         fs::create_dir_all(&data_dir)
             .map_err(|error| format!("cannot create Kakune data directory: {error}"))?;
         let database_path = data_dir.join("kakune.sqlite3");
@@ -436,16 +447,101 @@ impl Store {
                 > 0;
         let mut connection = Connection::open(&database_path)
             .map_err(|error| format!("cannot open Kakune database: {error}"))?;
+        if let Some(busy_timeout) = busy_timeout {
+            connection
+                .busy_timeout(busy_timeout)
+                .map_err(database_error)?;
+        }
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .map_err(|error| format!("cannot configure Kakune database: {error}"))?;
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| format!("cannot configure Kakune database: {error}"))?;
-        migrate(&mut connection, &data_dir, database_existed)?;
+        if let Err(error) = migrate(&mut connection, &data_dir, database_existed) {
+            return Err(if busy_timeout.is_some() {
+                format!("Kakune storage migration failed: {error}")
+            } else {
+                error
+            });
+        }
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             data_dir: Arc::new(data_dir),
+            initialization_issuance_eligible: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub(crate) fn open_for_initialization(data_dir: PathBuf) -> Result<(Self, bool), String> {
+        fs::create_dir_all(&data_dir)
+            .map_err(|error| format!("cannot create Kakune data directory: {error}"))?;
+        let database_path = data_dir.join("kakune.sqlite3");
+        let is_new = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&database_path)
+        {
+            Ok(file) => {
+                drop(file);
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                validate_initialization_database(&database_path)?;
+                false
+            }
+            Err(error) => {
+                return Err(format!("cannot create Kakune database: {error}"));
+            }
+        };
+
+        let store =
+            Self::open_with_busy_timeout(data_dir, Some(std::time::Duration::from_secs(5)))?;
+        store
+            .initialization_issuance_eligible
+            .store(is_new, Ordering::Release);
+        Ok((store, is_new))
+    }
+
+    pub(crate) fn issue_initial_admin_credential(&self) -> Result<String, String> {
+        if !self
+            .initialization_issuance_eligible
+            .load(Ordering::Acquire)
+        {
+            return Err("initial credential issuance requires a new installation".to_string());
+        }
+        self.with_connection(|connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            let has_identity: bool = transaction
+                .query_row("SELECT EXISTS(SELECT 1 FROM core_state)", [], |row| {
+                    row.get(0)
+                })
+                .map_err(database_error)?;
+            let has_credential_history: bool = transaction
+                .query_row("SELECT EXISTS(SELECT 1 FROM auth_tokens)", [], |row| {
+                    row.get(0)
+                })
+                .map_err(database_error)?;
+            if !has_identity || has_credential_history {
+                return Err(
+                    "installation identity or credential history prevents initial issuance"
+                        .to_string(),
+                );
+            }
+
+            let token = format!("kakune_{}", Uuid::new_v4().simple());
+            transaction
+                .execute(
+                    "INSERT INTO auth_tokens (id, token_hash, name, scopes, created_at)
+                     VALUES (?1, ?2, 'Initial local administrator', '[\"admin\"]', ?3)",
+                    params![Uuid::new_v4().to_string(), token_hash(&token), now()?],
+                )
+                .map_err(database_error)?;
+            transaction.commit().map_err(database_error)?;
+            self.initialization_issuance_eligible
+                .store(false, Ordering::Release);
+            Ok(token)
         })
     }
 
@@ -2943,6 +3039,58 @@ fn schema_version(connection: &Connection) -> Result<u32, String> {
     u32::try_from(version).map_err(|_| "database schema version is invalid".to_string())
 }
 
+fn validate_initialization_database(path: &Path) -> Result<(), String> {
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("cannot inspect Kakune database: {error}"))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err("preexisting database is empty or is not a regular file".to_string());
+    }
+
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "preexisting database is unreadable or corrupt".to_string())?;
+    let tables = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|_| "preexisting database is unreadable or corrupt".to_string())?;
+
+    let has_migrations = tables.iter().any(|name| name == "schema_migrations");
+    let recognized_legacy = ["workflows", "node_runs", "auth_tokens"]
+        .iter()
+        .all(|expected| tables.iter().any(|name| name == expected));
+    if !recognized_legacy {
+        return Err("preexisting database does not have a supported Kakune schema".to_string());
+    }
+
+    let current = if has_migrations {
+        schema_version(&connection)?
+    } else {
+        0
+    };
+    if current > LATEST_SCHEMA_VERSION {
+        return Err(format!(
+            "Kakune database schema version {current} is newer than this Core supports ({LATEST_SCHEMA_VERSION})"
+        ));
+    }
+    if current > 0 {
+        if !tables.iter().any(|name| name == "core_state") {
+            return Err("preexisting database is missing its supported core identity".to_string());
+        }
+        let has_identity: bool = connection
+            .query_row("SELECT EXISTS(SELECT 1 FROM core_state)", [], |row| {
+                row.get(0)
+            })
+            .map_err(|_| "preexisting database has an invalid core identity".to_string())?;
+        if !has_identity {
+            return Err("preexisting database is missing its supported core identity".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn count_rows(connection: &Connection, table: &str) -> Result<u64, String> {
     let value: i64 = connection
         .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -4119,13 +4267,13 @@ fn idempotent_execution(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, sync::atomic::Ordering};
 
     use crate::WorkflowDocument;
 
     use super::{
-        ProviderAuth, ProviderInvocation, ProviderProfileDiagnostic, ProviderProfileStatus,
-        ProviderProfileUpsert, ProviderType, Store, WorkflowSourceUpdate,
+        AuthScope, ProviderAuth, ProviderInvocation, ProviderProfileDiagnostic,
+        ProviderProfileStatus, ProviderProfileUpsert, ProviderType, Store, WorkflowSourceUpdate,
     };
 
     #[test]
@@ -4932,6 +5080,160 @@ mod tests {
                 .join("kakune.sqlite3.before-migration-v2.sqlite3")
                 .exists()
         );
+        drop(store);
+        fs::remove_dir_all(directory).expect("temporary data should be removed");
+    }
+
+    #[test]
+    fn initialization_opening_provenance_is_lost_when_an_unissued_store_is_reopened() {
+        let directory = std::env::temp_dir()
+            .join("opencode")
+            .join(format!("kakune-init-provenance-{}", uuid::Uuid::new_v4()));
+        let (new_store, was_new) = Store::open_for_initialization(directory.clone())
+            .expect("absent database should open as new");
+        assert!(was_new);
+        drop(new_store);
+
+        let (reopened, was_new) = Store::open_for_initialization(directory.clone())
+            .expect("supported existing database should reopen");
+        assert!(!was_new);
+        assert!(reopened.issue_initial_admin_credential().is_err());
+        assert!(reopened.list_auth_tokens().unwrap().is_empty());
+        drop(reopened);
+        fs::remove_dir_all(directory).expect("temporary data should be removed");
+    }
+
+    #[test]
+    fn initial_issuance_is_single_use_across_independent_sqlite_connections() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        let directory = std::env::temp_dir()
+            .join("opencode")
+            .join(format!("kakune-init-issuance-{}", uuid::Uuid::new_v4()));
+        let (first, eligible) = Store::open_for_initialization(directory.clone())
+            .expect("absent database should be eligible");
+        assert!(eligible);
+        let second = Store::open(directory.clone()).expect("second connection should open");
+        // Simulate two stale in-memory claims. The immediate transaction and durable
+        // credential-history recheck must still allow only one insert.
+        second
+            .initialization_issuance_eligible
+            .store(true, Ordering::Release);
+
+        let first = Arc::new(first);
+        let second = Arc::new(second);
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(2);
+        let (release_first, start_first) = mpsc::sync_channel(1);
+        let (release_second, start_second) = mpsc::sync_channel(1);
+        let (result_sender, result_receiver) = mpsc::sync_channel(2);
+        let first_worker = {
+            let store = Arc::clone(&first);
+            let ready = ready_sender.clone();
+            let result = result_sender.clone();
+            std::thread::spawn(move || {
+                ready
+                    .send(())
+                    .expect("test coordinator should remain connected");
+                let outcome = start_first
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|_| {
+                        "first issuer did not receive its bounded start signal".to_string()
+                    })
+                    .and_then(|()| store.issue_initial_admin_credential());
+                result
+                    .send(outcome)
+                    .expect("test coordinator should receive outcome");
+            })
+        };
+        let second_worker = {
+            let store = Arc::clone(&second);
+            let ready = ready_sender.clone();
+            std::thread::spawn(move || {
+                ready
+                    .send(())
+                    .expect("test coordinator should remain connected");
+                let outcome = start_second
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|_| {
+                        "second issuer did not receive its bounded start signal".to_string()
+                    })
+                    .and_then(|()| store.issue_initial_admin_credential());
+                result_sender
+                    .send(outcome)
+                    .expect("test coordinator should receive outcome");
+            })
+        };
+        ready_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first issuer should reach its bounded start gate");
+        ready_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second issuer should reach its bounded start gate");
+        release_first
+            .send(())
+            .expect("first issuer should accept its start signal");
+        release_second
+            .send(())
+            .expect("second issuer should accept its start signal");
+        let mut first_result = result_receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first issuance result should arrive before its deadline");
+        let mut second_result = result_receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("second issuance result should arrive before its deadline");
+        assert_eq!(
+            usize::from(first_result.is_ok()) + usize::from(second_result.is_ok()),
+            1
+        );
+        if let Ok(token) = &mut first_result {
+            use zeroize::Zeroize;
+            token.zeroize();
+        }
+        if let Ok(token) = &mut second_result {
+            use zeroize::Zeroize;
+            token.zeroize();
+        }
+        first_worker
+            .join()
+            .expect("first independent connection thread should finish");
+        second_worker
+            .join()
+            .expect("second independent connection thread should finish");
+
+        drop(first);
+        drop(second);
+        let store = Store::open(directory.clone()).expect("store should reopen");
+        let records = store
+            .list_auth_tokens()
+            .expect("credential history should load");
+        assert_eq!(records.len(), 1);
+        assert!(records[0].scopes.contains(&AuthScope::Admin));
+        drop(store);
+        fs::remove_dir_all(directory).expect("temporary data should be removed");
+    }
+
+    #[test]
+    fn initialization_issuance_rejects_preexisting_identity_and_token_history() {
+        let directory = std::env::temp_dir().join("opencode").join(format!(
+            "kakune-init-existing-identity-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(directory.clone()).expect("ordinary store should open");
+        assert!(store.issue_initial_admin_credential().is_err());
+        let mut created = store
+            .create_auth_token("historical token".to_string(), vec![AuthScope::Admin], None)
+            .expect("historical credential should be created");
+        assert!(!created.token.is_empty());
+        {
+            use zeroize::Zeroize;
+            created.token.zeroize();
+        }
+        store
+            .initialization_issuance_eligible
+            .store(true, Ordering::Release);
+        assert!(store.issue_initial_admin_credential().is_err());
+        assert_eq!(store.list_auth_tokens().unwrap().len(), 1);
         drop(store);
         fs::remove_dir_all(directory).expect("temporary data should be removed");
     }
