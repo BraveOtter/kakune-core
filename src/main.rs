@@ -6,7 +6,7 @@ use std::{
     process::{Command as ProcessCommand, ExitCode, Stdio},
 };
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 #[cfg(windows)]
 mod windows_service_host;
@@ -14,7 +14,14 @@ use kakune_core::{
     AuthPairingState, AuthScope, ConnectionContext, ContextFile, CoreConfig, PluginRegistry,
     ProviderAuth, ProviderProfile, ProviderProfileDiagnostic, ProviderProfileStatus,
     ProviderProfileUpsert, ProviderType, RetentionPolicy, Store, analyze_workflow_with_plugins,
-    api, default_contexts_path, default_data_dir, load_installed_plugin_registry,
+    api,
+    client_config::SystemCredentialAccess,
+    default_contexts_path, default_data_dir,
+    initialization::{
+        ComponentState, CredentialAccess, InitializationCorrection, InitializationError,
+        InitializationPaths, InitializationReport, initialize,
+    },
+    load_installed_plugin_registry,
     plugin_install::{self, PluginSource},
     run_workflow_with_plugins, start_scheduler,
 };
@@ -37,13 +44,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Creates the Kakune data directory and SQLite database.
+    /// Safely prepares or checks the selected local installation.
+    #[command(
+        long_about = "Local-only: does not accept --context and never starts the Core or contacts remote endpoints.\n--standalone and --ca are compatibility no-ops.\nSafe to repeat: preserves existing data, configuration, credential history, and custom connection metadata; does not rotate access.\nLost access requires explicit `kakune auth recover`."
+    )]
     Init {
         #[arg(long)]
         data_dir: Option<PathBuf>,
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Reports this executable's local build version.
+    #[command(
+        long_about = "Reports the build version of this local executable. It does not access installation files or a remote Core."
+    )]
+    Version,
     /// Runs the Core HTTP API in the foreground.
     Daemon(DaemonArgs),
     /// Backs up, restores, retains, and compacts Core data.
@@ -246,7 +261,7 @@ enum ContextCommand {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
-    /// Replaces all active API tokens and restores this CLI's local connection.
+    /// Explicitly recovers lost local access by replacing active API tokens.
     Recover {
         #[arg(long)]
         data_dir: Option<PathBuf>,
@@ -388,7 +403,22 @@ async fn main() -> ExitCode {
 }
 
 async fn execute(cli: Cli) -> Result<(), String> {
+    execute_with_credentials(cli, &SystemCredentialAccess).await
+}
+
+async fn execute_with_credentials(
+    cli: Cli,
+    credentials: &dyn CredentialAccess,
+) -> Result<(), String> {
+    if matches!(&cli.command, Command::Version) {
+        print!("{}", Cli::command().render_long_version());
+        return Ok(());
+    }
+
     let context_file = cli.context_file.clone();
+    if cli.context.is_some() && matches!(&cli.command, Command::Init { .. }) {
+        return Err("init is local-only and does not accept --context".to_string());
+    }
     if !cli.standalone
         && !matches!(&cli.command, Command::Auth { .. })
         && (cli.context.is_some() || matches!(&cli.command, Command::Run { .. }))
@@ -397,24 +427,12 @@ async fn execute(cli: Cli) -> Result<(), String> {
     }
     match cli.command {
         Command::Init { data_dir, config } => {
-            let data_dir = data_dir.unwrap_or_else(default_data_dir);
-            let loaded = CoreConfig::load_or_create(&data_dir, config)?;
-            let store = Store::open(data_dir.clone())?;
-            println!(
-                "Initialized Kakune data directory at {}",
-                store.data_dir().display()
-            );
-            println!("Configuration: {}", loaded.path.display());
-            let contexts_file = context_file
-                .clone()
-                .unwrap_or_else(|| default_contexts_path(data_dir));
-            configure_local_connection(
-                &store,
-                &contexts_file,
-                &loaded.config.api,
-                loaded.config.listen_addr()?,
-            )?;
+            let paths =
+                resolve_initialization_paths(data_dir, config, context_file, default_data_dir());
+            let report = run_initialization_with(paths, credentials)?;
+            println!("{}", render_init_report(&report));
         }
+        Command::Version => unreachable!("version returns before setup and remote routing"),
         Command::Daemon(options) => execute_daemon(options, context_file).await?,
         Command::Storage { command } => execute_storage(command)?,
         Command::Service { command } => execute_service(command)?,
@@ -611,6 +629,79 @@ async fn execute(cli: Cli) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn resolve_initialization_paths(
+    data_dir: Option<PathBuf>,
+    config: Option<PathBuf>,
+    context_file: Option<PathBuf>,
+    default_data_dir: PathBuf,
+) -> InitializationPaths {
+    let data_dir = data_dir.unwrap_or(default_data_dir);
+    InitializationPaths {
+        config_file: config.unwrap_or_else(|| data_dir.join("kakune.yaml")),
+        context_file: context_file.unwrap_or_else(|| default_contexts_path(data_dir.clone())),
+        data_dir,
+    }
+}
+
+fn run_initialization_with(
+    paths: InitializationPaths,
+    credentials: &dyn CredentialAccess,
+) -> Result<InitializationReport, String> {
+    initialize(paths, credentials).map_err(render_init_error)
+}
+
+fn render_init_error(error: InitializationError) -> String {
+    let report = &error.report;
+    let mut message = format!(
+        "initialization incomplete: {} for {}; {}\nData directory: {} ({})\nConfiguration: {} ({})\nStorage: {}\nInstallation identity: {}\nClient access: {}\nConnection file: {} ({})",
+        error.category,
+        error.resource,
+        error.correction,
+        report.paths.data_dir.display(),
+        component_state_name(report.storage),
+        report.paths.config_file.display(),
+        component_state_name(report.configuration),
+        component_state_name(report.storage),
+        component_state_name(report.identity),
+        component_state_name(report.client_access),
+        report.paths.context_file.display(),
+        component_state_name(report.local_context),
+    );
+    if error.correction == InitializationCorrection::RunExplicitAuthRecovery {
+        message.push_str(&format!(
+            "\nRun explicit recovery for these local paths: kakune --context-file \"{}\" auth recover --data-dir \"{}\" --config \"{}\"",
+            report.paths.context_file.display(),
+            report.paths.data_dir.display(),
+            report.paths.config_file.display(),
+        ));
+    }
+    message
+}
+
+fn render_init_report(report: &InitializationReport) -> String {
+    format!(
+        "Kakune local initialization complete.\nData directory: {} ({})\nConfiguration: {} ({})\nStorage: {}\nInstallation identity: {}\nClient access: {}\nLocal connection: {} ({})",
+        report.paths.data_dir.display(),
+        component_state_name(report.storage),
+        report.paths.config_file.display(),
+        component_state_name(report.configuration),
+        component_state_name(report.storage),
+        component_state_name(report.identity),
+        component_state_name(report.client_access),
+        report.paths.context_file.display(),
+        component_state_name(report.local_context),
+    )
+}
+
+fn component_state_name(state: ComponentState) -> &'static str {
+    match state {
+        ComponentState::NotAttempted => "not attempted",
+        ComponentState::Created => "created",
+        ComponentState::Reused => "reused",
+        ComponentState::Incomplete => "incomplete",
+    }
 }
 
 fn execute_service(command: ServiceCommand) -> Result<(), String> {
@@ -1184,53 +1275,48 @@ fn cli_credential_entry(reference: &str) -> Result<keyring::Entry, String> {
         .map_err(|error| format!("cannot access the OS credential manager: {error}"))
 }
 
+struct LocalConnectionOutcome {
+    endpoint: String,
+    credential_available: bool,
+    fallback_token: Option<String>,
+}
+
 fn configure_local_connection(
     store: &Store,
     contexts_file: &Path,
     api_config: &kakune_core::config::ApiConfig,
     listen: SocketAddr,
 ) -> Result<(), String> {
-    let token = store.ensure_bootstrap_token()?;
-    let core_id = store.core_id()?;
-    let reference = local_credential_ref(&core_id);
-    let credential_available = match cli_credential_entry(&reference) {
-        Ok(entry) => match token.as_deref() {
-            Some(token) => match entry.set_password(token) {
-                Ok(()) => true,
-                Err(error) => {
-                    eprintln!("Kakune could not save the local credential securely: {error}");
-                    false
-                }
-            },
-            None => entry.get_password().is_ok(),
-        },
-        Err(error) => {
-            if token.is_none() {
-                eprintln!("Kakune could not read the local credential: {error}");
-            } else {
-                eprintln!("Kakune could not save the local credential securely: {error}");
-            }
-            false
-        }
-    };
-    let context_credential_ref = if credential_available || token.is_none() {
-        Some(reference)
-    } else {
-        None
-    };
-    save_local_context(
+    let outcome = configure_local_connection_with_credentials(
+        store,
         contexts_file,
-        &core_id,
-        &local_endpoint(api_config, listen),
-        context_credential_ref,
+        api_config,
+        listen,
+        |reference, token| match cli_credential_entry(reference) {
+            Ok(entry) => match token {
+                Some(token) => match entry.set_password(token) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        eprintln!("Kakune could not save the local credential securely: {error}");
+                        false
+                    }
+                },
+                None => entry.get_password().is_ok(),
+            },
+            Err(error) => {
+                if token.is_none() {
+                    eprintln!("Kakune could not read the local credential: {error}");
+                } else {
+                    eprintln!("Kakune could not save the local credential securely: {error}");
+                }
+                false
+            }
+        },
     )?;
 
-    if credential_available {
-        println!(
-            "Local CLI connection configured for {}.",
-            local_endpoint(api_config, listen)
-        );
-    } else if let Some(token) = token {
+    if outcome.credential_available {
+        println!("Local CLI connection configured for {}.", outcome.endpoint);
+    } else if let Some(token) = outcome.fallback_token {
         println!(
             "Initial API token (OS credential manager unavailable; set KAKUNE_TOKEN to use it): {token}"
         );
@@ -1242,12 +1328,82 @@ fn configure_local_connection(
     Ok(())
 }
 
+fn configure_local_connection_with_credentials(
+    store: &Store,
+    contexts_file: &Path,
+    api_config: &kakune_core::config::ApiConfig,
+    listen: SocketAddr,
+    credential_access: impl FnOnce(&str, Option<&str>) -> bool,
+) -> Result<LocalConnectionOutcome, String> {
+    let token = store.ensure_bootstrap_token()?;
+    let core_id = store.core_id()?;
+    let reference = local_credential_ref(&core_id);
+    let credential_available = credential_access(&reference, token.as_deref());
+    let context_credential_ref = if credential_available || token.is_none() {
+        Some(reference)
+    } else {
+        None
+    };
+    let endpoint = local_endpoint(api_config, listen);
+    save_local_context(contexts_file, &core_id, &endpoint, context_credential_ref)?;
+
+    Ok(LocalConnectionOutcome {
+        endpoint,
+        credential_available,
+        fallback_token: (!credential_available).then_some(token).flatten(),
+    })
+}
+
+struct LocalAuthRecoveryOutcome {
+    endpoint: String,
+    fallback_token: Option<String>,
+    revoked_count: u64,
+}
+
 fn recover_local_auth(
     store: &Store,
     contexts_file: &Path,
     api_config: &kakune_core::config::ApiConfig,
     listen: SocketAddr,
 ) -> Result<(), String> {
+    let outcome = recover_local_auth_with_credential_writer(
+        store,
+        contexts_file,
+        api_config,
+        listen,
+        |reference, token| match cli_credential_entry(reference) {
+            Ok(entry) => match entry.set_password(token) {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!("Kakune could not save the recovered credential securely: {error}");
+                    false
+                }
+            },
+            Err(error) => {
+                eprintln!("Kakune could not save the recovered credential securely: {error}");
+                false
+            }
+        },
+    )?;
+
+    println!(
+        "Local API access recovered; revoked {} previous active token(s).",
+        outcome.revoked_count
+    );
+    println!("Local CLI connection configured for {}.", outcome.endpoint);
+    if let Some(token) = outcome.fallback_token {
+        println!("Recovery token (OS credential manager unavailable; set KAKUNE_TOKEN): {token}");
+    }
+    Ok(())
+}
+
+fn recover_local_auth_with_credential_writer(
+    store: &Store,
+    contexts_file: &Path,
+    api_config: &kakune_core::config::ApiConfig,
+    listen: SocketAddr,
+    write_secure: impl FnOnce(&str, &str) -> bool,
+) -> Result<LocalAuthRecoveryOutcome, String> {
     let created = store.create_auth_token(
         "Local recovery".to_string(),
         vec![kakune_core::AuthScope::Admin],
@@ -1255,19 +1411,7 @@ fn recover_local_auth(
     )?;
     let core_id = store.core_id()?;
     let reference = local_credential_ref(&core_id);
-    let credential_available = match cli_credential_entry(&reference) {
-        Ok(entry) => match entry.set_password(&created.token) {
-            Ok(()) => true,
-            Err(error) => {
-                eprintln!("Kakune could not save the recovered credential securely: {error}");
-                false
-            }
-        },
-        Err(error) => {
-            eprintln!("Kakune could not save the recovered credential securely: {error}");
-            false
-        }
-    };
+    let credential_available = write_secure(&reference, &created.token);
     save_local_context(
         contexts_file,
         &core_id,
@@ -1275,18 +1419,11 @@ fn recover_local_auth(
         credential_available.then_some(reference),
     )?;
     let revoked = store.revoke_other_auth_tokens(&created.record.id)?;
-    println!("Local API access recovered; revoked {revoked} previous active token(s).");
-    println!(
-        "Local CLI connection configured for {}.",
-        local_endpoint(api_config, listen)
-    );
-    if !credential_available {
-        println!(
-            "Recovery token (OS credential manager unavailable; set KAKUNE_TOKEN): {}",
-            created.token
-        );
-    }
-    Ok(())
+    Ok(LocalAuthRecoveryOutcome {
+        endpoint: local_endpoint(api_config, listen),
+        fallback_token: (!credential_available).then_some(created.token),
+        revoked_count: revoked,
+    })
 }
 
 fn pair_local_gui(
@@ -1731,9 +1868,583 @@ async fn execute_remote(cli: &Cli) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextFile, local_endpoint, save_local_context, validate_pairing_endpoint};
-    use kakune_core::config::ApiConfig;
-    use std::fs;
+    use super::{
+        AuthCommand, Cli, Command, ContextFile, configure_local_connection_with_credentials,
+        execute, execute_with_credentials, local_endpoint,
+        recover_local_auth_with_credential_writer, render_init_report,
+        resolve_initialization_paths, run_initialization_with, save_local_context,
+        validate_pairing_endpoint,
+    };
+    use clap::Parser;
+    use kakune_core::{
+        AuthScope, Store,
+        config::ApiConfig,
+        initialization::{
+            CredentialAccess, CredentialAccessError, CredentialReference, CredentialSecret,
+            InitializationPaths,
+        },
+    };
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::Mutex,
+    };
+
+    struct CliFixture {
+        root: PathBuf,
+    }
+
+    impl CliFixture {
+        fn new() -> Self {
+            let parent = std::env::temp_dir().join("opencode");
+            fs::create_dir_all(&parent).expect("approved temporary parent should exist");
+            let root = parent.join(format!("kakune-init-cli-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&root).expect("fixture directory should be created");
+            Self { root }
+        }
+
+        fn paths(&self) -> InitializationPaths {
+            InitializationPaths {
+                data_dir: self.root.join("data"),
+                config_file: self.root.join("config").join("kakune.yaml"),
+                context_file: self.root.join("contexts").join("contexts.json"),
+            }
+        }
+    }
+
+    impl Drop for CliFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    struct CliCredentialDouble {
+        saved: Mutex<Option<String>>,
+        write_fails: bool,
+    }
+
+    impl CliCredentialDouble {
+        fn new(write_fails: bool) -> Self {
+            Self {
+                saved: Mutex::new(None),
+                write_fails,
+            }
+        }
+
+        fn saved_secret(&self) -> Option<String> {
+            self.saved.lock().ok()?.clone()
+        }
+    }
+
+    impl CredentialAccess for CliCredentialDouble {
+        fn resolve_reference(
+            &self,
+            reference: Option<&str>,
+        ) -> Result<CredentialReference, CredentialAccessError> {
+            CredentialReference::new(reference.unwrap_or("env:KAKUNE_TOKEN"))
+        }
+
+        fn write_secure(
+            &self,
+            _reference: &CredentialReference,
+            secret: &CredentialSecret,
+        ) -> Result<(), CredentialAccessError> {
+            if self.write_fails {
+                return Err(CredentialAccessError::SecureWriteFailed);
+            }
+            *self
+                .saved
+                .lock()
+                .map_err(|_| CredentialAccessError::SecureWriteFailed)? =
+                Some(secret.expose_secret().to_string());
+            Ok(())
+        }
+
+        fn read(
+            &self,
+            _reference: &CredentialReference,
+        ) -> Result<CredentialSecret, CredentialAccessError> {
+            self.saved
+                .lock()
+                .map_err(|_| CredentialAccessError::Unavailable)?
+                .as_ref()
+                .map(|secret| CredentialSecret::new(secret.clone()))
+                .ok_or(CredentialAccessError::Unavailable)
+        }
+    }
+
+    fn assert_path_is_under(path: &Path, root: &Path) {
+        assert!(
+            path.starts_with(root),
+            "{} should be under {}",
+            path.display(),
+            root.display()
+        );
+    }
+
+    #[test]
+    fn init_adapter_resolves_default_and_explicit_paths_without_environment_mutation() {
+        let fixture = CliFixture::new();
+        let simulated_kakune_data_dir = fixture.root.join("KAKUNE_DATA_DIR");
+        let defaults =
+            resolve_initialization_paths(None, None, None, simulated_kakune_data_dir.clone());
+        assert_eq!(defaults.data_dir, simulated_kakune_data_dir);
+        assert_eq!(defaults.config_file, defaults.data_dir.join("kakune.yaml"));
+        assert_eq!(
+            defaults.context_file,
+            defaults.data_dir.join("cli").join("contexts.json")
+        );
+
+        let explicit = resolve_initialization_paths(
+            Some(fixture.root.join("custom data")),
+            Some(fixture.root.join("custom config.yaml")),
+            Some(fixture.root.join("custom contexts.json")),
+            fixture.root.join("unused default"),
+        );
+        assert_path_is_under(&explicit.data_dir, &fixture.root);
+        assert_eq!(explicit.data_dir, fixture.root.join("custom data"));
+        assert_eq!(
+            explicit.config_file,
+            fixture.root.join("custom config.yaml")
+        );
+        assert_eq!(
+            explicit.context_file,
+            fixture.root.join("custom contexts.json")
+        );
+    }
+
+    #[test]
+    fn init_parser_accepts_standalone_and_ca_compatibility_no_ops() {
+        let parsed = Cli::try_parse_from([
+            "kakune",
+            "--standalone",
+            "--ca",
+            "missing-ca.pem",
+            "init",
+            "--data-dir",
+            "isolated-data",
+            "--config",
+            "isolated.yaml",
+        ])
+        .expect("init should accept documented compatibility options");
+        assert!(parsed.standalone);
+        assert_eq!(parsed.ca, Some(PathBuf::from("missing-ca.pem")));
+        assert!(matches!(parsed.command, Command::Init { .. }));
+    }
+
+    #[tokio::test]
+    async fn init_uses_injected_local_setup_without_starting_core_or_running_recovery() {
+        let fixture = CliFixture::new();
+        let paths = fixture.paths();
+        let credentials = CliCredentialDouble::new(false);
+        let cli = Cli {
+            context: None,
+            context_file: Some(paths.context_file.clone()),
+            ca: None,
+            standalone: false,
+            command: Command::Init {
+                data_dir: Some(paths.data_dir.clone()),
+                config: Some(paths.config_file.clone()),
+            },
+        };
+
+        execute_with_credentials(cli, &credentials)
+            .await
+            .expect("injected local initialization should complete");
+
+        let secret = credentials
+            .saved_secret()
+            .expect("initialization should use the injected secure credential adapter");
+        let store = Store::open(paths.data_dir.clone()).expect("initialized store should open");
+        let tokens = store.list_auth_tokens().expect("token history should load");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].name, "Initial local administrator");
+        assert!(
+            store
+                .authorize_scope(&secret, AuthScope::Admin)
+                .expect("local authorization should be checked")
+        );
+        assert!(paths.context_file.is_file());
+        assert!(!paths.data_dir.join("daemon.pid").exists());
+        assert!(!paths.data_dir.join("daemon.log").exists());
+    }
+
+    #[test]
+    fn daemon_connection_preparation_keeps_bootstrap_separate_from_recovery() {
+        let fixture = CliFixture::new();
+        let paths = fixture.paths();
+        let store = Store::open(paths.data_dir.clone()).expect("fixture store should open");
+        let api = ApiConfig::default();
+        let listen = "127.0.0.1:8787"
+            .parse()
+            .expect("loopback address should parse");
+        let mut first_secret = None;
+        let mut first_reference = None;
+
+        let first = configure_local_connection_with_credentials(
+            &store,
+            &paths.context_file,
+            &api,
+            listen,
+            |reference, secret| {
+                first_reference = Some(reference.to_string());
+                first_secret = secret.map(str::to_string);
+                secret.is_some()
+            },
+        )
+        .expect("daemon preparation should configure bootstrap access");
+
+        assert!(first.credential_available);
+        assert!(first.fallback_token.is_none());
+        let bootstrap = first_secret.expect("first-use setup should provide bootstrap access");
+        let reference = first_reference.expect("local access should use a canonical reference");
+        let before_repeat = store
+            .list_auth_tokens()
+            .expect("bootstrap history should load");
+        assert_eq!(before_repeat.len(), 1);
+
+        let repeat = configure_local_connection_with_credentials(
+            &store,
+            &paths.context_file,
+            &api,
+            listen,
+            |next_reference, secret| {
+                assert_eq!(next_reference, reference);
+                assert!(
+                    secret.is_none(),
+                    "repeat startup must reuse existing access"
+                );
+                true
+            },
+        )
+        .expect("repeat daemon preparation should reuse existing access");
+
+        assert!(repeat.credential_available);
+        assert!(repeat.fallback_token.is_none());
+        let after_repeat = store
+            .list_auth_tokens()
+            .expect("repeated history should load");
+        assert_eq!(after_repeat.len(), 1, "startup must not become recovery");
+        assert_eq!(before_repeat[0].id, after_repeat[0].id);
+        assert!(
+            store
+                .authorize_scope(&bootstrap, AuthScope::Admin)
+                .expect("the existing bootstrap credential should remain authorized")
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_remains_diagnostic_and_does_not_recover_or_configure_local_access() {
+        let fixture = CliFixture::new();
+        let paths = fixture.paths();
+        let store = Store::open(paths.data_dir.clone()).expect("fixture store should open");
+        let existing = store
+            .create_auth_token(
+                "Existing administrative access".to_string(),
+                vec![AuthScope::Admin],
+                None,
+            )
+            .expect("fixture credential should be issued");
+        drop(store);
+
+        let credentials = CliCredentialDouble::new(false);
+        let cli = Cli {
+            context: None,
+            context_file: Some(paths.context_file.clone()),
+            ca: None,
+            standalone: true,
+            command: Command::Doctor {
+                data_dir: Some(paths.data_dir.clone()),
+                config: Some(paths.config_file.clone()),
+            },
+        };
+        execute_with_credentials(cli, &credentials)
+            .await
+            .expect("doctor should report local diagnostics");
+
+        let after = Store::open(paths.data_dir.clone()).expect("diagnosed store should open");
+        let tokens = after
+            .list_auth_tokens()
+            .expect("diagnosed token history should load");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].id, existing.record.id);
+        assert!(tokens[0].revoked_at.is_none());
+        assert!(credentials.saved_secret().is_none());
+        assert!(!paths.context_file.exists());
+    }
+
+    #[test]
+    fn explicit_auth_recovery_still_replaces_active_access_with_injected_credentials() {
+        let fixture = CliFixture::new();
+        let paths = fixture.paths();
+        let parsed = Cli::try_parse_from([
+            "kakune",
+            "--standalone",
+            "--context-file",
+            paths
+                .context_file
+                .to_str()
+                .expect("fixture path should be UTF-8"),
+            "auth",
+            "recover",
+            "--data-dir",
+            paths
+                .data_dir
+                .to_str()
+                .expect("fixture path should be UTF-8"),
+        ])
+        .expect("explicit auth recover should remain a supported command");
+        assert!(matches!(
+            parsed.command,
+            Command::Auth {
+                command: AuthCommand::Recover { .. }
+            }
+        ));
+
+        let store = Store::open(paths.data_dir.clone()).expect("fixture store should open");
+        let previous = store
+            .create_auth_token(
+                "Existing administrative access".to_string(),
+                vec![AuthScope::Admin],
+                None,
+            )
+            .expect("fixture credential should be issued");
+        let api = ApiConfig::default();
+        let listen = "127.0.0.1:8787"
+            .parse()
+            .expect("loopback address should parse");
+        let mut new_secret = None;
+        let mut new_reference = None;
+
+        let outcome = recover_local_auth_with_credential_writer(
+            &store,
+            &paths.context_file,
+            &api,
+            listen,
+            |reference, secret| {
+                new_reference = Some(reference.to_string());
+                new_secret = Some(secret.to_string());
+                true
+            },
+        )
+        .expect("explicit recovery should persist and authorize replacement access");
+
+        assert_eq!(outcome.revoked_count, 1);
+        assert!(outcome.fallback_token.is_none());
+        let tokens = store
+            .list_auth_tokens()
+            .expect("recovered history should load");
+        assert_eq!(tokens.len(), 2);
+        let old = tokens
+            .iter()
+            .find(|token| token.id == previous.record.id)
+            .expect("the old token should remain in history");
+        assert!(old.revoked_at.is_some());
+        let new_secret = new_secret.expect("secure writer should receive the new credential");
+        assert!(
+            store
+                .authorize_scope(&new_secret, AuthScope::Admin)
+                .expect("replacement access should authorize locally")
+        );
+        let contexts = ContextFile::load(&paths.context_file)
+            .expect("recovery should restore the local context");
+        assert_eq!(
+            contexts.contexts[0].credential_ref.as_deref(),
+            new_reference.as_deref()
+        );
+    }
+
+    #[tokio::test]
+    async fn init_rejects_remote_context_before_filesystem_or_lock_side_effects() {
+        let fixture = CliFixture::new();
+        let paths = fixture.paths();
+        let parsed = Cli::try_parse_from([
+            "kakune",
+            "--context",
+            "remote",
+            "--context-file",
+            paths.context_file.to_str().expect("fixture path is UTF-8"),
+            "init",
+            "--data-dir",
+            paths.data_dir.to_str().expect("fixture path is UTF-8"),
+            "--config",
+            paths.config_file.to_str().expect("fixture path is UTF-8"),
+        ])
+        .expect("the argument parser accepts context so the local adapter can reject it");
+
+        let error = super::execute(parsed)
+            .await
+            .expect_err("init must reject explicit remote selection");
+        assert!(error.contains("local-only"));
+        assert!(!paths.data_dir.exists());
+        assert!(!paths.config_file.exists());
+        assert!(!paths.context_file.exists());
+    }
+
+    #[tokio::test]
+    async fn version_dispatch_precedes_remote_and_local_file_access() {
+        let fixture = CliFixture::new();
+        let context_file = fixture.root.join("poison-missing-contexts.json");
+        let ca_file = fixture.root.join("poison-missing-ca.pem");
+        let cli = Cli {
+            context: Some("unreachable-remote".to_string()),
+            context_file: Some(context_file.clone()),
+            ca: Some(ca_file.clone()),
+            standalone: false,
+            command: Command::Version,
+        };
+
+        execute(cli)
+            .await
+            .expect("version must exit before remote routing or local resource access");
+
+        assert!(!context_file.exists());
+        assert!(!ca_file.exists());
+    }
+
+    #[test]
+    fn injected_init_adapter_reports_complete_and_secret_free_partial_results() {
+        let fixture = CliFixture::new();
+        let paths = fixture.paths();
+        let report = run_initialization_with(paths.clone(), &CliCredentialDouble::new(false))
+            .expect("injected secure-access success should complete setup");
+        let rendered = render_init_report(&report);
+        assert!(rendered.contains("Kakune local initialization complete"));
+        assert!(rendered.contains("Client access: created"));
+        assert!(rendered.contains(paths.data_dir.to_string_lossy().as_ref()));
+
+        let failed_paths = InitializationPaths {
+            data_dir: fixture.root.join("failed-data"),
+            config_file: fixture.root.join("failed-config").join("kakune.yaml"),
+            context_file: fixture.root.join("failed-contexts").join("contexts.json"),
+        };
+        let error = run_initialization_with(failed_paths.clone(), &CliCredentialDouble::new(true))
+            .expect_err("injected secure-save failure must remain partial");
+        assert!(error.contains("incomplete"));
+        assert!(error.contains("auth recover"));
+        assert!(error.contains(failed_paths.data_dir.to_string_lossy().as_ref()));
+        assert!(!error.contains("kakune_"));
+        assert!(!failed_paths.context_file.exists());
+    }
+
+    #[test]
+    fn existing_initialization_failures_render_partial_paths_without_secrets_or_success_claims() {
+        let fixture = CliFixture::new();
+        let paths = fixture.paths();
+        let credentials = CliCredentialDouble::new(false);
+        run_initialization_with(paths.clone(), &credentials)
+            .expect("initial setup should complete before error-rendering cases");
+        let original_secret = credentials
+            .saved_secret()
+            .expect("first-use credential should be available to the test double");
+
+        let unusable = CliCredentialDouble::new(false);
+        *unusable.saved.lock().unwrap() = Some("kakune_secret_bearing_fixture_value".to_string());
+        let invalid_access = run_initialization_with(paths.clone(), &unusable)
+            .expect_err("a non-authorizing existing credential should fail");
+        assert!(invalid_access.starts_with("initialization incomplete"));
+        assert!(invalid_access.contains("auth recover"));
+        assert!(invalid_access.contains(paths.data_dir.to_string_lossy().as_ref()));
+        assert!(invalid_access.contains(paths.config_file.to_string_lossy().as_ref()));
+        assert!(invalid_access.contains(paths.context_file.to_string_lossy().as_ref()));
+        assert!(!invalid_access.contains("Kakune local initialization complete"));
+        assert!(!invalid_access.contains(&original_secret));
+        assert!(!invalid_access.contains("kakune_secret_bearing_fixture_value"));
+
+        let conflict = serde_json::json!({
+            "format": "kakune-contexts/v1",
+            "exportedAt": "2026-10-01T12:00:00Z",
+            "activeContextId": "local",
+            "contexts": [{
+                "id": "local",
+                "name": "Preserve conflicting local context",
+                "endpoint": "https://custom.example.test:9443",
+                "expectedCoreId": "another-installation",
+                "credentialRef": "keychain:do-not-replace"
+            }]
+        });
+        fs::write(
+            &paths.context_file,
+            serde_json::to_vec_pretty(&conflict).unwrap(),
+        )
+        .unwrap();
+        let original_conflict = fs::read(&paths.context_file).unwrap();
+        let context_conflict = run_initialization_with(paths.clone(), &credentials)
+            .expect_err("identity conflict should be rendered as a partial result");
+        assert!(context_conflict.starts_with("initialization incomplete"));
+        assert!(context_conflict.contains("local context"));
+        assert!(context_conflict.contains(paths.context_file.to_string_lossy().as_ref()));
+        assert!(!context_conflict.contains("Kakune local initialization complete"));
+        assert!(!context_conflict.contains(&original_secret));
+        assert_eq!(fs::read(&paths.context_file).unwrap(), original_conflict);
+
+        fs::write(&paths.context_file, b"{malformed json").unwrap();
+        let malformed_bytes = fs::read(&paths.context_file).unwrap();
+        let malformed_metadata = run_initialization_with(paths.clone(), &credentials)
+            .expect_err("malformed existing context metadata should be reported");
+        assert!(malformed_metadata.starts_with("initialization incomplete"));
+        assert!(malformed_metadata.contains("local context"));
+        assert!(malformed_metadata.contains(paths.context_file.to_string_lossy().as_ref()));
+        assert!(!malformed_metadata.contains(&original_secret));
+        assert_eq!(fs::read(&paths.context_file).unwrap(), malformed_bytes);
+
+        let migration_paths = InitializationPaths {
+            data_dir: fixture.root.join("migration-data"),
+            config_file: fixture.root.join("migration-config").join("kakune.yaml"),
+            context_file: fixture
+                .root
+                .join("migration-contexts")
+                .join("contexts.json"),
+        };
+        let migration_credentials = CliCredentialDouble::new(false);
+        run_initialization_with(migration_paths.clone(), &migration_credentials)
+            .expect("migration fixture should initialize before it is marked unsupported");
+        let migration_database = migration_paths.data_dir.join("kakune.sqlite3");
+        let connection = rusqlite::Connection::open(&migration_database).unwrap();
+        connection
+            .execute("INSERT INTO schema_migrations (version) VALUES (999)", [])
+            .unwrap();
+        drop(connection);
+        let database_before = fs::read(&migration_database).unwrap();
+        let migration_error =
+            run_initialization_with(migration_paths.clone(), &migration_credentials)
+                .expect_err("unsupported storage should report incomplete setup");
+        assert!(migration_error.starts_with("initialization incomplete"));
+        assert!(migration_error.contains("unsupported storage format"));
+        assert!(migration_error.contains(migration_paths.data_dir.to_string_lossy().as_ref()));
+        assert!(!migration_error.contains("Kakune local initialization complete"));
+        assert!(!migration_error.contains(&original_secret));
+        assert_eq!(fs::read(&migration_database).unwrap(), database_before);
+
+        let retry_paths = InitializationPaths {
+            data_dir: fixture.root.join("retry-data"),
+            config_file: fixture.root.join("retry-config").join("kakune.yaml"),
+            context_file: fixture.root.join("retry-contexts").join("contexts.json"),
+        };
+        let failed_save = CliCredentialDouble::new(true);
+        let secure_save_error = run_initialization_with(retry_paths.clone(), &failed_save)
+            .expect_err("secure-save failure should remain visibly incomplete");
+        assert!(secure_save_error.starts_with("initialization incomplete"));
+        assert!(secure_save_error.contains("auth recover"));
+        assert!(secure_save_error.contains(retry_paths.data_dir.to_string_lossy().as_ref()));
+        assert!(!secure_save_error.contains("Kakune local initialization complete"));
+        assert!(!secure_save_error.contains("kakune_"));
+        let before_retry = kakune_core::Store::open(retry_paths.data_dir.clone()).unwrap();
+        let token_count = before_retry.list_auth_tokens().unwrap().len();
+        assert_eq!(token_count, 1);
+        drop(before_retry);
+
+        let retry_error =
+            run_initialization_with(retry_paths.clone(), &CliCredentialDouble::new(false))
+                .expect_err("retry must not silently replace an unsaved initial credential");
+        assert!(retry_error.starts_with("initialization incomplete"));
+        assert!(retry_error.contains("auth recover"));
+        assert!(retry_error.contains(retry_paths.data_dir.to_string_lossy().as_ref()));
+        assert!(!retry_error.contains("Kakune local initialization complete"));
+        assert!(!retry_error.contains("kakune_"));
+        let after_retry = kakune_core::Store::open(retry_paths.data_dir.clone()).unwrap();
+        assert_eq!(after_retry.list_auth_tokens().unwrap().len(), token_count);
+    }
 
     #[test]
     fn local_connection_persists_only_credential_reference_and_selects_local_context() {
