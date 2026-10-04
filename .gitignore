@@ -25,3 +25,8 @@ Thumbs.db
 .idea/
 *.tmp
 *.swp
+
+# Private reading copies and machine-local Spec Kit translation hooks.
+/private_doc/
+/.specify/extensions.yml
+/.opencode/commands/private-doc.translate.md
