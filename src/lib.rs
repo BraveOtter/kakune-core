@@ -4,6 +4,7 @@ pub mod client_config;
 pub mod codex;
 pub mod config;
 pub mod diagnostic;
+pub mod initialization;
 pub mod mcp;
 pub mod minimax;
 mod planner;
@@ -23,6 +24,12 @@ pub use artifacts::ArtifactRef;
 pub use client_config::{ConnectionContext, ContextFile, default_contexts_path};
 pub use config::CoreConfig;
 pub use diagnostic::{Diagnostic, DiagnosticSeverity, SourcePosition, SourceRange};
+pub use initialization::{
+    ComponentState, CredentialAccess, CredentialAccessError, CredentialReference, CredentialSecret,
+    InitializationComponent, InitializationCorrection, InitializationError,
+    InitializationFailureCategory, InitializationPaths, InitializationReport,
+    InitializationResource,
+};
 pub use planner::WorkflowAnalysis;
 pub use plugin_process::PluginRegistry;
 pub use runtime::{
