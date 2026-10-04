@@ -65,10 +65,29 @@ tests MUST be explicitly opt-in and MUST NOT become a prerequisite for default v
 
 ### IX. Bounded Execution
 
-Loops, concurrency, retries, execution time, and output sizes MUST have explicit finite bounds.
-Core MUST validate applicable limits and enforce them during execution. Exceeding a bound
-MUST produce a defined result or failure, not unbounded work. New execution mechanisms MUST
-declare and test their limits before becoming available to workflows.
+Workflow execution MUST have explicit finite bounds for loops, concurrency, retries,
+execution time, and output sizes. Core MUST validate applicable limits and enforce them
+during execution. Exceeding a bound MUST produce a defined result or failure, not unbounded
+work. New execution mechanisms MUST declare and test their limits before becoming available
+to workflows. These obligations apply regardless of whether workflow work invokes a provider,
+plugin, subprocess, filesystem, or other platform facility.
+
+Local administrative operations, such as initialization, diagnostics, and service management,
+MUST declare and enforce finite bounds for application-controlled loops, concurrency, retries,
+lock acquisition, and configurable database busy waits. A supported timeout or cancellation
+mechanism for potentially blocking platform I/O MUST be used when it can safely preserve
+resource ownership, secret protection, and compatible persistence.
+
+A local administrative filesystem or OS credential-manager call without a supported safe
+timeout/cancellation mechanism MAY rely on platform completion rather than an application-
+enforced wall-clock deadline. The active specification or plan MUST identify such calls,
+document the lack of a guaranteed completion deadline, define error and partial-state behavior,
+and distinguish measured performance targets from enforced limits. Tests MUST cover applicable
+bounds and deterministic platform-failure/partial-state behavior without requiring live services
+or external credentials. Returning a timeout while detached work continues to mutate resources
+MUST NOT be represented as cancellation. This allowance MUST NOT exempt workflow execution,
+justify application-controlled indefinite retries or polling, or bypass Principles VII, VIII,
+and X.
 
 ### X. Secret Protection and Compatible Persistence
 
@@ -146,4 +165,8 @@ Ratification approval: explicitly approved by the project maintainer on 2026-09-
 This date records formal ratification of version 1.0.0, not the undocumented adoption date
 of the earlier unversioned rules.
 
-**Version**: 1.0.0 | **Ratified**: 2026-09-30 | **Last Amended**: 2026-09-30
+Amendment authorization: the project maintainer explicitly requested the Principle IX scope
+change on 2026-10-01 to resolve the local administrative I/O conflict identified as C1. Version
+2.0.0 records this incompatible narrowing; it does not relax workflow execution bounds.
+
+**Version**: 2.0.0 | **Ratified**: 2026-09-30 | **Last Amended**: 2026-10-01
