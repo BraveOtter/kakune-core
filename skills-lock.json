@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "clap": {
+      "source": "bobmatnyc/claude-mpm-skills",
+      "sourceType": "github",
+      "skillPath": "toolchains/rust/cli/clap/SKILL.md",
+      "computedHash": "3091f3d7e0a0238a52774eb0a04ab38ccb6b57183e27550987e61036cf26cd3d"
+    },
+    "rust-best-practices": {
+      "source": "apollographql/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust-best-practices/SKILL.md",
+      "computedHash": "5f050929b5b62c8c847b75955d7d773be9dc649d03778e6e94cd8db1101fb674"
+    }
+  }
+}
