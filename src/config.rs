@@ -72,6 +72,47 @@ impl CoreConfig {
         Ok(LoadedCoreConfig { config, path })
     }
 
+    pub(crate) fn load_or_create_for_initialization(
+        path: &Path,
+    ) -> Result<(LoadedCoreConfig, bool), String> {
+        if path.exists() {
+            return Self::load_existing_for_initialization(path).map(|loaded| (loaded, false));
+        }
+
+        let config = Self::default();
+        config.validate()?;
+        let contents = serde_yaml::to_string(&config)
+            .map_err(|error| format!("cannot serialize configuration: {error}"))?;
+        match crate::initialization::publish_new_file(path, contents.as_bytes()) {
+            Ok(()) => Ok((
+                LoadedCoreConfig {
+                    config,
+                    path: path.to_path_buf(),
+                },
+                true,
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Self::load_existing_for_initialization(path).map(|loaded| (loaded, false))
+            }
+            Err(error) => Err(format!(
+                "cannot publish configuration {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    fn load_existing_for_initialization(path: &Path) -> Result<LoadedCoreConfig, String> {
+        let source = fs::read_to_string(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let config = serde_yaml::from_str::<Self>(&source)
+            .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+        config.validate()?;
+        Ok(LoadedCoreConfig {
+            config,
+            path: path.to_path_buf(),
+        })
+    }
+
     pub fn listen_addr(&self) -> Result<SocketAddr, String> {
         self.api
             .listen
