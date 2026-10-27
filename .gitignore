@@ -6,8 +6,7 @@
 *.sqlite3-wal
 
 # Local configuration, logs, and editor/OS state.
-.env
-.env.*
+.env*
 !.env.example
 *.log
 .DS_Store
@@ -30,3 +29,13 @@ Thumbs.db
 /private_doc/
 /.specify/extensions.yml
 /.opencode/commands/private-doc.translate.md
+
+# Local Spec Kit artifacts; keep the project constitution versioned.
+.specify/*
+!.specify/memory/
+.specify/memory/*
+!.specify/memory/constitution.md
+/specs/
+
+# OpenCode command definitions are local to each developer.
+/.opencode/commands/
