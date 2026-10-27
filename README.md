@@ -33,29 +33,31 @@ cargo run -- daemon --data-dir .\data
 
 The daemon listens on `http://127.0.0.1:8787` by default. Kakune selects its data directory from `KAKUNE_DATA_DIR` when set, then `%APPDATA%\Kakune`, `$XDG_DATA_HOME/kakune`, or `~/.local/share/kakune`. Override it per command with `--data-dir <directory>`.
 
-### General commands
+### General and local commands
 
 ```text
 kakune init [--data-dir <directory>] [--config <file>] [--context-file <file>]
 kakune version
 kakune --version
+kakune doctor [--data-dir <directory>] [--config <file>] [--json]
+kakune context add <name> --endpoint <url> [--name <display-name>]
+kakune context list
+kakune context use <name>
+kakune context inspect <name>
+kakune context remove <name>
+kakune context import <file>
+kakune context export <name> --output <file> [--replace]
 ```
 
-`init` is local-only: it rejects `--context`, never starts the Core, and never contacts a remote endpoint. `--standalone` and `--ca` are accepted as compatibility no-ops. Unless overridden, the configuration is `<data-dir>/kakune.yaml` and the connection file is `<data-dir>/cli/contexts.json`; pass `--config` and the global `--context-file` option to select other paths.
+`init`, `doctor`, context management, storage maintenance, and Core API authentication (`auth`) are local operations. `doctor` is read-only: it reports configuration, storage, database, credentials, Core, service, compatibility, and platform findings without setup, repair, or migration. Any failed finding or required unknown finding exits 1; optional warnings/unknown findings alone exit 0; invalid arguments exit 2. `kakune version` and `kakune --version` report the same local build version without reading installation files or contacting a Core.
 
-Initialization is complete only when the configuration, storage, installation identity, usable administrative client access, and compatible local connection metadata are all ready. First-use access must be saved to the OS credential manager, read back, and authorized locally. If secure saving, readback, or authorization fails, `init` reports partial setup and exits unsuccessfully; it never prints a token as a fallback. A retry never issues replacement access for an existing installation. If access must be restored, use explicit recovery with the same paths selected for initialization:
+Initialization remains safe to repeat. It creates only missing valid resources and preserves existing configuration, credential history, custom connection fields, unrelated contexts, and active selection. Initial access is saved and verified in the OS credential manager; failure is reported as partial setup, never as a printed-token fallback. Recovery remains explicit:
 
 ```text
 kakune --context-file <contexts-file> auth recover --data-dir <directory> --config <config-file>
 ```
 
-It is safe to repeat `init`: it creates only missing valid resources and preserves existing configuration, credential history, custom connection fields, unrelated contexts, and the active-context selection. It does not refresh custom endpoints or silently rotate/revoke credentials. Initial access is issued only for a genuinely new installation; recovery remains a separate, deliberate operation.
-
-`kakune version` and `kakune --version` report the same build version of the invoked executable. They do not inspect installation files, load connection metadata, or contact a Core.
-
-These commands have distinct purposes: `daemon` starts or manages the Core, `doctor` reports local configuration/storage/runtime diagnostics, and `auth recover` deliberately replaces active access when requested. Initialization does not run any of them implicitly.
-
-`init` creates `<data-dir>/kakune.yaml` if it does not exist. It configures the loopback listener, an explicit browser-origin allowlist, a 1 MiB request-body limit, and a 120 request/minute local API limit. Add trusted browser origins to `api.allowedOrigins`; requests that include any other `Origin` are rejected.
+Unless overridden, configuration is `<data-dir>/kakune.yaml` and connection metadata is `<data-dir>/cli/contexts.json`. `init` configures the loopback listener, explicit browser-origin allowlist, 1 MiB API request limit, and request rate limit:
 
 ```yaml
 api:
@@ -65,9 +67,96 @@ api:
   rateLimitRequestsPerMinute: 120
 ```
 
-Use `kakune daemon start`, `kakune daemon status`, and `kakune daemon stop` for a user-managed background process. `kakune context add|list|use|inspect|remove|import|export` stores only portable connection metadata and credential references in `<data-dir>/cli/contexts.json`; it never stores token values.
+Use `daemon start|status|stop` for the current-user background Core; `service install|start|status|stop|uninstall` operates the machine-wide native service. These are separate scopes and neither is controlled through a remote context.
 
-`kakune provider list|upsert|status|remove` manages non-secret provider profiles. A Codex profile uses `oauthSecret`, whose reference points to an encrypted ChatGPT Plus/Pro OAuth token. `kakune provider login <id>` opens a browser authorization flow directly and does not require, invoke, or read credentials from Codex CLI.
+### Routing, output, and bounds
+
+- Core-backed workflow, execution, trigger, provider, named MCP, and secret commands use the active context, or `--context <id>` to select one. `--context-file <path>` selects a connection collection and `--ca <file>` supplies a TLS CA. Missing selection, identity mismatch, authorization failure, and unreachable Cores fail; there is no implicit localhost or local-Store fallback.
+- `--data-dir` selects local data for commands that support it; it **does not** make a Core-backed command standalone. Use `--standalone` only for a documented direct-local execution. Local authoring/checks and context/doctor operations disclose their local scope.
+- Canonical commands use human-readable output by default and `--json` for machine-readable outcomes where available. Every canonical provider, named MCP, and secret command supports both modes; `--json` does not change the separate legacy `provider` or one-shot `mcp call` contracts. Canonical argument errors exit 2; validation, authorization, unsupported requested capability, and operation failures exit 1; success and explicit no-op outcomes exit 0. Legacy extras retain their own output and exit contracts.
+- Canonical list commands return one bounded page. Use `--limit <n>` and `--cursor <opaque>` to continue; a cursor is opaque and must be reused with the same query. Results are not silently fetched without a bound.
+- File output is create-only unless `--replace` is supplied. Provide `--output <file>` where required; parent directories are not created automatically. Imports validate before changing a Core. File paths must use the command's documented positional argument or explicit `--file`/`--input` option; a workflow file is never guessed from its name.
+
+### Canonical workflow commands
+
+```text
+kakune workflow create <name> [--output <file>] [--replace]
+kakune workflow import <file> [--replace] [--if-revision <revision>]
+kakune workflow export <workflow> --output <file> [--replace]
+kakune workflow validate <workflow>
+kakune workflow validate --file <file>
+kakune workflow plan <workflow>
+kakune workflow plan --file <file>
+kakune workflow list [--limit <n>] [--cursor <opaque>]
+kakune workflow run <workflow> [--request-key <key>]
+kakune workflow enable <stored-workflow>
+kakune workflow disable <stored-workflow>
+```
+
+Create and local file checks do not register or execute a workflow. Import creates a disabled registration; replacement requires `--replace`, and `--if-revision` can guard it. Export preserves the original YAML source and secret references, not resolved values. Stored selectors can be IDs or unique names; use `id:<id>` or `name:<name>` when needed. Manual run submits one execution and does not enable triggers. Enable/disable change trigger eligibility only; disabling does not cancel work already admitted.
+
+The canonical syntax intentionally corrects earlier file-oriented forms: use `workflow validate --file <file>` rather than passing a path as a positional workflow selector; `workflow enable` and `disable` take a stored workflow, not a YAML file; `context export <name> --output <file>` exports one context, not a whole collection. For a local file, create/import it as appropriate, then select its stored ID to enable it.
+
+Direct local execution is a separate, bounded path and requires local YAML:
+
+```powershell
+cargo run -- --standalone workflow run --file .\examples\write-note.kakune.yaml --data-dir .\isolated-run --timeout-seconds 30
+```
+
+It does not contact a selected Core or leave a background runtime. Do not use an ordinary data directory for isolated checks.
+
+Execution and trigger observations are also Core-backed:
+
+```text
+kakune execution list [--limit <n>] [--cursor <opaque>]
+kakune execution inspect <execution-id>
+kakune execution cancel <execution-id> [--wait-seconds 0..30]
+kakune execution logs <execution-id> [--limit <n>] [--cursor <opaque>]
+kakune trigger list [--limit <n>] [--cursor <opaque>]
+kakune trigger inspect <workflow-id>/<trigger-id>
+```
+
+Cancellation request acceptance is distinct from observed termination. Logs are finite snapshots, not a follow stream; trigger inspection is read-only and does not fire or reconcile schedules.
+
+### Providers, MCP, and secrets
+
+```text
+kakune provider add <id> --file <profile.json> [--json]
+kakune provider list [--limit <n>] [--cursor <opaque>] [--json]
+kakune provider auth <id> [--stdin] [--json]
+kakune provider test <id> [--json]
+kakune provider models <id> [--json]
+kakune mcp add <name> --file <connection.json> [--json]
+kakune mcp list [--limit <n>] [--cursor <opaque>] [--json]
+kakune mcp inspect <name> [--json]
+kakune mcp auth <name> [--secret <existing-reference>] [--json]
+kakune mcp tool list <name> [--limit <n>] [--cursor <opaque>] [--json]
+kakune mcp tool call <name> <tool> --input <json-file> [--json]
+kakune secret set <name> [--stdin] [--json]
+kakune secret list [--limit <n>] [--cursor <opaque>] [--json]
+kakune secret remove <name> [--json]
+```
+
+Provider add is create-only. MiniMax authentication accepts hidden terminal input or explicit bounded `--stdin`; Codex uses its supported browser flow. Neither current provider supports live model discovery: `provider models` labels configured/static data and reports discovery as unsupported rather than inventing results. MCP uses the existing stdio and HTTP transports; tool input is validated against the discovered schema before one named call. `mcp auth --secret <reference>` binds an existing secret reference and never accepts secret values or stdin. Run `secret set <name> --stdin` separately when needed. Secret values are never accepted as ordinary arguments, included in output, or shown by `secret list`.
+
+Without `--json`, provider, named MCP, and secret commands print human-readable summaries/tables. Use `--json` on any canonical command in these three families for typed JSON output, including paginated list results and operation outcomes. Secret values are excluded from both modes. This option does not apply to legacy `provider upsert|status|remove|login` or the one-shot `mcp call` command.
+
+### Legacy extras and migration
+
+Legacy entry points remain available; they are **not** aliases for the canonical commands. Their compatibility ledger and per-command evidence are in [`specs/003-complete-command-surface/command-review.md`](specs/003-complete-command-surface/command-review.md).
+
+| Legacy invocation | Possible canonical migration | Difference to account for |
+| --- | --- | --- |
+| `kakune run flow.yaml` | `workflow import flow.yaml`, then `workflow run id:flow` | Legacy run registers/enables; canonical import starts disabled and manual run does not enable. Explicitly `workflow enable` only if that old side effect is desired. |
+| `kakune executions --data-dir data` | `execution list --limit 100 --json` | Only if the selected Core is the intended target; canonical list is Core-backed and paginated. |
+| `kakune inspect E --data-dir data` | `execution inspect E --json` | Target and output schema differ; canonical detail includes explicit availability/continuation. |
+| `provider upsert profile.json` | `provider add id --file profile.json` | Only for create; canonical add rejects duplicates. Existing-profile update has no canonical replacement. |
+| `provider login codex-id` | `provider auth codex-id` | Codex browser auth overlaps, but target and outcome/presentation contracts differ. |
+| `provider status id` | No exact replacement | Cached diagnostics are not equivalent to active `provider test`. |
+| `mcp call call.json` | `mcp add name --file connection.json`, then `mcp tool call name tool --input args.json` | Converts a one-shot file into persistent named configuration and adds discovery/schema validation; convert credentials to references deliberately. |
+| `provider remove`, `auth recover|pair|tokens|revoke`, `storage backup|restore|retain|compact|pin` | No exact replacement | These operations have distinct profile, Core-access, pairing, backup, retention, compaction, or pinning effects. Keep their existing invocations. |
+
+The legacy `provider upsert|status|remove|login`, `mcp call`, top-level `run|executions|inspect`, `auth`, and `storage` contracts remain separate. No extra is removed or newly deprecated. Existing Plugin commands remain unchanged and Plugin expansion is outside this scope.
 
 Measure the release Core's idle private memory and CPU on Windows with `powershell -ExecutionPolicy Bypass -File .\scripts\measure-idle.ps1`. The script also fails if an empty Core has a Codex, Node, or Python child process.
 
@@ -96,12 +185,18 @@ nodes:
 ```
 
 ```powershell
-cargo run -- workflow validate .\examples\write-note.kakune.yaml
-cargo run -- workflow enable .\examples\write-note.kakune.yaml --data-dir .\data
-cargo run -- run .\examples\write-note.kakune.yaml --data-dir .\data
+cargo run -- workflow validate --file .\examples\write-note.kakune.yaml
+cargo run -- workflow plan --file .\examples\write-note.kakune.yaml
+cargo run -- workflow import .\examples\write-note.kakune.yaml
+cargo run -- workflow list --json
+cargo run -- workflow run id:write-note --request-key write-note-example
+cargo run -- workflow enable id:write-note
+cargo run -- workflow disable id:write-note
 ```
 
-Pass `--data-dir .\data` to `workflow validate` when the workflow uses an installed process plugin; the command loads enabled plugin definitions from that directory. Without the flag, validation uses only built-in node definitions and does not open the data store.
+Core-backed commands above use the active context; select a different Core with `--context <id>` and, if needed, select its context collection with `--context-file <file>`. `workflow validate --file` and `workflow plan --file` are local and do not contact the Core. A local file can be checked without registering it; import it before using a stored selector with run/enable/disable. `workflow import` creates a disabled registration. Existing output files require `--replace` on commands that write files.
+
+Pass `--data-dir .\data` to local `workflow validate --file` or `workflow plan --file` when the workflow uses installed process plugins; local validation loads enabled plugin definitions from that data directory. Without the flag, validation uses built-in node definitions and does not open the Store.
 
 The initial native node catalog supports `kakune.log@1`, `kakune.fs.write-text@1`, `kakune.fs.read-text@1`, `kakune.fs.copy@1`, `kakune.fs.move@1`, `kakune.http.request@1`, `kakune.flow.end@1`, `kakune.flow.if@1`, `kakune.flow.delay@1`, `kakune.flow.pass@1`, and structured control nodes. File operations are restricted to the Kakune workspace in the selected data directory. The HTTP node accepts an `inputs.url`, optional object-of-strings `inputs.headers`, optional `inputs.body`, and bounded `with.method` / `with.timeoutSeconds`; its route is `success` for a 2xx status and `httpError` otherwise.
 
@@ -295,21 +390,23 @@ An `admin` token can create scoped, optionally expiring tokens: `read` permits q
 
 ## Service, secrets, and recovery
 
-Kakune runs under the identity selected by its service manager. Provider profiles and secrets belong to that Core identity, never to a remote GUI user or to a Codex Desktop session. The default data directories are `%APPDATA%\Kakune` for an interactive Windows user, `%ProgramData%\Kakune` when installing the Windows service with `--data-dir`, `~/.local/share/kakune` for the included systemd user unit, and `~/Library/Application Support/Kakune` for the included launchd agent.
+The user daemon (`kakune daemon start|status|stop`) runs under the current user. The separate system service (`kakune service install|start|status|stop|uninstall`) is machine-wide and runs under its native service identity: `LocalSystem` on Windows and `root` for the Linux systemd and theoretical macOS launchd definitions. Provider profiles and credentials belong to that Core identity, not to a remote GUI user or a Codex Desktop session. Initialize and provision required credentials for the intended service identity; an interactive user's credential store is not automatically available to `LocalSystem` or `root`. The Windows default service data location is `%ProgramData%\Kakune`; the packaged Linux and macOS examples use `/var/lib/kakune` and `/Library/Application Support/Kakune` respectively. Pass an explicit absolute `--data-dir` when installing.
 
-On Windows, install and operate the native service from an elevated terminal:
+The CLI has initial native service adapters, but they have not completed end-to-end native service acceptance. Use only an approved disposable machine or VM for service installation; do not experiment with an existing `KakuneCore`, systemd unit, or launchd job. Linux target compilation/native acceptance is not established here, and macOS remains theoretical. Windows commands require an elevated terminal; Linux/macOS machine-wide commands require root. For example, the Windows command sequence is:
 
 ```powershell
 kakune service install --data-dir "$env:ProgramData\Kakune"
-kakune service start
 kakune service status
+kakune service start
 kakune service stop
 kakune service uninstall
 ```
 
-The service is `KakuneCore`, runs as `LocalSystem`, starts automatically, restarts after failures, and terminates its Core process tree on stop. Its credentials are therefore stored for `LocalSystem`; an interactive user's Credential Manager is intentionally not reused.
+Installation registers automatic boot but leaves the service stopped. An equivalent install is a no-op; a conflicting executable, argument, data path, account, or boot policy is not silently rewritten. Start succeeds only after Core readiness is observed. Stop confirms Core exit and native stopped state; uninstall removes only the registration after a confirmed stop. All workflows, configuration, credentials, execution history, logs, and persistent data are retained. A failed or uncertain stop leaves the registration in place. Old or conflicting registrations require an explicit stop/uninstall/reinstall procedure; never delete the data directory or silently replace credentials to resolve a conflict.
 
-For Linux, install `packaging/linux/kakune-core.service` as `~/.config/systemd/user/kakune-core.service`, then run `systemctl --user daemon-reload` and `systemctl --user enable --now kakune-core`. The unit uses `KillMode=control-group`. For macOS, create `~/Library/Logs/Kakune`, copy `packaging/macos/dev.kakune.core.plist` to `~/Library/LaunchAgents/`, then run `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.kakune.core.plist`. Adjust `/usr/local/bin/kakune` when installed elsewhere.
+Application-controlled waits are bounded: 10 seconds for lock acquisition, service status, preflight/reconciliation, helper work, and stop dispatch; 30 seconds for Core readiness/grace, installation, and post-stop removal. The accumulated application-wait ceilings are 50/50/60/90 seconds for install/start/stop/uninstall. These are not total wall-clock guarantees: filesystem and OS credential calls may not provide safe cancellation, and a native manager can accept work before its client times out. A timeout therefore does not prove cancellation or completion. Inspect the service manager and the retained attempt journal before retrying. Journal roots are Windows ProgramData `Kakune\lifecycle\services`, `/var/lib/kakune/lifecycle/services` on Linux, and `/Library/Application Support/Kakune/lifecycle/services` on macOS. Status is read-only; unknown or inaccessible state is an error, not absence.
+
+The Linux systemd and macOS launchd definitions in `packaging/` are machine-wide templates, not user units/agents. Update their absolute executable/data paths when adapting the templates. The macOS definition and manager semantics are explicitly unverified.
 
 Secrets use the platform store by default: Windows Credential Manager, macOS Keychain, or Linux Secret Service. Names are scoped by the persisted Core ID, so two Core data directories under one OS identity cannot collide. A desktop-less installation must opt into the encrypted vault and supply its unlock material on every service start:
 

@@ -170,19 +170,25 @@ Un token `admin` puede crear tokens con expiracion opcional y scopes: `read` per
 
 ## Servicio, secretos y recuperacion
 
-Los perfiles y secretos pertenecen a la identidad que ejecuta Core, nunca al usuario de una GUI remota ni a una sesion de Codex Desktop. En Windows, instala el servicio nativo desde una consola elevada:
+El daemon de usuario (`kakune daemon start|status|stop`) se ejecuta con la identidad actual. El servicio de sistema, distinto (`kakune service install|start|status|stop|uninstall`), es de toda la maquina y usa la identidad del gestor nativo: `LocalSystem` en Windows y `root` en systemd de Linux y en la definicion teorica de launchd para macOS. Los perfiles y credenciales pertenecen a esa identidad de Core, no al usuario de una GUI remota ni a una sesion de Codex Desktop. Inicializa y provisiona las credenciales necesarias para la identidad del servicio; el almacen del usuario interactivo no esta disponible automaticamente para `LocalSystem` o `root`. La ubicacion predeterminada del servicio Windows es `%ProgramData%\Kakune`; los ejemplos de Linux y macOS usan `/var/lib/kakune` y `/Library/Application Support/Kakune`. Especifica `--data-dir` absoluto al instalar.
+
+Los adaptadores nativos son una implementacion inicial y aun no han completado la aceptacion integral con gestores de servicios reales. Usa los comandos solo en una maquina o VM desechable aprobada; no pruebes sobre un `KakuneCore`, unidad systemd o trabajo launchd existente. La compilacion/aceptacion nativa de Linux no esta establecida aqui y macOS sigue siendo teorico. Windows requiere una consola elevada; Linux/macOS, root. Secuencia de ejemplo para Windows:
 
 ```powershell
 kakune service install --data-dir "$env:ProgramData\Kakune"
-kakune service start
 kakune service status
+kakune service start
+kakune service stop
+kakune service uninstall
 ```
 
-El servicio `KakuneCore` se inicia automaticamente como `LocalSystem`, se reinicia tras un fallo y termina el arbol de procesos del Core al detenerse. Sus credenciales pertenecen a `LocalSystem`; no reutiliza las del usuario interactivo.
+La instalacion registra el inicio automatico, pero deja el servicio detenido. Una definicion equivalente no modifica nada; una ruta de ejecutable/datos, argumentos, cuenta o politica de arranque en conflicto no se reescribe silenciosamente. `start` solo tiene exito tras observar Core listo. `stop` confirma la salida de Core y el estado detenido nativo; `uninstall` elimina solo el registro despues de una parada confirmada. Se conservan workflows, configuracion, credenciales, historial, logs y datos. Si la parada falla o queda incierta, el registro se conserva. Resuelve registros antiguos o incompatibles con una secuencia explicita detener/desinstalar/reinstalar; nunca borres el directorio de datos ni sustituyas credenciales silenciosamente.
 
-Las unidades para Linux y macOS se incluyen en `packaging/linux/kakune-core.service` y `packaging/macos/dev.kakune.core.plist`. Instala la unidad systemd como usuario mediante `systemctl --user daemon-reload` y `systemctl --user enable --now kakune-core`; usa `KillMode=control-group`. Para launchd, crea `~/Library/Logs/Kakune`, copia el plist a `~/Library/LaunchAgents/` y ejecuta `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.kakune.core.plist`.
+Los tiempos de espera controlados por la aplicacion tienen limites: 10 segundos para adquirir locks, consultar estado, preflight/reconciliacion, helpers y despacho de parada; 30 segundos para readiness/gracia de Core, instalacion y eliminacion posterior a la parada. Los techos acumulados de espera son 50/50/60/90 segundos para instalar/iniciar/detener/desinstalar. No son garantias de tiempo total: puede que llamadas de filesystem/credenciales no se puedan cancelar de forma segura, y el gestor nativo puede aceptar una operacion antes de que expire su cliente. Un timeout no demuestra cancelacion ni finalizacion. Inspecciona el gestor y el diario retenido antes de reintentar. Las raices del diario son ProgramData `Kakune\lifecycle\services` en Windows, `/var/lib/kakune/lifecycle/services` en Linux y `/Library/Application Support/Kakune/lifecycle/services` en macOS. `status` es de solo lectura; un estado desconocido o inaccesible es error, no ausencia.
 
-Por defecto los secretos usan Credential Manager, Keychain o Secret Service, aislados por el `coreId` persistente. Para un host headless configura explicitamente `KAKUNE_SECRET_STORE=vault` y proporciona `KAKUNE_VAULT_PASSPHRASE` desde el gestor de servicios. No existe fallback a texto plano ni se oculta un fallo del keyring con una copia vault.
+Las definiciones systemd y launchd de `packaging/` son plantillas de sistema, no servicios/agentes de usuario. Ajusta las rutas absolutas del ejecutable y datos. La definicion de macOS y su semantica de gestor no estan verificadas.
+
+Por defecto los secretos usan Credential Manager, Keychain o Secret Service, aislados por el `coreId` persistente. Para un host headless configura explicitamente `KAKUNE_SECRET_STORE=vault` y proporciona `KAKUNE_VAULT_PASSPHRASE` desde el gestor de servicios. No existe fallback a texto plano ni se oculta un fallo del keyring con una copia vault. No copies tokens a unidades, archivos plist, logs o argumentos de comandos.
 
 Los backups excluyen secretos por estar ligados a usuario y maquina. Incluyen workflows, ejecuciones, artefactos, workspace y configuracion; el restore exige otro directorio vacio:
 
