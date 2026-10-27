@@ -258,6 +258,18 @@ fn database_schema_version(path: &Path) -> i64 {
         .expect("schema version should be readable")
 }
 
+fn roll_back_fixture_to_schema_14(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            "DELETE FROM schema_migrations WHERE version >= 15;
+             DROP INDEX IF EXISTS execution_events_lookup;
+             DROP TABLE IF EXISTS named_mcp_connections;
+             ALTER TABLE secrets DROP COLUMN credential_version;
+             DROP TABLE IF EXISTS auth_pairing_codes;",
+        )
+        .expect("fixture should be reduced to schema 14");
+}
+
 #[test]
 fn initialization_migrates_legacy_store_with_recoverable_backup() {
     let root = initialization_fixture("initialization-legacy-upgrade");
@@ -290,12 +302,7 @@ fn initialization_migrates_legacy_store_with_recoverable_backup() {
 
     let database = paths.data_dir.join("kakune.sqlite3");
     let connection = rusqlite::Connection::open(&database).unwrap();
-    connection
-        .execute("DELETE FROM schema_migrations WHERE version = 15", [])
-        .expect("fixture should become a supported version-14 store");
-    connection
-        .execute("DROP TABLE auth_pairing_codes", [])
-        .expect("version-15 table should be absent in the legacy fixture");
+    roll_back_fixture_to_schema_14(&connection);
     drop(connection);
     assert_eq!(database_schema_version(&database), 14);
     let before = migration_database_snapshot(&database);
@@ -346,7 +353,7 @@ fn initialization_migrates_legacy_store_with_recoverable_backup() {
     );
     assert_eq!(credentials.reads.load(Ordering::Relaxed), 1);
     assert_eq!(credentials.writes.load(Ordering::Relaxed), 0);
-    assert_eq!(database_schema_version(&database), 15);
+    assert_eq!(database_schema_version(&database), 16);
     assert_eq!(migration_database_snapshot(&database), before);
 
     let backup = paths
@@ -442,13 +449,8 @@ fn failed_initialization_upgrade_keeps_original_data_and_backup_recoverable() {
 
     let database = paths.data_dir.join("kakune.sqlite3");
     let connection = rusqlite::Connection::open(&database).unwrap();
-    connection
-        .execute("DELETE FROM schema_migrations WHERE version = 15", [])
-        .unwrap();
+    roll_back_fixture_to_schema_14(&connection);
     // This collision forces the v15 table-creation step to fail transactionally.
-    connection
-        .execute("DROP TABLE auth_pairing_codes", [])
-        .expect("migration target should be removed before the conflicting fixture is created");
     connection
         .execute_batch("CREATE TABLE auth_pairing_codes (preserved_fixture INTEGER)")
         .expect("conflicting migration target should be prepared");

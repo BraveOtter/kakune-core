@@ -23,6 +23,32 @@ use crate::{
     workflow::{WorkflowBinding, WorkflowNode, WorkflowSubgraph},
 };
 
+const STANDALONE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+const STANDALONE_MAX_TIMEOUT: Duration = Duration::from_secs(3_600);
+const STANDALONE_ADMISSION_WAIT: Duration = Duration::from_secs(30);
+const STANDALONE_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const STANDALONE_MAX_RESULT_BYTES: usize = 4 * 1_048_576;
+const STANDALONE_MAX_NODE_RESULT_BYTES: usize = 1_048_576;
+
+#[derive(Clone, Copy, Default)]
+struct ExecutionLimits {
+    max_execution_result_bytes: Option<usize>,
+    max_node_result_bytes: Option<usize>,
+    admission_wait: Option<Duration>,
+    shutdown_grace: Option<Duration>,
+}
+
+impl ExecutionLimits {
+    fn standalone() -> Self {
+        Self {
+            max_execution_result_bytes: Some(STANDALONE_MAX_RESULT_BYTES),
+            max_node_result_bytes: Some(STANDALONE_MAX_NODE_RESULT_BYTES),
+            admission_wait: Some(STANDALONE_ADMISSION_WAIT),
+            shutdown_grace: Some(STANDALONE_SHUTDOWN_GRACE),
+        }
+    }
+}
+
 pub fn run_workflow(store: &Store, workflow: &WorkflowDocument) -> Result<ExecutionRecord, String> {
     run_workflow_with_plugins(store, workflow, &PluginRegistry::default())
 }
@@ -49,6 +75,27 @@ pub fn run_workflow_with_context(
     input_values: Value,
     trigger_values: Value,
 ) -> Result<ExecutionRecord, String> {
+    run_workflow_with_context_and_shutdown(
+        store,
+        workflow,
+        plugins,
+        input_values,
+        trigger_values,
+        None,
+    )
+}
+
+/// Runs workflow work with an optional Core-wide cooperative shutdown signal.
+/// A shutdown request leaves the execution nonterminal so normal store recovery
+/// can resume it from durable checkpoints on the next startup.
+pub fn run_workflow_with_context_and_shutdown(
+    store: &Store,
+    workflow: &WorkflowDocument,
+    plugins: &PluginRegistry,
+    input_values: Value,
+    trigger_values: Value,
+    shutdown_requested: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<ExecutionRecord, String> {
     let source_record = store.get_workflow_source(&workflow.metadata.id)?;
     let source = source_record
         .as_ref()
@@ -66,7 +113,13 @@ pub fn run_workflow_with_context(
         input_values,
         trigger_values,
     )?;
-    execute_prepared_workflow_with_plugins(store, execution, plugins)
+    execute_prepared_workflow_with_shutdown(
+        store,
+        execution,
+        plugins,
+        shutdown_requested,
+        ExecutionLimits::default(),
+    )
 }
 
 /// Validates and snapshots the exact source that will be executed. The caller
@@ -135,12 +188,194 @@ pub fn prepare_execution_with_context_request(
     Ok(execution)
 }
 
+/// Canonical management admission pins the workflow revision in the same
+/// transaction that stores the executable plan and always has a finite
+/// deadline. Legacy entry points retain their existing policy behavior.
+pub fn prepare_canonical_execution_with_context_request(
+    store: &Store,
+    source: &str,
+    revision: &str,
+    plugins: &PluginRegistry,
+    input_values: Value,
+    trigger_values: Value,
+    identity: Option<(&str, &str)>,
+) -> Result<(ExecutionRecord, bool), String> {
+    prepare_canonical_execution_with_eligibility(
+        store,
+        source,
+        revision,
+        plugins,
+        input_values,
+        trigger_values,
+        ExecutionEligibility {
+            identity,
+            require_enabled: false,
+        },
+    )
+}
+
+/// Automatically triggered work is admitted only while the exact workflow
+/// revision remains enabled. The status and revision check shares the storage
+/// transaction that records the immutable execution plan.
+pub(crate) fn prepare_automatic_execution_with_context(
+    store: &Store,
+    source: &str,
+    revision: &str,
+    plugins: &PluginRegistry,
+    input_values: Value,
+    trigger_values: Value,
+) -> Result<(ExecutionRecord, bool), String> {
+    prepare_canonical_execution_with_eligibility(
+        store,
+        source,
+        revision,
+        plugins,
+        input_values,
+        trigger_values,
+        ExecutionEligibility {
+            identity: None,
+            require_enabled: true,
+        },
+    )
+}
+
+struct ExecutionEligibility<'a> {
+    identity: Option<(&'a str, &'a str)>,
+    require_enabled: bool,
+}
+
+fn prepare_canonical_execution_with_eligibility(
+    store: &Store,
+    source: &str,
+    revision: &str,
+    plugins: &PluginRegistry,
+    input_values: Value,
+    trigger_values: Value,
+    eligibility: ExecutionEligibility<'_>,
+) -> Result<(ExecutionRecord, bool), String> {
+    if !input_values.is_object() || !trigger_values.is_object() {
+        return Err("execution inputs and trigger values must be objects".to_owned());
+    }
+    let mut compiled = planner::compile(source, plugins)
+        .map_err(|diagnostics| planner::diagnostics_message(&diagnostics))?;
+    validate_provider_profiles(store, &compiled.ir.nodes)?;
+    if compiled.plan.policy.timeout.is_none() {
+        compiled.plan.policy.timeout = Some("300s".to_owned());
+    }
+    let timeout = parse_duration(
+        compiled
+            .plan
+            .policy
+            .timeout
+            .as_deref()
+            .expect("canonical execution always has a deadline"),
+    )?;
+    if timeout > Duration::from_secs(3_600) {
+        return Err("canonical workflow timeout must not exceed 3,600 seconds".into());
+    }
+    compiled.plan.input_values = input_values;
+    compiled.plan.trigger_values = trigger_values;
+    let plan_value = serde_json::to_value(&compiled.plan)
+        .map_err(|error| format!("cannot encode execution plan: {error}"))?;
+    store.create_execution_with_plan_if_current_revision_request(
+        &compiled.ir.metadata.id,
+        revision,
+        &plan_value,
+        eligibility.identity,
+        eligibility.require_enabled,
+    )
+}
+
+pub fn run_standalone_workflow(
+    store: &Store,
+    source: &str,
+    plugins: &PluginRegistry,
+    timeout_seconds: Option<u64>,
+) -> Result<ExecutionRecord, String> {
+    run_standalone_workflow_with_limits(
+        store,
+        source,
+        plugins,
+        timeout_seconds,
+        ExecutionLimits::standalone(),
+    )
+}
+
+fn run_standalone_workflow_with_limits(
+    store: &Store,
+    source: &str,
+    plugins: &PluginRegistry,
+    timeout_seconds: Option<u64>,
+    limits: ExecutionLimits,
+) -> Result<ExecutionRecord, String> {
+    if timeout_seconds.is_some_and(|seconds| !(1..=3_600).contains(&seconds)) {
+        return Err("standalone timeout must be from 1 to 3,600 seconds".to_owned());
+    }
+    let mut compiled = planner::compile(source, plugins)
+        .map_err(|diagnostics| planner::diagnostics_message(&diagnostics))?;
+    validate_provider_profiles(store, &compiled.ir.nodes)?;
+    let timeout = if let Some(seconds) = timeout_seconds {
+        Some(format!("{seconds}s"))
+    } else if let Some(timeout) = compiled.plan.policy.timeout.as_deref() {
+        Some(timeout.to_owned())
+    } else {
+        Some(format!("{}s", STANDALONE_DEFAULT_TIMEOUT.as_secs()))
+    };
+    let timeout_duration = parse_duration(
+        timeout
+            .as_deref()
+            .expect("standalone executions always have a timeout"),
+    )?;
+    if timeout_duration > STANDALONE_MAX_TIMEOUT {
+        return Err("standalone workflow timeout must not exceed 3,600 seconds".to_owned());
+    }
+    compiled.plan.policy.timeout = timeout;
+    let plan = serde_json::to_value(&compiled.plan)
+        .map_err(|error| format!("cannot encode execution plan: {error}"))?;
+    let execution =
+        store.create_execution_with_plan(&compiled.ir.metadata.id, "standalone", &plan)?;
+    execute_prepared_workflow_with_shutdown(store, execution, plugins, None, limits)
+}
+
 /// Finishes a previously prepared execution. It is intentionally separate from
 /// preparation so the HTTP API can make cancellation observable immediately.
 pub fn execute_prepared_workflow_with_plugins(
     store: &Store,
+    execution: ExecutionRecord,
+    plugins: &PluginRegistry,
+) -> Result<ExecutionRecord, String> {
+    execute_prepared_workflow_with_shutdown(
+        store,
+        execution,
+        plugins,
+        None,
+        ExecutionLimits::default(),
+    )
+}
+
+/// Finishes a prepared execution while observing Core-wide cooperative
+/// shutdown at the same checkpoints used for execution cancellation/deadlines.
+pub fn execute_prepared_workflow_with_plugins_and_shutdown(
+    store: &Store,
+    execution: ExecutionRecord,
+    plugins: &PluginRegistry,
+    shutdown_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<ExecutionRecord, String> {
+    execute_prepared_workflow_with_shutdown(
+        store,
+        execution,
+        plugins,
+        Some(shutdown_requested),
+        ExecutionLimits::default(),
+    )
+}
+
+fn execute_prepared_workflow_with_shutdown(
+    store: &Store,
     mut execution: ExecutionRecord,
     plugins: &PluginRegistry,
+    shutdown_requested: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    limits: ExecutionLimits,
 ) -> Result<ExecutionRecord, String> {
     let plan: planner::ExecutionPlan = serde_json::from_value(
         store
@@ -148,6 +383,17 @@ pub fn execute_prepared_workflow_with_plugins(
             .ok_or_else(|| format!("execution {} has no persisted plan", execution.id))?,
     )
     .map_err(|error| format!("cannot decode persisted execution plan: {error}"))?;
+    let total_deadline = plan
+        .policy
+        .timeout
+        .as_deref()
+        .map(|timeout| store.execution_time_remaining(&execution.id, parse_duration(timeout)?))
+        .transpose()?
+        .map(|remaining| Instant::now() + remaining);
+    let admission_deadline = limits.admission_wait.map(|wait| {
+        let admission_deadline = Instant::now() + wait;
+        total_deadline.map_or(admission_deadline, |total| total.min(admission_deadline))
+    });
     if execution.status == "queued" {
         loop {
             if store.claim_execution_slot(
@@ -166,17 +412,35 @@ pub fn execute_prepared_workflow_with_plugins(
                 execution.completed_at = Some(timestamp()?);
                 return Ok(execution);
             }
-            thread::sleep(Duration::from_millis(20));
+            if shutdown_requested
+                .as_ref()
+                .is_some_and(|requested| requested.load(std::sync::atomic::Ordering::Acquire))
+            {
+                return Err("Core shutdown requested".to_string());
+            }
+            if let Some(deadline) = admission_deadline {
+                let now = Instant::now();
+                if now >= deadline {
+                    let error = if total_deadline.is_some_and(|total| now >= total) {
+                        "execution timed out before admission"
+                    } else {
+                        "execution admission wait exceeded its limit"
+                    };
+                    store.finish_execution(&execution.id, "timed_out", Some(error))?;
+                    return Err(error.to_owned());
+                }
+                thread::sleep(
+                    Duration::from_millis(20).min(deadline.saturating_duration_since(now)),
+                );
+            } else {
+                thread::sleep(Duration::from_millis(20));
+            }
         }
     }
-    let mut control = RunControl::new(plan.policy.timeout.as_deref())?;
-    if let Some(timeout) = plan.policy.timeout.as_deref() {
-        control.deadline = Some(
-            Instant::now()
-                + store.execution_time_remaining(&execution.id, parse_duration(timeout)?)?,
-        );
-    }
-    let outcome = execute_nodes(store, &execution.id, &plan, plugins, &control);
+    let mut control = RunControl::new(None, shutdown_requested)?;
+    control.deadline = total_deadline
+        .map(|deadline| reserve_shutdown_grace(deadline, Instant::now(), limits.shutdown_grace));
+    let outcome = execute_nodes(store, &execution.id, &plan, plugins, &control, limits);
     match outcome {
         Ok(()) => {
             store.finish_execution(&execution.id, "succeeded", None)?;
@@ -198,10 +462,25 @@ pub fn execute_prepared_workflow_with_plugins(
             store.finish_execution(&execution.id, "timed_out", Some(&error))?;
             Err(error)
         }
+        Err(error) if error == "Core shutdown requested" => Err(error),
         Err(error) => {
             store.finish_execution(&execution.id, "failed", Some(&error))?;
             Err(error)
         }
+    }
+}
+
+fn reserve_shutdown_grace(
+    total_deadline: Instant,
+    now: Instant,
+    shutdown_grace: Option<Duration>,
+) -> Instant {
+    let remaining = total_deadline.saturating_duration_since(now);
+    let grace = shutdown_grace.unwrap_or_default().min(remaining);
+    if remaining > grace {
+        now + (remaining - grace)
+    } else {
+        total_deadline
     }
 }
 
@@ -211,6 +490,7 @@ fn execute_nodes(
     plan: &planner::ExecutionPlan,
     plugins: &PluginRegistry,
     control: &RunControl,
+    limits: ExecutionLimits,
 ) -> Result<(), String> {
     let context = ExecutionContext {
         store,
@@ -229,6 +509,7 @@ fn execute_nodes(
             .ai
             .as_ref()
             .and_then(|policy| policy.budget_tokens),
+        max_node_result_bytes: limits.max_node_result_bytes,
     };
     let node_outputs = execute_graph(
         &context,
@@ -249,7 +530,18 @@ fn execute_nodes(
             outputs.insert(name.clone(), Value::String("[redacted]".to_string()));
         }
     }
-    store.set_execution_result(execution_id, &Value::Object(outputs.into_iter().collect()))?;
+    let result = Value::Object(outputs.into_iter().collect());
+    if let Some(limit) = limits.max_execution_result_bytes
+        && serde_json::to_vec(&result)
+            .map_err(|error| format!("cannot encode execution result: {error}"))?
+            .len()
+            > limit
+    {
+        return Err(format!(
+            "standalone execution result exceeds the {limit}-byte limit"
+        ));
+    }
+    store.set_execution_result(execution_id, &result)?;
     Ok(())
 }
 
@@ -265,6 +557,7 @@ struct ExecutionContext<'a> {
     active_span_id: Option<&'a str>,
     ai_budget_tokens: Option<u64>,
     max_parallel_nodes: usize,
+    max_node_result_bytes: Option<usize>,
     sensitive: bool,
 }
 
@@ -535,6 +828,18 @@ fn execute_node_with_retry(
         };
         match execute_node(&span_context, node, inputs, locals) {
             Ok(result) => {
+                if let Some(limit) = context.max_node_result_bytes
+                    && serde_json::to_vec(&result)
+                        .map_err(|error| format!("cannot encode node {} result: {error}", node.id))?
+                        .len()
+                        > limit
+                {
+                    let error = format!("node {} result exceeds the {limit}-byte limit", node.id);
+                    context
+                        .store
+                        .finish_trace_span(&span_id, "failed", Some(&error))?;
+                    return Err(error);
+                }
                 let sensitive = context.sensitive || node.inputs.values().any(binding_uses_secret);
                 let saved = if sensitive {
                     None
@@ -607,13 +912,18 @@ struct RunControl {
     deadline: Option<Instant>,
     abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ancestors: Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    shutdown_requested: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl RunControl {
-    fn new(timeout: Option<&str>) -> Result<Self, String> {
+    fn new(
+        timeout: Option<&str>,
+        shutdown_requested: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Self, String> {
         Ok(Self {
             abort: Default::default(),
             ancestors: Vec::new(),
+            shutdown_requested,
             deadline: timeout
                 .map(parse_duration)
                 .transpose()?
@@ -628,10 +938,18 @@ impl RunControl {
             deadline: self.deadline,
             abort: Default::default(),
             ancestors,
+            shutdown_requested: self.shutdown_requested.clone(),
         }
     }
 
     fn check(&self, store: &Store, execution_id: &str) -> Result<(), String> {
+        if self
+            .shutdown_requested
+            .as_ref()
+            .is_some_and(|requested| requested.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err("Core shutdown requested".to_string());
+        }
         if self.abort.load(std::sync::atomic::Ordering::Acquire)
             || self
                 .ancestors
@@ -845,7 +1163,14 @@ fn execute_node(
             let plugin = plugins
                 .get(other)
                 .ok_or_else(|| format!("node type {other} is not installed"))?;
-            execute_plugin_node(plugin, store, execution_id, node, inputs)?
+            execute_plugin_node(
+                plugin,
+                store,
+                execution_id,
+                node,
+                inputs,
+                context.plugins.diagnostic_reporter().clone(),
+            )?
         }
     };
     Ok(result)
@@ -1072,6 +1397,7 @@ fn execute_plugin_node(
     execution_id: &str,
     node: &WorkflowNode,
     inputs: &BTreeMap<String, Value>,
+    reporter: crate::DiagnosticReporter,
 ) -> Result<NodeResult, String> {
     let plugin = plugin.clone();
     let execution_id = execution_id.to_string();
@@ -1087,7 +1413,13 @@ fn execute_plugin_node(
                 .build()
                 .map_err(|error| format!("cannot start plugin runtime: {error}"))?;
             runtime
-                .block_on(plugin.execute(store, &execution_id, &node_id, inputs))
+                .block_on(plugin.execute_with_reporter(
+                    store,
+                    &execution_id,
+                    &node_id,
+                    inputs,
+                    reporter,
+                ))
                 .map_err(|error| match error {
                     crate::plugin_process::PluginNodeExecutionError::Cancelled => {
                         "execution cancellation requested".to_string()
@@ -3877,6 +4209,141 @@ nodes:
             "input_schema": { "type": "object" }
         })];
         assert!(super::execute_agent_tool(&tools, "not-allowed", &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn standalone_admission_wait_is_bounded_by_its_own_and_total_deadlines() {
+        let directory = std::env::temp_dir().join(format!(
+            "kakune-standalone-admission-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(directory.clone()).expect("store should open");
+        let source = "apiVersion: kakune/v1\nkind: Workflow\nmetadata: {id: admission, name: Admission}\ntriggers: [{id: manual, type: kakune.trigger.manual@1}]\npolicy: {concurrency: {maxRuns: 1, overflow: queue, maxQueued: 1}}\nentry: pass\nnodes: [{id: pass, type: kakune.flow.pass@1, inputs: {value: {literal: ready}}}]\n";
+        let compiled = super::planner::compile(source, &PluginRegistry::default())
+            .expect("workflow should compile");
+        let plan = serde_json::to_value(&compiled.plan).expect("plan should serialize");
+        let blocker = store
+            .create_execution_with_plan("admission", "blocker", &plan)
+            .expect("blocking execution should be admitted");
+        assert_eq!(blocker.status, "running");
+
+        let error = super::run_standalone_workflow_with_limits(
+            &store,
+            source,
+            &PluginRegistry::default(),
+            Some(1),
+            super::ExecutionLimits {
+                admission_wait: Some(Duration::from_millis(25)),
+                shutdown_grace: Some(Duration::from_millis(5)),
+                ..super::ExecutionLimits::standalone()
+            },
+        )
+        .expect_err("standalone admission must not wait for the whole workflow timeout");
+        assert!(error.contains("admission wait exceeded"), "{error}");
+        let timed_out = store
+            .list_executions()
+            .expect("execution history should list")
+            .into_iter()
+            .find(|execution| execution.id != blocker.id)
+            .expect("standalone admission should be recorded");
+        assert_eq!(timed_out.status, "timed_out");
+
+        store
+            .finish_execution(&blocker.id, "cancelled", None)
+            .expect("blocking execution should be released");
+        drop(store);
+        fs::remove_dir_all(directory).expect("temporary store should be removed");
+    }
+
+    #[test]
+    fn standalone_caps_each_node_and_the_final_execution_result() {
+        let directory = std::env::temp_dir().join(format!(
+            "kakune-standalone-result-limits-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(directory.clone()).expect("store should open");
+        let source = "apiVersion: kakune/v1\nkind: Workflow\nmetadata: {id: limits, name: Limits}\ntriggers: [{id: manual, type: kakune.trigger.manual@1}]\nentry: pass\nnodes: [{id: pass, type: kakune.flow.pass@1}]\n";
+
+        let mut oversized_node = super::planner::compile(source, &PluginRegistry::default())
+            .expect("workflow should compile");
+        oversized_node.plan.nodes[0].node.inputs.insert(
+            "value".to_owned(),
+            crate::workflow::WorkflowBinding::Literal {
+                literal: Value::String("x".repeat(super::STANDALONE_MAX_NODE_RESULT_BYTES + 1)),
+            },
+        );
+        let node_plan = serde_json::to_value(&oversized_node.plan)
+            .expect("oversized node plan should serialize");
+        let node_execution = store
+            .create_execution_with_plan("limits", "node-limit", &node_plan)
+            .expect("node-limited execution should be queued");
+        let node_error = super::execute_prepared_workflow_with_shutdown(
+            &store,
+            node_execution,
+            &PluginRegistry::default(),
+            None,
+            super::ExecutionLimits::standalone(),
+        )
+        .expect_err("a node result over 1 MiB should fail");
+        assert!(
+            node_error.contains("node pass result exceeds"),
+            "{node_error}"
+        );
+
+        let mut oversized_execution = super::planner::compile(source, &PluginRegistry::default())
+            .expect("workflow should compile");
+        oversized_execution.plan.nodes[0].node.inputs.insert(
+            "value".to_owned(),
+            crate::workflow::WorkflowBinding::Literal {
+                literal: Value::String("x".repeat(900_000)),
+            },
+        );
+        oversized_execution.plan.outputs = (0..5)
+            .map(|index| {
+                (
+                    format!("result{index}"),
+                    crate::workflow::WorkflowBinding::From {
+                        from: "pass.value".to_owned(),
+                    },
+                )
+            })
+            .collect();
+        let result_plan = serde_json::to_value(&oversized_execution.plan)
+            .expect("execution result plan should serialize");
+        let result_execution = store
+            .create_execution_with_plan("limits", "execution-limit", &result_plan)
+            .expect("result-limited execution should be queued");
+        let result_error = super::execute_prepared_workflow_with_shutdown(
+            &store,
+            result_execution,
+            &PluginRegistry::default(),
+            None,
+            super::ExecutionLimits::standalone(),
+        )
+        .expect_err("an execution result over 4 MiB should fail");
+        assert!(
+            result_error.contains("standalone execution result exceeds"),
+            "{result_error}"
+        );
+
+        drop(store);
+        fs::remove_dir_all(directory).expect("temporary store should be removed");
+    }
+
+    #[test]
+    fn standalone_shutdown_grace_is_reserved_inside_the_total_timeout() {
+        let start = super::Instant::now();
+        let full_deadline = start + Duration::from_secs(10);
+        assert_eq!(
+            super::reserve_shutdown_grace(full_deadline, start, Some(Duration::from_secs(5))),
+            start + Duration::from_secs(5)
+        );
+        let short_deadline = start + Duration::from_secs(2);
+        assert_eq!(
+            super::reserve_shutdown_grace(short_deadline, start, Some(Duration::from_secs(5))),
+            short_deadline,
+            "grace shrinks when the total budget is shorter than five seconds"
+        );
     }
 
     #[cfg(windows)]

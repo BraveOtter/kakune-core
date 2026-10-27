@@ -26,6 +26,7 @@ use tokio::{
     time::timeout,
 };
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
@@ -64,6 +65,11 @@ impl CodexOAuthTokens {
 
     pub fn to_secret(&self) -> Result<String, CodexError> {
         serde_json::to_string(self).map_err(CodexError::EncodeTokens)
+    }
+
+    pub fn zeroize_secrets(&mut self) {
+        self.refresh.zeroize();
+        self.access.zeroize();
     }
 
     fn expired(&self) -> bool {
@@ -277,8 +283,55 @@ fn parse_stream_response(body: &[u8]) -> Result<(Value, String, Option<CodexUsag
     Ok((raw, text, usage))
 }
 
-/// Opens the ChatGPT authorization page and waits for the loopback callback.
-pub async fn login_with_browser() -> Result<CodexOAuthTokens, CodexError> {
+/// Prepared browser flow. The library exposes an authorization URL but does
+/// not print it or launch a browser; those presentation actions belong to CLI.
+pub struct CodexBrowserLogin {
+    listener: TcpListener,
+    verifier: String,
+    state: String,
+    redirect_uri: String,
+    authorize_url: String,
+}
+
+impl CodexBrowserLogin {
+    pub fn authorize_url(&self) -> &str {
+        &self.authorize_url
+    }
+
+    pub async fn complete(mut self) -> Result<CodexOAuthTokens, CodexError> {
+        let mut callback = Zeroizing::new(
+            timeout(
+                Duration::from_secs(300),
+                receive_callback(&self.listener, &self.state),
+            )
+            .await
+            .map_err(|_| CodexError::CallbackTimeout)??,
+        );
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(CodexError::HttpClient)?;
+        let result = exchange_code(&client, &callback, &self.redirect_uri, &self.verifier).await;
+        callback.zeroize();
+        self.verifier.zeroize();
+        self.state.zeroize();
+        self.redirect_uri.zeroize();
+        self.authorize_url.zeroize();
+        result
+    }
+}
+
+impl Drop for CodexBrowserLogin {
+    fn drop(&mut self) {
+        self.verifier.zeroize();
+        self.state.zeroize();
+        self.redirect_uri.zeroize();
+        self.authorize_url.zeroize();
+    }
+}
+
+pub async fn begin_browser_login() -> Result<CodexBrowserLogin, CodexError> {
     let listener = TcpListener::bind(CALLBACK_ADDR)
         .await
         .map_err(CodexError::BindCallback)?;
@@ -286,41 +339,49 @@ pub async fn login_with_browser() -> Result<CodexOAuthTokens, CodexError> {
     let challenge = base64_url(&Sha256::digest(verifier.as_bytes()));
     let state = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let redirect_uri = format!("http://localhost:1455{CALLBACK_PATH}");
-    let authorize_url = reqwest::Url::parse_with_params(
+    let authorize_url = build_authorize_url(&redirect_uri, &challenge, &state)?;
+    Ok(CodexBrowserLogin {
+        listener,
+        verifier,
+        state,
+        redirect_uri,
+        authorize_url,
+    })
+}
+
+fn build_authorize_url(
+    redirect_uri: &str,
+    challenge: &str,
+    state: &str,
+) -> Result<String, CodexError> {
+    reqwest::Url::parse_with_params(
         &format!("{ISSUER}/oauth/authorize"),
         [
             ("response_type", "code"),
             ("client_id", CLIENT_ID),
-            ("redirect_uri", redirect_uri.as_str()),
+            ("redirect_uri", redirect_uri),
             ("scope", "openid profile email offline_access"),
-            ("code_challenge", challenge.as_str()),
+            ("code_challenge", challenge),
             ("code_challenge_method", "S256"),
             ("id_token_add_organizations", "true"),
             ("codex_cli_simplified_flow", "true"),
-            ("state", state.as_str()),
+            ("state", state),
             ("originator", "kakune"),
         ],
     )
-    .map_err(|error| CodexError::AuthorizeUrl(error.to_string()))?;
+    .map(|url| url.to_string())
+    .map_err(|error| CodexError::AuthorizeUrl(error.to_string()))
+}
+
+/// Legacy presentation adapter retained for the frozen `provider login` extra.
+pub async fn login_with_browser() -> Result<CodexOAuthTokens, CodexError> {
+    let login = begin_browser_login().await?;
+    let authorize_url = login.authorize_url().to_owned();
     println!("Open this URL to authorize ChatGPT Plus/Pro:\n{authorize_url}");
-    let _ = webbrowser::open(authorize_url.as_str());
-    let callback = timeout(
-        Duration::from_secs(300),
-        receive_callback(&listener, &state),
-    )
-    .await
-    .map_err(|_| CodexError::CallbackTimeout)??;
-    exchange_code(
-        &Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(CodexError::HttpClient)?,
-        &callback,
-        &redirect_uri,
-        &verifier,
-    )
-    .await
+    if webbrowser::open(&authorize_url).is_err() {
+        eprintln!("Browser launch was unavailable. Open the authorization URL above manually.");
+    }
+    login.complete().await
 }
 
 async fn receive_callback(listener: &TcpListener, state: &str) -> Result<String, CodexError> {
@@ -736,6 +797,43 @@ mod tests {
                 .access,
             "access-token-value"
         );
+    }
+
+    #[test]
+    fn browser_authorization_url_preserves_pkce_state_and_loopback_callback() {
+        let redirect_uri = "http://localhost:1455/auth/callback";
+        let challenge = "deterministic-pkce-challenge";
+        let state = "deterministic-callback-state";
+        let url = reqwest::Url::parse(
+            &build_authorize_url(redirect_uri, challenge, state).expect("URL should build"),
+        )
+        .expect("authorization URL should parse");
+        let query = url
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("auth.openai.com"));
+        assert_eq!(url.path(), "/oauth/authorize");
+        assert_eq!(query.get("response_type").map(String::as_str), Some("code"));
+        assert_eq!(query.get("client_id").map(String::as_str), Some(CLIENT_ID));
+        assert_eq!(
+            query.get("redirect_uri").map(String::as_str),
+            Some(redirect_uri)
+        );
+        assert_eq!(
+            query.get("code_challenge").map(String::as_str),
+            Some(challenge)
+        );
+        assert_eq!(
+            query.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(query.get("state").map(String::as_str), Some(state));
+        assert_eq!(query.get("originator").map(String::as_str), Some("kakune"));
+        assert!(!url.as_str().contains("access_token"));
+        assert!(!url.as_str().contains("refresh_token"));
     }
 
     #[tokio::test]

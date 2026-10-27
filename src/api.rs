@@ -8,33 +8,45 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    body::{Body, to_bytes},
+    extract::{DefaultBodyLimit, Path, Query, Request, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{Next, from_fn_with_state},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::{
-    API_VERSION, AuthPairingStatus, AuthScope, PluginRegistry, ProviderAuth, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileStatus, ProviderProfileUpsert, ProviderType, Store,
+    API_VERSION, AuthPairingStatus, AuthScope, McpConnectionTransport, NewNamedMcpConnection,
+    PluginRegistry, ProviderAuth, ProviderProfile, ProviderProfileDiagnostic,
+    ProviderProfileStatus, ProviderProfileUpsert, ProviderType, Store, WorkflowDocument,
     WorkflowSourceUpdate,
     config::ApiConfig,
-    execute_prepared_workflow_with_plugins,
+    lifecycle::{CoreLifecycle, execution::TrackedExecutionState},
+    management::{
+        CursorOrder, DEFAULT_REQUEST_BYTES, MAX_METADATA_SECTION_BYTES, MAX_PAGE_SIZE,
+        MAX_RESPONSE_BYTES, ManagementCursor, ManagementError, ManagementErrorCode, ManagementPage,
+        SecretValue, WORKFLOW_IMPORT_ENVELOPE_BYTES, WORKFLOW_IMPORT_REQUEST_BYTES,
+        WORKFLOW_IMPORT_SOURCE_BYTES,
+    },
     mcp::{McpClient, McpClientOptions, McpHttpServerConfig, McpStdioServerConfig, McpToolContent},
     plugin_install::{self, PluginSource},
+    reporting::{CoreDiagnosticSource, DiagnosticReporter},
 };
 
 struct AppState {
     store: Store,
     plugins: Mutex<PluginRegistry>,
     api_config: ApiConfig,
+    lifecycle: CoreLifecycle,
+    reporter: DiagnosticReporter,
     rate_limit: Mutex<RateLimit>,
     minimax_quota_cache: Mutex<HashMap<String, QuotaCacheEntry>>,
 }
@@ -77,11 +89,43 @@ pub fn router_with_plugins_and_config(
     plugins: PluginRegistry,
     api_config: ApiConfig,
 ) -> Router {
+    router_with_lifecycle(store, plugins, api_config, CoreLifecycle::ready())
+}
+
+/// Builds an API router whose readiness and execution admission follow the
+/// supplied Core lifecycle state.
+pub fn router_with_lifecycle(
+    store: Store,
+    plugins: PluginRegistry,
+    api_config: ApiConfig,
+    lifecycle: CoreLifecycle,
+) -> Router {
+    router_with_lifecycle_and_reporter(
+        store,
+        plugins,
+        api_config,
+        lifecycle,
+        DiagnosticReporter::default(),
+    )
+}
+
+/// Builds an API router whose runtime diagnostics are sent to an injected
+/// reporter instead of being written directly by library code.
+pub fn router_with_lifecycle_and_reporter(
+    store: Store,
+    plugins: PluginRegistry,
+    api_config: ApiConfig,
+    lifecycle: CoreLifecycle,
+    reporter: DiagnosticReporter,
+) -> Router {
     let body_limit = api_config.request_body_limit_bytes;
+    let plugins = plugins.with_diagnostic_reporter(reporter.clone());
     let state = Arc::new(AppState {
         store,
         plugins: Mutex::new(plugins),
         api_config,
+        lifecycle,
+        reporter,
         rate_limit: Mutex::new(RateLimit {
             started_at: Instant::now(),
             requests: 0,
@@ -163,21 +207,1562 @@ pub fn router_with_plugins_and_config(
         .route("/api/v1/executions/{id}", get(get_execution))
         .route("/api/v1/executions/{id}/trace", get(get_execution_trace))
         .route("/api/v1/executions/{id}/cancel", post(cancel_execution))
+        .nest(
+            "/api/v1/manage",
+            Router::new()
+                .route("/", get(management_index))
+                .route("/workflows", get(management_list_workflows))
+                .route("/workflows/resolve", post(management_resolve_workflow))
+                .route("/workflows/import", post(management_import_workflow))
+                .route("/workflows/{id}/source", get(management_workflow_source))
+                .route(
+                    "/workflows/{id}/validate",
+                    post(management_validate_workflow),
+                )
+                .route("/workflows/{id}/plan", post(management_plan_workflow))
+                .route(
+                    "/workflows/{id}/eligibility",
+                    put(management_update_workflow_eligibility),
+                )
+                .route(
+                    "/workflows/{id}/executions",
+                    post(management_submit_workflow),
+                )
+                .route("/executions", get(management_list_executions))
+                .route("/executions/{id}", get(management_inspect_execution))
+                .route("/executions/{id}/cancel", post(management_cancel_execution))
+                .route("/executions/{id}/logs", get(management_execution_logs))
+                .route("/triggers", get(management_list_triggers))
+                .route(
+                    "/triggers/{workflow_id}/{trigger_id}",
+                    get(management_inspect_trigger),
+                )
+                .route(
+                    "/providers",
+                    get(management_list_providers).post(management_create_provider),
+                )
+                .route("/providers/{id}", get(management_get_provider))
+                .route(
+                    "/providers/{id}/auth/prepare",
+                    post(management_prepare_provider_auth),
+                )
+                .route(
+                    "/providers/{id}/auth/commit",
+                    post(management_commit_provider_auth),
+                )
+                .route("/providers/{id}/test", post(management_test_provider))
+                .route("/providers/{id}/models", post(management_provider_models))
+                .route("/mcp", get(management_list_mcp).post(management_create_mcp))
+                .route("/mcp/{name}", get(management_get_mcp))
+                .route("/mcp/{name}/auth", post(management_mcp_auth))
+                .route("/mcp/{name}/tools/list", post(management_mcp_list_tools))
+                .route("/mcp/{name}/tools/call", post(management_mcp_call_tool))
+                .route("/secrets", get(management_list_secrets))
+                .route(
+                    "/secrets/{name}",
+                    put(management_set_secret).delete(management_remove_secret),
+                )
+                .fallback(management_not_found),
+        )
+        .layer(from_fn_with_state(state.clone(), enforce_request_size))
         .layer(from_fn_with_state(state.clone(), require_auth));
     Router::new()
-        .route("/health/live", get(health))
-        .route("/health/ready", get(health))
+        .route("/health/live", get(live_health))
+        .route("/health/ready", get(ready_health))
         .route("/api/v1/auth/pair/claim", post(claim_auth_pairing))
         .route("/api/v1/auth/pair/status", post(auth_pairing_status))
         .route("/api/v1/auth/pair/exchange", post(exchange_auth_pairing))
         .merge(protected)
-        .layer(DefaultBodyLimit::max(body_limit))
+        .layer(DefaultBodyLimit::max(
+            body_limit.max(WORKFLOW_IMPORT_REQUEST_BYTES),
+        ))
         .layer(from_fn_with_state(state.clone(), enforce_local_policy))
         .with_state(state)
 }
 
-async fn health() -> Json<serde_json::Value> {
+async fn live_health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
+}
+
+async fn management_index(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let value = json!({
+        "capability": "management-api",
+        "apiVersion": "kakune-management/v1",
+        "storageSchemaVersion": state.store.schema_version().map_err(ApiError::internal)?,
+        "limits": {
+            "defaultRequestBytes": DEFAULT_REQUEST_BYTES,
+            "workflowImportRequestBytes": WORKFLOW_IMPORT_REQUEST_BYTES,
+            "workflowImportSourceBytes": WORKFLOW_IMPORT_SOURCE_BYTES,
+            "workflowImportEnvelopeBytes": WORKFLOW_IMPORT_ENVELOPE_BYTES,
+            "responseBytes": MAX_RESPONSE_BYTES,
+            "metadataSectionBytes": MAX_METADATA_SECTION_BYTES,
+            "defaultPageSize": 100,
+            "maximumPageSize": MAX_PAGE_SIZE
+        }
+    });
+    if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > MAX_METADATA_SECTION_BYTES) {
+        return Err(ApiError::internal(
+            "management metadata exceeds its response limit",
+        ));
+    }
+    Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowImportRequest {
+    source: String,
+    #[serde(default)]
+    replace: bool,
+    #[serde(default)]
+    expected_revision: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowSelectorRequest {
+    selector: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowEligibilityRequest {
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowExecutionRequest {
+    #[serde(default)]
+    request_key: Option<String>,
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowPageQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecutionPageQuery {
+    workflow_id: Option<String>,
+    status: Option<String>,
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecutionDetailQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecutionCancelRequest {
+    #[serde(default)]
+    wait_seconds: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecutionEventPageQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+    high_water: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowExecutionSubmission {
+    execution_id: String,
+    status: String,
+    workflow_revision: String,
+}
+
+async fn management_list_workflows(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<WorkflowPageQuery>,
+) -> Response {
+    let page = match crate::management::list_workflow_page(
+        &state.store,
+        query.limit,
+        query.cursor.as_deref(),
+    ) {
+        Ok(page) => page,
+        Err(error) => return management_error_response(error),
+    };
+    if serde_json::to_vec(&page).map_or(true, |bytes| bytes.len() > MAX_METADATA_SECTION_BYTES) {
+        return management_error_response(ManagementError::new(
+            ManagementErrorCode::Internal,
+            "workflow metadata page exceeds its response limit",
+        ));
+    }
+    Json(page).into_response()
+}
+
+async fn management_resolve_workflow(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<WorkflowSelectorRequest>, JsonRejection>,
+) -> Response {
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(_) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::InvalidRequest,
+                "workflow resolution requires a selector",
+            ));
+        }
+    };
+    match crate::management::resolve_workflow(&state.store, &payload.selector) {
+        Ok(record) => Json(record).into_response(),
+        Err(error) => management_error_response(error),
+    }
+}
+
+async fn management_import_workflow(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    payload: Result<Json<WorkflowImportRequest>, JsonRejection>,
+) -> Response {
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(_) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::InvalidRequest,
+                "workflow import request must be valid JSON with a source string",
+            ));
+        }
+    };
+    let expected_revision = match request_revision(&headers, payload.expected_revision.as_deref()) {
+        Ok(revision) => revision,
+        Err(error) => return management_error_response(error),
+    };
+    let existed = WorkflowDocument::parse(&payload.source)
+        .ok()
+        .and_then(|workflow| {
+            state
+                .store
+                .get_workflow_source(&workflow.metadata.id)
+                .ok()
+                .flatten()
+        })
+        .is_some();
+    match crate::management::import_workflow(
+        &state.store,
+        &payload.source,
+        payload.replace,
+        expected_revision.as_deref(),
+        &plugin_snapshot(&state),
+    ) {
+        Ok(record) => (
+            if existed {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            },
+            Json(record),
+        )
+            .into_response(),
+        Err(error) => management_error_response(error),
+    }
+}
+
+async fn management_workflow_source(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match crate::management::workflow_source(&state.store, &id) {
+        Ok(source) => Json(json!({
+            "id": id,
+            "source": source.source,
+            "revision": source.revision,
+        }))
+        .into_response(),
+        Err(error) => management_error_response(error),
+    }
+}
+
+async fn management_validate_workflow(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let source = match crate::management::workflow_source(&state.store, &id) {
+        Ok(source) => source,
+        Err(error) => return management_error_response(error),
+    };
+    let analysis = crate::management::analyze_workflow(&source.source, &plugin_snapshot(&state));
+    if !analysis.is_valid() {
+        return management_error_response(
+            ManagementError::new(
+                ManagementErrorCode::InvalidOperation,
+                "stored workflow validation failed",
+            )
+            .with_details(json!({ "diagnostics": analysis.diagnostics })),
+        );
+    }
+    Json(analysis).into_response()
+}
+
+async fn management_plan_workflow(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let source = match crate::management::workflow_source(&state.store, &id) {
+        Ok(source) => source,
+        Err(error) => return management_error_response(error),
+    };
+    let plan = crate::management::plan_workflow(
+        &source.source,
+        Some(&source.revision),
+        &plugin_snapshot(&state),
+    );
+    if !plan.diagnostics.is_empty() {
+        return management_error_response(
+            ManagementError::new(
+                ManagementErrorCode::InvalidOperation,
+                "stored workflow cannot be planned",
+            )
+            .with_details(json!({ "diagnostics": plan.diagnostics })),
+        );
+    }
+    if serde_json::to_vec(&plan).map_or(true, |bytes| bytes.len() > MAX_METADATA_SECTION_BYTES) {
+        return management_error_response(ManagementError::new(
+            ManagementErrorCode::Internal,
+            "workflow plan exceeds its response limit",
+        ));
+    }
+    Json(plan).into_response()
+}
+
+async fn management_update_workflow_eligibility(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    payload: Result<Json<WorkflowEligibilityRequest>, JsonRejection>,
+) -> Response {
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(_) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::InvalidRequest,
+                "eligibility update requires an enabled boolean",
+            ));
+        }
+    };
+    let revision = match request_revision(&headers, None) {
+        Ok(Some(revision)) => revision,
+        Ok(None) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::PreconditionFailed,
+                "workflow eligibility update requires If-Match",
+            ));
+        }
+        Err(error) => return management_error_response(error),
+    };
+    match crate::management::update_workflow_eligibility(
+        &state.store,
+        &id,
+        payload.enabled,
+        &revision,
+    ) {
+        Ok(record) => Json(record).into_response(),
+        Err(error) => management_error_response(error),
+    }
+}
+
+async fn management_submit_workflow(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<WorkflowExecutionRequest>, JsonRejection>,
+) -> Response {
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(_) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::InvalidRequest,
+                "workflow execution request must be valid JSON",
+            ));
+        }
+    };
+    let inputs = payload.input.unwrap_or_else(|| json!({}));
+    if !inputs.is_object() {
+        return management_error_response(ManagementError::new(
+            ManagementErrorCode::InvalidRequest,
+            "workflow execution input must be an object",
+        ));
+    }
+    if payload.request_key.as_deref().is_some_and(|key| {
+        key.is_empty() || key.len() > 128 || !key.bytes().all(|byte| byte.is_ascii_graphic())
+    }) {
+        return management_error_response(ManagementError::new(
+            ManagementErrorCode::InvalidRequest,
+            "requestKey must contain 1 to 128 visible ASCII characters",
+        ));
+    }
+    let hash = crate::artifacts::artifact_id(
+        json!({ "workflowId": &id, "input": &inputs })
+            .to_string()
+            .as_bytes(),
+    );
+    if let Some(key) = payload.request_key.as_deref() {
+        match state.store.find_idempotent_execution(key, &hash) {
+            Ok(Some(execution)) => {
+                let revision = match state.store.execution_workflow_revision(&execution.id) {
+                    Ok(Some(revision)) => revision,
+                    _ => {
+                        return management_error_response(ManagementError::new(
+                            ManagementErrorCode::Internal,
+                            "admitted workflow revision is unavailable",
+                        ));
+                    }
+                };
+                return (
+                    StatusCode::OK,
+                    Json(WorkflowExecutionSubmission {
+                        execution_id: execution.id,
+                        status: execution.status,
+                        workflow_revision: revision,
+                    }),
+                )
+                    .into_response();
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return management_error_response(ManagementError::new(
+                    ManagementErrorCode::Conflict,
+                    "requestKey was already used for different workflow content",
+                ));
+            }
+        }
+    }
+    let mut permit = match state
+        .lifecycle
+        .admission()
+        .admit(TrackedExecutionState::Preparation)
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::Unsupported,
+                "Core is stopping and no longer accepts workflow executions",
+            ));
+        }
+    };
+    let plugins = plugin_snapshot(&state);
+    let admission = match crate::management::admit_workflow_execution(
+        &state.store,
+        &id,
+        inputs,
+        payload
+            .request_key
+            .as_deref()
+            .map(|key| (key, hash.as_str())),
+        &plugins,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => return management_error_response(error),
+    };
+    let execution = admission.execution;
+    let created = admission.created;
+    if created {
+        if permit.transition(TrackedExecutionState::Queued).is_err() {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::Internal,
+                "Core could not track admitted workflow execution",
+            ));
+        }
+        let store = state.store.clone();
+        let background_execution = execution.clone();
+        let shutdown_requested = state.lifecycle.shutdown_signal();
+        let reporter = state.reporter.clone();
+        tokio::task::spawn_blocking(move || {
+            if permit.transition(TrackedExecutionState::Active).is_err() {
+                return;
+            }
+            if let Err(error) = crate::execute_prepared_workflow_with_plugins_and_shutdown(
+                &store,
+                background_execution.clone(),
+                &plugins,
+                shutdown_requested,
+            ) && error != "Core shutdown requested"
+            {
+                reporter.report(
+                    CoreDiagnosticSource::Api,
+                    format!("execution {} failed: {error}", background_execution.id),
+                );
+            }
+        });
+    }
+    (
+        if created {
+            StatusCode::ACCEPTED
+        } else {
+            StatusCode::OK
+        },
+        Json(WorkflowExecutionSubmission {
+            execution_id: execution.id,
+            status: execution.status,
+            workflow_revision: admission.workflow_revision,
+        }),
+    )
+        .into_response()
+}
+
+async fn management_list_executions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ExecutionPageQuery>,
+) -> Response {
+    let page = match crate::management::list_execution_page(
+        &state.store,
+        query.workflow_id.as_deref(),
+        query.status.as_deref(),
+        query.limit,
+        query.cursor.as_deref(),
+    ) {
+        Ok(page) => page,
+        Err(error) => return management_error_response(error),
+    };
+    if serde_json::to_vec(&page).map_or(true, |bytes| bytes.len() > MAX_METADATA_SECTION_BYTES) {
+        return management_error_response(ManagementError::new(
+            ManagementErrorCode::PayloadTooLarge,
+            "execution metadata page exceeds its 4 MiB section limit",
+        ));
+    }
+    Json(page).into_response()
+}
+
+async fn management_inspect_execution(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ExecutionDetailQuery>,
+) -> Response {
+    let detail = match crate::management::inspect_execution(
+        &state.store,
+        &id,
+        query.limit,
+        query.cursor.as_deref(),
+    ) {
+        Ok(detail) => detail,
+        Err(error) => return management_error_response(error),
+    };
+    if serde_json::to_vec(&detail).map_or(true, |bytes| bytes.len() > MAX_METADATA_SECTION_BYTES) {
+        return management_error_response(ManagementError::new(
+            ManagementErrorCode::PayloadTooLarge,
+            "execution detail exceeds its 4 MiB section limit",
+        ));
+    }
+    Json(detail).into_response()
+}
+
+async fn management_cancel_execution(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<ExecutionCancelRequest>, JsonRejection>,
+) -> Response {
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(_) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::InvalidRequest,
+                "cancellation request must be valid JSON",
+            ));
+        }
+    };
+    match crate::management::cancel_execution(&state.store, &id, payload.wait_seconds).await {
+        Ok(outcome) => Json(outcome).into_response(),
+        Err(error) => management_error_response(error),
+    }
+}
+
+async fn management_execution_logs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ExecutionEventPageQuery>,
+) -> Response {
+    let page = match crate::management::execution_event_page(
+        &state.store,
+        &id,
+        query.limit,
+        query.cursor.as_deref(),
+        query.high_water,
+    ) {
+        Ok(page) => page,
+        Err(error) => return management_error_response(error),
+    };
+    if serde_json::to_vec(&page).map_or(true, |bytes| bytes.len() > MAX_METADATA_SECTION_BYTES) {
+        return management_error_response(ManagementError::new(
+            ManagementErrorCode::PayloadTooLarge,
+            "execution event page exceeds its 4 MiB section limit",
+        ));
+    }
+    Json(page).into_response()
+}
+
+async fn management_list_triggers(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<WorkflowPageQuery>,
+) -> Response {
+    let page = match crate::management::list_trigger_page(
+        &state.store,
+        query.limit,
+        query.cursor.as_deref(),
+    ) {
+        Ok(page) => page,
+        Err(error) => return management_error_response(error),
+    };
+    if serde_json::to_vec(&page).map_or(true, |bytes| bytes.len() > MAX_METADATA_SECTION_BYTES) {
+        return management_error_response(ManagementError::new(
+            ManagementErrorCode::PayloadTooLarge,
+            "trigger metadata page exceeds its 4 MiB section limit",
+        ));
+    }
+    Json(page).into_response()
+}
+
+async fn management_inspect_trigger(
+    State(state): State<Arc<AppState>>,
+    Path((workflow_id, trigger_id)): Path<(String, String)>,
+) -> Response {
+    match crate::management::inspect_trigger(&state.store, &workflow_id, &trigger_id) {
+        Ok(trigger) => Json(trigger).into_response(),
+        Err(error) => management_error_response(error),
+    }
+}
+
+fn request_revision(
+    headers: &HeaderMap,
+    body_revision: Option<&str>,
+) -> Result<Option<String>, ManagementError> {
+    let header_revision = headers
+        .get(header::IF_MATCH)
+        .map(|value| {
+            value.to_str().map(normalize_revision).map_err(|_| {
+                ManagementError::new(
+                    ManagementErrorCode::InvalidRequest,
+                    "If-Match must contain a valid workflow revision",
+                )
+            })
+        })
+        .transpose()?;
+    let body_revision = body_revision.map(normalize_revision);
+    if header_revision
+        .as_ref()
+        .zip(body_revision.as_ref())
+        .is_some_and(|(header, body)| header != body)
+    {
+        return Err(ManagementError::new(
+            ManagementErrorCode::InvalidRequest,
+            "If-Match and expectedRevision must identify the same workflow revision",
+        ));
+    }
+    Ok(header_revision.or(body_revision))
+}
+
+fn normalize_revision(value: &str) -> String {
+    value.trim().trim_matches('"').to_owned()
+}
+
+async fn management_not_found() -> Response {
+    management_error_response(ManagementError::new(
+        ManagementErrorCode::NotFound,
+        "management route was not found",
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IntegrationPageQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderAuthCommitRequest {
+    secret_value: Option<SecretValue>,
+    oauth_bundle: Option<SecretValue>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpAuthRequest {
+    secret_reference: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpToolListRequest {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpToolCallRequest {
+    name: String,
+    arguments: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSecretValueRequest {
+    value: SecretValue,
+}
+
+async fn management_list_providers(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<IntegrationPageQuery>,
+) -> Response {
+    let items = match state.store.list_provider_profiles() {
+        Ok(items) => items,
+        Err(_) => {
+            return management_error_response(internal_management_error(
+                "cannot list provider profiles",
+            ));
+        }
+    };
+    match paginate_integration_items(
+        items,
+        query.limit,
+        query.cursor.as_deref(),
+        "providers",
+        |profile| format!("{}\0{}", profile.id, profile.updated_at),
+        |profile| profile.id.clone(),
+    ) {
+        Ok(page) => bounded_management_json(
+            StatusCode::OK,
+            serde_json::to_value(page).unwrap_or(serde_json::Value::Null),
+        ),
+        Err(error) => management_error_response(error),
+    }
+}
+
+async fn management_get_provider(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.store.get_provider_profile(&id) {
+        Ok(Some(profile)) => bounded_management_json(
+            StatusCode::OK,
+            serde_json::to_value(profile).unwrap_or(serde_json::Value::Null),
+        ),
+        Ok(None) => management_error_response(ManagementError::new(
+            ManagementErrorCode::NotFound,
+            "provider profile was not found",
+        )),
+        Err(_) => {
+            management_error_response(internal_management_error("cannot inspect provider profile"))
+        }
+    }
+}
+
+async fn management_create_provider(
+    State(state): State<Arc<AppState>>,
+    Json(profile): Json<ProviderProfileUpsert>,
+) -> Response {
+    match state.store.get_provider_profile(&profile.id) {
+        Ok(Some(_)) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::Conflict,
+                "provider profile already exists; add is create-only",
+            ));
+        }
+        Err(_) => {
+            return management_error_response(internal_management_error(
+                "cannot inspect provider profile",
+            ));
+        }
+        Ok(None) => {}
+    }
+    match state.store.create_provider_profile(profile) {
+        Ok(profile) => bounded_management_json(
+            StatusCode::CREATED,
+            serde_json::to_value(profile).unwrap_or(serde_json::Value::Null),
+        ),
+        Err(error) if error.contains("UNIQUE constraint") => {
+            management_error_response(ManagementError::new(
+                ManagementErrorCode::Conflict,
+                "provider profile already exists; add is create-only",
+            ))
+        }
+        Err(_) => management_error_response(ManagementError::new(
+            ManagementErrorCode::InvalidRequest,
+            "provider profile is invalid",
+        )),
+    }
+}
+
+async fn management_prepare_provider_auth(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match crate::management::prepare_provider_auth(&state.store, &id) {
+        Ok(preparation) => bounded_management_json(
+            StatusCode::OK,
+            serde_json::to_value(preparation).unwrap_or(serde_json::Value::Null),
+        ),
+        Err(error) => management_error_response(error),
+    }
+}
+
+async fn management_commit_provider_auth(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<ProviderAuthCommitRequest>,
+) -> Response {
+    let (value, oauth_bundle) = match (request.secret_value, request.oauth_bundle) {
+        (Some(value), None) => (value, false),
+        (None, Some(value)) => (value, true),
+        _ => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::InvalidRequest,
+                "provide exactly one supported authentication payload",
+            ));
+        }
+    };
+    match crate::management::commit_provider_auth(&state.store, &id, value, oauth_bundle) {
+        Ok(outcome) => bounded_management_json(
+            StatusCode::OK,
+            json!({
+                "status": "committed",
+                "secret": outcome.record,
+                "cleanupWarning": outcome.cleanup_warning
+            }),
+        ),
+        Err(error) => management_error_response(error),
+    }
+}
+
+async fn management_test_provider(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match crate::management::test_provider(&state.store, &id) {
+        Ok(report) => bounded_management_json(
+            StatusCode::OK,
+            serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+        ),
+        Err(error) => management_error_response(error),
+    }
+}
+
+async fn management_provider_models(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match crate::management::provider_models(&state.store, &id) {
+        Ok(models) => bounded_management_json(StatusCode::NOT_IMPLEMENTED, models),
+        Err(error) => management_error_response(error),
+    }
+}
+
+async fn management_list_mcp(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<IntegrationPageQuery>,
+) -> Response {
+    let items = match state.store.list_named_mcp_connections() {
+        Ok(items) => items,
+        Err(_) => {
+            return management_error_response(internal_management_error(
+                "cannot list MCP connections",
+            ));
+        }
+    };
+    match paginate_integration_items(
+        items,
+        query.limit,
+        query.cursor.as_deref(),
+        "mcp",
+        |connection| format!("{}\0{}", connection.name, connection.revision),
+        |connection| connection.name.clone(),
+    ) {
+        Ok(page) => bounded_management_json(
+            StatusCode::OK,
+            serde_json::to_value(page).unwrap_or(serde_json::Value::Null),
+        ),
+        Err(error) => management_error_response(error),
+    }
+}
+
+async fn management_get_mcp(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    match state.store.get_named_mcp_connection(&name) {
+        Ok(Some(connection)) => bounded_management_json(
+            StatusCode::OK,
+            serde_json::to_value(connection).unwrap_or(serde_json::Value::Null),
+        ),
+        Ok(None) => management_error_response(ManagementError::new(
+            ManagementErrorCode::NotFound,
+            "MCP connection was not found",
+        )),
+        Err(_) => {
+            management_error_response(internal_management_error("cannot inspect MCP connection"))
+        }
+    }
+}
+
+async fn management_create_mcp(
+    State(state): State<Arc<AppState>>,
+    Json(connection): Json<NewNamedMcpConnection>,
+) -> Response {
+    match state.store.get_named_mcp_connection(&connection.name) {
+        Ok(Some(_)) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::Conflict,
+                "named MCP connection already exists; add is create-only",
+            ));
+        }
+        Err(_) => {
+            return management_error_response(internal_management_error(
+                "cannot inspect MCP connection",
+            ));
+        }
+        Ok(None) => {}
+    }
+    match state.store.create_named_mcp_connection(connection) {
+        Ok(connection) => bounded_management_json(
+            StatusCode::CREATED,
+            serde_json::to_value(connection).unwrap_or(serde_json::Value::Null),
+        ),
+        Err(error) if error.contains("already exists") => {
+            management_error_response(ManagementError::new(
+                ManagementErrorCode::Conflict,
+                "named MCP connection already exists; add is create-only",
+            ))
+        }
+        Err(_) => management_error_response(ManagementError::new(
+            ManagementErrorCode::InvalidRequest,
+            "MCP connection configuration is invalid",
+        )),
+    }
+}
+
+async fn management_mcp_auth(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<McpAuthRequest>,
+) -> Response {
+    let connection = match state.store.get_named_mcp_connection(&name) {
+        Ok(Some(connection)) => connection,
+        Ok(None) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::NotFound,
+                "MCP connection was not found",
+            ));
+        }
+        Err(_) => {
+            return management_error_response(internal_management_error(
+                "cannot inspect MCP connection",
+            ));
+        }
+    };
+    if let Some(reference) = request.secret_reference {
+        if !matches!(&connection.transport, McpConnectionTransport::Http { .. }) {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::InvalidOperation,
+                "--secret binding is supported only for HTTP MCP connections; stdio uses named environment references",
+            ));
+        }
+        let Some(revision) = headers
+            .get("if-match")
+            .and_then(|value| value.to_str().ok())
+        else {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::PreconditionFailed,
+                "HTTP MCP reference binding requires If-Match",
+            ));
+        };
+        let revision = normalize_revision(revision);
+        match state
+            .store
+            .bind_named_mcp_bearer_reference(&name, &revision, &reference)
+        {
+            Ok(connection) => bounded_management_json(
+                StatusCode::OK,
+                json!({
+                    "status": "committed",
+                    "connection": connection,
+                    "cleanupWarning": null
+                }),
+            ),
+            Err(error) if error.contains("revision is stale") => {
+                management_error_response(ManagementError::new(
+                    ManagementErrorCode::PreconditionFailed,
+                    "MCP connection revision is stale; no binding was changed",
+                ))
+            }
+            Err(error) if error.contains("was not found") => {
+                management_error_response(ManagementError::new(
+                    ManagementErrorCode::NotFound,
+                    "MCP connection or credential reference was not found",
+                ))
+            }
+            Err(_) => management_error_response(ManagementError::new(
+                ManagementErrorCode::InvalidOperation,
+                "MCP credential reference could not be bound; prior configuration was preserved",
+            )),
+        }
+    } else {
+        match crate::management::check_named_mcp_auth(&state.store, &connection) {
+            Ok(result) => bounded_management_json(StatusCode::OK, result),
+            Err(error) => management_error_response(error),
+        }
+    }
+}
+
+async fn management_mcp_list_tools(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(request): Json<McpToolListRequest>,
+) -> Response {
+    let connection = match state.store.get_named_mcp_connection(&name) {
+        Ok(Some(connection)) => connection,
+        Ok(None) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::NotFound,
+                "MCP connection was not found",
+            ));
+        }
+        Err(_) => {
+            return management_error_response(internal_management_error(
+                "cannot inspect MCP connection",
+            ));
+        }
+    };
+    let limit = match validate_page_limit(request.limit) {
+        Ok(limit) => limit,
+        Err(error) => return management_error_response(error),
+    };
+    let decoded_cursor = match request
+        .cursor
+        .as_deref()
+        .map(ManagementCursor::decode)
+        .transpose()
+    {
+        Ok(cursor) => cursor,
+        Err(_) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::InvalidRequest,
+                "MCP discovery cursor is invalid",
+            ));
+        }
+    };
+    if let Some(cursor) = &decoded_cursor
+        && (cursor.order != CursorOrder::MetadataIdentityAscending
+            || cursor.filters.get("collection").map(String::as_str) != Some("mcp-tools")
+            || cursor.filters.get("revision").map(String::as_str)
+                != Some(connection.revision.as_str())
+            || cursor.position.len() != 2)
+    {
+        return management_error_response(ManagementError::new(
+            ManagementErrorCode::Conflict,
+            "MCP connection changed; restart tool discovery",
+        ));
+    }
+    let operation = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut resolved = crate::management::connect_named_mcp(&state.store, &connection).await?;
+        let server = resolved.client.server_info().clone();
+        let tools = resolved.client.list_tools().await;
+        if let Err(error) = resolved.client.cancel().await {
+            return Err(crate::management::map_mcp_operation_error(error));
+        }
+        let tools = tools.map_err(crate::management::map_mcp_operation_error)?;
+        Ok::<_, ManagementError>((server, tools, resolved.secret_values))
+    })
+    .await;
+    let (server, tools, secrets) = match operation {
+        Ok(Ok(operation)) => operation,
+        Ok(Err(error)) => return management_error_response(error),
+        Err(_) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::DeadlineExceeded,
+                "MCP discovery exceeded its aggregate 30-second deadline",
+            ));
+        }
+    };
+    let mut items = tools
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": tool.input_schema.into_value(),
+                "outputSchema": tool.output_schema.map(|schema| schema.into_value())
+            })
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    let serialized = match serde_json::to_vec(&items) {
+        Ok(value) => value,
+        Err(_) => {
+            return management_error_response(internal_management_error(
+                "cannot encode discovered MCP schemas",
+            ));
+        }
+    };
+    let snapshot = format!("{:x}", Sha256::digest(&serialized));
+    let offset = if let Some(cursor) = decoded_cursor {
+        let cursor_snapshot = cursor.position[0].as_str();
+        if cursor_snapshot != snapshot {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::Conflict,
+                "MCP tool discovery changed; restart pagination",
+            ));
+        }
+        cursor.position[1]
+            .parse::<usize>()
+            .ok()
+            .filter(|offset| *offset <= items.len())
+            .unwrap_or(usize::MAX)
+    } else {
+        0
+    };
+    if offset == usize::MAX {
+        return management_error_response(ManagementError::new(
+            ManagementErrorCode::InvalidRequest,
+            "MCP discovery cursor position is invalid",
+        ));
+    }
+    let end = offset.saturating_add(limit).min(items.len());
+    let mut page = items[offset..end].to_vec();
+    let mut sensitive = secrets
+        .iter()
+        .map(|secret| secret.expose().to_owned())
+        .collect::<Vec<_>>();
+    for item in &mut page {
+        redact_json_strings(item, &sensitive);
+    }
+    let next_cursor = if end < items.len() {
+        let mut filters = BTreeMap::new();
+        filters.insert("collection".to_owned(), "mcp-tools".to_owned());
+        filters.insert("revision".to_owned(), connection.revision.clone());
+        Some(
+            ManagementCursor {
+                filters,
+                order: CursorOrder::MetadataIdentityAscending,
+                high_water: None,
+                position: vec![snapshot.clone(), end.to_string()],
+            }
+            .encode()
+            .unwrap_or_default(),
+        )
+    } else {
+        None
+    };
+    for value in &mut sensitive {
+        zeroize::Zeroize::zeroize(value);
+    }
+    bounded_management_json(
+        StatusCode::OK,
+        json!({
+            "server": {"protocolVersion": server.protocol_version, "name": server.name, "version": server.version},
+            "items": page,
+            "nextCursor": next_cursor,
+            "snapshot": snapshot
+        }),
+    )
+}
+
+async fn management_mcp_call_tool(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(request): Json<McpToolCallRequest>,
+) -> Response {
+    let connection = match state.store.get_named_mcp_connection(&name) {
+        Ok(Some(connection)) => connection,
+        Ok(None) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::NotFound,
+                "MCP connection was not found",
+            ));
+        }
+        Err(_) => {
+            return management_error_response(internal_management_error(
+                "cannot inspect MCP connection",
+            ));
+        }
+    };
+    let mut sensitive = Vec::new();
+    collect_sensitive_strings(
+        &serde_json::Value::Object(request.arguments.clone()),
+        &mut sensitive,
+    );
+    let operation = tokio::time::timeout(Duration::from_secs(60), async {
+        let mut resolved = crate::management::connect_named_mcp(&state.store, &connection).await?;
+        sensitive.extend(
+            resolved
+                .secret_values
+                .iter()
+                .map(|secret| secret.expose().to_owned()),
+        );
+        let result = resolved
+            .client
+            .call_validated_tool(&request.name, request.arguments)
+            .await;
+        if let Err(error) = resolved.client.cancel().await {
+            return Err(crate::management::map_mcp_operation_error(error));
+        }
+        result.map_err(crate::management::map_mcp_operation_error)
+    })
+    .await;
+    let result = match operation {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => return management_error_response(error),
+        Err(_) => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::DeadlineExceeded,
+                "MCP tool operation exceeded its aggregate 60-second deadline",
+            ));
+        }
+    };
+    let content = result
+        .content
+        .into_iter()
+        .map(mcp_content_value)
+        .collect::<Vec<_>>();
+    let mut response = json!({"content":content,"structuredContent":result.structured_content,"isError":result.is_error});
+    redact_json_strings(&mut response, &sensitive);
+    for value in &mut sensitive {
+        zeroize::Zeroize::zeroize(value);
+    }
+    bounded_management_json(StatusCode::OK, response)
+}
+
+fn mcp_content_value(content: McpToolContent) -> serde_json::Value {
+    match content {
+        McpToolContent::Text { text } => json!({"type":"text","text":text}),
+        McpToolContent::Image { data, mime_type } => {
+            json!({"type":"image","data":data,"mimeType":mime_type})
+        }
+        McpToolContent::Audio { data, mime_type } => {
+            json!({"type":"audio","data":data,"mimeType":mime_type})
+        }
+        McpToolContent::ResourceLink {
+            uri,
+            name,
+            description,
+            mime_type,
+            size,
+        } => {
+            json!({"type":"resourceLink","uri":uri,"name":name,"description":description,"mimeType":mime_type,"size":size})
+        }
+        McpToolContent::EmbeddedTextResource {
+            uri,
+            mime_type,
+            text,
+        } => json!({"type":"resource","resource":{"uri":uri,"mimeType":mime_type,"text":text}}),
+        McpToolContent::EmbeddedBlobResource {
+            uri,
+            mime_type,
+            blob,
+        } => json!({"type":"resource","resource":{"uri":uri,"mimeType":mime_type,"blob":blob}}),
+    }
+}
+
+fn collect_sensitive_strings(value: &serde_json::Value, output: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value) if !value.is_empty() => output.push(value.clone()),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .for_each(|value| collect_sensitive_strings(value, output)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .for_each(|value| collect_sensitive_strings(value, output)),
+        _ => {}
+    }
+}
+
+fn redact_json_strings(value: &mut serde_json::Value, sensitive: &[String]) {
+    match value {
+        serde_json::Value::String(text) => {
+            for secret in sensitive {
+                if !secret.is_empty() && text.contains(secret) {
+                    *text = text.replace(secret, "[redacted]");
+                }
+            }
+        }
+        serde_json::Value::Array(values) => values
+            .iter_mut()
+            .for_each(|value| redact_json_strings(value, sensitive)),
+        serde_json::Value::Object(values) => values
+            .values_mut()
+            .for_each(|value| redact_json_strings(value, sensitive)),
+        _ => {}
+    }
+}
+
+async fn management_list_secrets(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<IntegrationPageQuery>,
+) -> Response {
+    let items = match state.store.list_secrets() {
+        Ok(items) => items,
+        Err(_) => {
+            return management_error_response(internal_management_error(
+                "cannot list secret metadata",
+            ));
+        }
+    };
+    match paginate_integration_items(
+        items,
+        query.limit,
+        query.cursor.as_deref(),
+        "secrets",
+        |secret| format!("{}\0{}", secret.name, secret.updated_at),
+        |secret| secret.name.clone(),
+    ) {
+        Ok(page) => bounded_management_json(
+            StatusCode::OK,
+            serde_json::to_value(page).unwrap_or(serde_json::Value::Null),
+        ),
+        Err(error) => management_error_response(error),
+    }
+}
+
+async fn management_set_secret(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(request): Json<SetSecretValueRequest>,
+) -> Response {
+    let existed = state
+        .store
+        .list_secrets()
+        .ok()
+        .is_some_and(|items| items.iter().any(|item| item.name == name));
+    match state
+        .store
+        .set_secret_versioned(&name, request.value.expose())
+    {
+        Ok(outcome) => bounded_management_json(
+            if existed {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            },
+            json!({"status":"committed","secret":outcome.record,"cleanupWarning":outcome.cleanup_warning}),
+        ),
+        Err(_) => management_error_response(ManagementError::new(
+            ManagementErrorCode::InvalidRequest,
+            "secret could not be committed; prior access was preserved",
+        )),
+    }
+}
+
+async fn management_remove_secret(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    match state.store.remove_secret_versioned(&name) {
+        Ok(outcome) if outcome.removed => bounded_management_json(
+            StatusCode::OK,
+            serde_json::to_value(outcome).unwrap_or(serde_json::Value::Null),
+        ),
+        Ok(_) => management_error_response(ManagementError::new(
+            ManagementErrorCode::NotFound,
+            "secret was not found",
+        )),
+        Err(_) => management_error_response(ManagementError::new(
+            ManagementErrorCode::InvalidRequest,
+            "secret could not be removed",
+        )),
+    }
+}
+
+fn paginate_integration_items<T>(
+    items: Vec<T>,
+    requested_limit: Option<usize>,
+    cursor_value: Option<&str>,
+    collection: &str,
+    snapshot_identity: impl Fn(&T) -> String,
+    identity: impl Fn(&T) -> String,
+) -> Result<ManagementPage<T>, ManagementError> {
+    let limit = validate_page_limit(requested_limit)?;
+    let identities = items.iter().map(&snapshot_identity).collect::<Vec<_>>();
+    let encoded = serde_json::to_vec(&identities)
+        .map_err(|_| internal_management_error("cannot encode metadata page snapshot"))?;
+    let snapshot = format!("{:x}", Sha256::digest(encoded));
+    let mut filters = BTreeMap::new();
+    filters.insert("collection".to_owned(), collection.to_owned());
+    filters.insert("snapshot".to_owned(), snapshot.clone());
+    let start = if let Some(cursor_value) = cursor_value {
+        let cursor = ManagementCursor::decode(cursor_value).map_err(|_| {
+            ManagementError::new(
+                ManagementErrorCode::InvalidRequest,
+                "metadata cursor is invalid",
+            )
+        })?;
+        cursor
+            .validate_binding(&filters, CursorOrder::MetadataIdentityAscending, None)
+            .map_err(|_| {
+                ManagementError::new(
+                    ManagementErrorCode::Conflict,
+                    "metadata changed; restart pagination",
+                )
+            })?;
+        let after = cursor.position.first().ok_or_else(|| {
+            ManagementError::new(
+                ManagementErrorCode::InvalidRequest,
+                "metadata cursor has no position",
+            )
+        })?;
+        items
+            .iter()
+            .position(|item| identity(item) == *after)
+            .map(|index| index + 1)
+            .ok_or_else(|| {
+                ManagementError::new(
+                    ManagementErrorCode::Conflict,
+                    "metadata changed; restart pagination",
+                )
+            })?
+    } else {
+        0
+    };
+    let end = start.saturating_add(limit).min(items.len());
+    let page = items
+        .into_iter()
+        .skip(start)
+        .take(end - start)
+        .collect::<Vec<_>>();
+    let next_cursor = if end < identities.len() {
+        let last = page
+            .last()
+            .map(&identity)
+            .ok_or_else(|| internal_management_error("cannot advance metadata cursor"))?;
+        Some(
+            ManagementCursor {
+                filters,
+                order: CursorOrder::MetadataIdentityAscending,
+                high_water: None,
+                position: vec![last],
+            }
+            .encode()
+            .map_err(|_| internal_management_error("cannot encode metadata cursor"))?,
+        )
+    } else {
+        None
+    };
+    Ok(ManagementPage {
+        items: page,
+        next_cursor,
+        snapshot: Some(snapshot),
+    })
+}
+
+fn validate_page_limit(limit: Option<usize>) -> Result<usize, ManagementError> {
+    let limit = limit.unwrap_or(100);
+    if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+        return Err(ManagementError::new(
+            ManagementErrorCode::InvalidRequest,
+            format!("page limit must be between 1 and {MAX_PAGE_SIZE}"),
+        ));
+    }
+    Ok(limit)
+}
+
+fn bounded_management_json(status: StatusCode, value: serde_json::Value) -> Response {
+    if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > MAX_METADATA_SECTION_BYTES) {
+        return management_error_response(ManagementError::new(
+            ManagementErrorCode::PayloadTooLarge,
+            "management response section exceeds the 4 MiB limit",
+        ));
+    }
+    (status, Json(value)).into_response()
+}
+
+fn internal_management_error(message: &str) -> ManagementError {
+    ManagementError::new(ManagementErrorCode::Internal, message)
+}
+
+fn management_error_response(error: ManagementError) -> Response {
+    let status =
+        StatusCode::from_u16(error.code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(error)).into_response()
+}
+
+async fn enforce_request_size(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let is_management = path == "/api/v1/manage" || path.starts_with("/api/v1/manage/");
+    let is_import = path == "/api/v1/manage/workflows/import";
+    let limit = if is_import {
+        WORKFLOW_IMPORT_REQUEST_BYTES
+    } else if is_management {
+        DEFAULT_REQUEST_BYTES
+    } else {
+        state.api_config.request_body_limit_bytes
+    };
+    let (parts, body) = request.into_parts();
+    let bytes = match to_bytes(body, limit).await {
+        Ok(bytes) => bytes,
+        Err(_) if is_management => {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::PayloadTooLarge,
+                "encoded management request exceeds its route limit",
+            ));
+        }
+        Err(_) => {
+            return ApiError::payload_too_large("request body exceeds configured limit")
+                .into_response();
+        }
+    };
+    if is_import
+        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Some(object) = value.as_object()
+        && let Some(source) = object.get("source").and_then(serde_json::Value::as_str)
+    {
+        if source.len() > WORKFLOW_IMPORT_SOURCE_BYTES {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::PayloadTooLarge,
+                "decoded workflow source exceeds 1 MiB",
+            ));
+        }
+        let mut envelope = value;
+        if let Some(object) = envelope.as_object_mut() {
+            object.remove("source");
+        }
+        if serde_json::to_vec(&envelope).map_or(true, |encoded| {
+            encoded.len() > WORKFLOW_IMPORT_ENVELOPE_BYTES
+        }) {
+            return management_error_response(ManagementError::new(
+                ManagementErrorCode::PayloadTooLarge,
+                "encoded workflow import envelope exceeds 64 KiB",
+            ));
+        }
+    }
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
+}
+
+async fn ready_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.lifecycle.is_ready() {
+        (StatusCode::OK, Json(json!({ "status": "ready" })))
+    } else {
+        let phase = match state.lifecycle.phase() {
+            crate::lifecycle::LifecyclePhase::Starting => "starting",
+            crate::lifecycle::LifecyclePhase::Ready => "ready",
+            crate::lifecycle::LifecyclePhase::Stopping => "stopping",
+            crate::lifecycle::LifecyclePhase::Failed => "failed",
+        };
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "not_ready", "phase": phase })),
+        )
+    }
 }
 
 async fn minimax_capabilities() -> Json<serde_json::Value> {
@@ -588,12 +2173,30 @@ async fn require_auth(
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    let scope = required_scope(request.method().as_str(), request.uri().path());
+    let path = request.uri().path();
+    let is_management = path == "/api/v1/manage" || path.starts_with("/api/v1/manage/");
+    let scope = if is_management {
+        required_management_scope(request.method().as_str(), path)
+    } else {
+        required_scope(request.method().as_str(), path)
+    };
     match token.map(|token| state.store.authorize_scope(token, scope)) {
         Some(Ok(true)) => next.run(request).await,
+        Some(Ok(false)) if is_management => management_error_response(ManagementError::new(
+            ManagementErrorCode::Forbidden,
+            "the credential does not include the required management scope",
+        )),
+        None if is_management => management_error_response(ManagementError::new(
+            ManagementErrorCode::Unauthenticated,
+            "a valid Core credential is required",
+        )),
         Some(Ok(false)) | None => {
             ApiError::unauthorized("a valid Bearer token is required").into_response()
         }
+        Some(Err(_)) if is_management => management_error_response(ManagementError::new(
+            ManagementErrorCode::Internal,
+            "Core could not verify the management credential",
+        )),
         Some(Err(error)) => ApiError::internal(error).into_response(),
     }
 }
@@ -622,6 +2225,38 @@ fn required_scope(method: &str, path: &str) -> AuthScope {
     AuthScope::Manage
 }
 
+fn required_management_scope(method: &str, path: &str) -> AuthScope {
+    let route = path.strip_prefix("/api/v1/manage").unwrap_or(path);
+    if route == "/secrets" || route.starts_with("/secrets/") {
+        return AuthScope::Manage;
+    }
+    if method == "POST"
+        && (route == "/workflows/resolve"
+            || route.ends_with("/validate")
+            || route.ends_with("/plan"))
+    {
+        return AuthScope::Read;
+    }
+    if method == "POST"
+        && (route == "/workflows/import"
+            || route.ends_with("/eligibility")
+            || route.starts_with("/providers")
+            || route.starts_with("/mcp"))
+    {
+        return AuthScope::Manage;
+    }
+    if method == "POST"
+        && (route.starts_with("/workflows/") && route.ends_with("/executions")
+            || route.starts_with("/executions/") && route.ends_with("/cancel"))
+    {
+        return AuthScope::Run;
+    }
+    if method == "GET" {
+        return AuthScope::Read;
+    }
+    AuthScope::Manage
+}
+
 async fn info(State(state): State<Arc<AppState>>) -> Result<Json<CoreInfo>, ApiError> {
     Ok(Json(CoreInfo {
         api_version: API_VERSION,
@@ -637,6 +2272,7 @@ async fn info(State(state): State<Arc<AppState>>) -> Result<Json<CoreInfo>, ApiE
             "durable-events".to_string(),
             "native-core-plugin".to_string(),
             "device-pairing".to_string(),
+            "management-api".to_string(),
         ],
     }))
 }
@@ -1434,6 +3070,11 @@ async fn create_execution(
     headers: HeaderMap,
     Json(payload): Json<ExecutionRequest>,
 ) -> Result<(StatusCode, Json<crate::ExecutionRecord>), ApiError> {
+    let mut permit = state
+        .lifecycle
+        .admission()
+        .admit(TrackedExecutionState::Preparation)
+        .map_err(|_| ApiError::unavailable("Core is stopping and no longer accepts executions"))?;
     let key = headers
         .get("Idempotency-Key")
         .map(|value| {
@@ -1484,15 +3125,27 @@ async fn create_execution(
     if !created {
         return Ok((StatusCode::OK, Json(execution)));
     }
+    permit
+        .transition(TrackedExecutionState::Queued)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     let store = state.store.clone();
     let background_execution = execution.clone();
+    let shutdown_requested = state.lifecycle.shutdown_signal();
+    let reporter = state.reporter.clone();
     tokio::task::spawn_blocking(move || {
-        if let Err(error) =
-            execute_prepared_workflow_with_plugins(&store, background_execution.clone(), &plugins)
+        if permit.transition(TrackedExecutionState::Active).is_err() {
+            return;
+        }
+        if let Err(error) = crate::runtime::execute_prepared_workflow_with_plugins_and_shutdown(
+            &store,
+            background_execution.clone(),
+            &plugins,
+            shutdown_requested,
+        ) && error != "Core shutdown requested"
         {
-            eprintln!(
-                "kakune execution {} failed: {error}",
-                background_execution.id
+            reporter.report(
+                CoreDiagnosticSource::Api,
+                format!("execution {} failed: {error}", background_execution.id),
             );
         }
     });
@@ -1728,6 +3381,14 @@ impl ApiError {
         }
     }
 
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: "payload_too_large",
+            message: message.into(),
+        }
+    }
+
     fn rate_limited(retry_after: u64) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -1740,6 +3401,14 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal_error",
+            message: message.into(),
+        }
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "core_not_accepting_work",
             message: message.into(),
         }
     }
@@ -2134,7 +3803,7 @@ mod tests {
             "defaultModel":"gpt-5",
             "allowedModels":["gpt-5"],
             "capabilities":["text-generation"],
-            "auth":{"type":"oauthSecret","secret_ref":"provider-key"},
+            "auth":{"type":"oauthSecret","secretRef":"provider-key"},
             "config":{}
         }"#;
         let response = app

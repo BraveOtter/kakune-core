@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use crate::reporting::{CoreDiagnosticSource, DiagnosticReporter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
@@ -394,6 +395,24 @@ impl RegisteredPluginNode {
         node_id: &str,
         inputs: BTreeMap<String, Value>,
     ) -> Result<PluginNodeResult, PluginNodeExecutionError> {
+        self.execute_with_reporter(
+            store,
+            execution_id,
+            node_id,
+            inputs,
+            DiagnosticReporter::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_with_reporter(
+        &self,
+        store: crate::Store,
+        execution_id: &str,
+        node_id: &str,
+        inputs: BTreeMap<String, Value>,
+        reporter: DiagnosticReporter,
+    ) -> Result<PluginNodeResult, PluginNodeExecutionError> {
         let mut host = PluginHost::start(&self.manifest, self.options.clone())
             .await
             .map_err(PluginNodeExecutionError::Host)?;
@@ -434,7 +453,10 @@ impl RegisteredPluginNode {
         // exits non-zero while its isolated host is being reaped must not turn
         // a successful node invocation into a false failure.
         if let Err(error) = shutdown {
-            eprintln!("kakune plugin {} shutdown: {error}", self.manifest_id);
+            reporter.report(
+                CoreDiagnosticSource::Plugin,
+                format!("plugin {} shutdown: {error}", self.manifest_id),
+            );
         }
         Ok(result)
     }
@@ -466,6 +488,7 @@ pub enum PluginNodeExecutionError {
 #[derive(Clone, Debug, Default)]
 pub struct PluginRegistry {
     nodes: BTreeMap<String, RegisteredPluginNode>,
+    diagnostic_reporter: DiagnosticReporter,
 }
 
 impl PluginRegistry {
@@ -530,6 +553,17 @@ impl PluginRegistry {
     /// Finds a registered external node by its exact workflow node type.
     pub fn get(&self, node_type: &str) -> Option<&RegisteredPluginNode> {
         self.nodes.get(node_type)
+    }
+
+    /// Associates runtime plugin diagnostics with an executable or embedding
+    /// application's reporting boundary.
+    pub fn with_diagnostic_reporter(mut self, reporter: DiagnosticReporter) -> Self {
+        self.diagnostic_reporter = reporter;
+        self
+    }
+
+    pub(crate) fn diagnostic_reporter(&self) -> &DiagnosticReporter {
+        &self.diagnostic_reporter
     }
 }
 

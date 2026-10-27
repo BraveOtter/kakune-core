@@ -12,6 +12,7 @@ fn main() {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut input = stdin.lock();
+    let shutdown_error = std::env::args().any(|argument| argument == "shutdown-error");
     for expected_id in 1_u64.. {
         let mut line = String::new();
         if input.read_line(&mut line).unwrap() == 0 {
@@ -97,12 +98,21 @@ fn main() {
             stdout.flush().expect("stdout flushed");
             continue;
         }
-        writeln!(
-            stdout,
-            "{}",
-            json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}})
-        )
-        .expect("response written");
+        if method == "shutdown" && shutdown_error {
+            writeln!(
+                stdout,
+                "{}",
+                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"shutdown rejected"}})
+            )
+            .expect("shutdown error written");
+        } else {
+            writeln!(
+                stdout,
+                "{}",
+                json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}})
+            )
+            .expect("response written");
+        }
         stdout.flush().expect("stdout flushed");
         if method == "shutdown" {
             return;

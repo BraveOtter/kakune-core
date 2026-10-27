@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -9,8 +10,9 @@ use kakune_core::plugin_process::{
     PluginHost, PluginHostError, PluginHostOptions, PluginManifest, PluginRegistry,
 };
 use kakune_core::{
-    Store, WorkflowDocument, execute_prepared_workflow_with_plugins,
-    prepare_execution_with_plugins, run_workflow_with_plugins,
+    CoreDiagnosticSource, DiagnosticReporter, Store, WorkflowDocument,
+    execute_prepared_workflow_with_plugins, prepare_execution_with_plugins,
+    run_workflow_with_plugins,
 };
 use serde_json::{Value, json};
 
@@ -84,26 +86,20 @@ fn write_manifest(command: &str) -> PathBuf {
 }
 
 fn write_node_manifest(command: &str) -> PathBuf {
+    write_node_manifest_with_args(command, &[])
+}
+
+fn write_node_manifest_with_args(command: &str, args: &[&str]) -> PathBuf {
     let manifest_path = write_manifest(command);
     let directory = manifest_path.parent().expect("manifest parent");
     fs::create_dir(directory.join("definitions")).expect("definition directory created");
-    let manifest = json!({
-        "manifestVersion": "1.0",
-        "id": "org.example.test-plugin",
-        "name": "Test plugin",
-        "version": "0.1.0",
-        "pluginProtocol": ">=1.0.0 <2.0.0",
-        "runtime": {
-            "kind": "process",
-            "command": command,
-            "args": []
-        },
-        "contributes": {
-            "nodes": ["definitions/greet.json"],
-            "triggers": [],
-            "providers": [],
-            "services": []
-        }
+    let mut manifest = helper_manifest(command);
+    manifest["runtime"]["args"] = json!(args);
+    manifest["contributes"] = json!({
+        "nodes": ["definitions/greet.json"],
+        "triggers": [],
+        "providers": [],
+        "services": []
     });
     let definition = json!({
         "apiVersion": "kakune.dev/v1",
@@ -310,6 +306,48 @@ fn persists_plugin_node_errors() {
             .as_deref()
             .is_some_and(|error| error.contains("plugin returned JSON-RPC error: rejected"))
     );
+    drop(store);
+    remove_manifest(&manifest_path);
+    fs::remove_dir_all(directory).expect("temporary data removed");
+}
+
+#[test]
+fn plugin_shutdown_diagnostic_uses_the_injected_reporter() {
+    let manifest_path = write_node_manifest_with_args(&helper_command(), &["shutdown-error"]);
+    let manifest = PluginManifest::load(&manifest_path).expect("manifest loads");
+    let mut registry = PluginRegistry::default();
+    registry
+        .register_manifest(manifest)
+        .expect("node registers");
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let reporter = {
+        let captured = Arc::clone(&captured);
+        DiagnosticReporter::new(move |diagnostic| {
+            captured.lock().expect("diagnostic lock").push(diagnostic);
+        })
+    };
+    let registry = registry.with_diagnostic_reporter(reporter);
+    let directory = temp_directory("reporting");
+    let store = Store::open(directory.clone()).expect("store opens");
+    let workflow = WorkflowDocument::parse(
+        "apiVersion: kakune/v1\nkind: Workflow\nmetadata:\n  id: plugin-report\n  name: Plugin report\ntriggers:\n  - id: manual\n    type: kakune.trigger.manual@1\nentry: greet\nnodes:\n  - id: greet\n    type: org.example.greet@1\n    inputs:\n      name: { literal: Ada }\n",
+    )
+    .expect("workflow parses");
+
+    let execution = run_workflow_with_plugins(&store, &workflow, &registry)
+        .expect("a shutdown warning must not fail the successful node");
+
+    assert_eq!(execution.status, "succeeded");
+    let captured = captured.lock().expect("diagnostic lock");
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].source, CoreDiagnosticSource::Plugin);
+    assert!(
+        captured[0]
+            .message
+            .contains("plugin org.example.test-plugin shutdown")
+    );
+    assert!(captured[0].message.contains("shutdown rejected"));
+    drop(captured);
     drop(store);
     remove_manifest(&manifest_path);
     fs::remove_dir_all(directory).expect("temporary data removed");

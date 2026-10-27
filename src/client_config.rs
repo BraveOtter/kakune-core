@@ -1,6 +1,9 @@
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
+    io::{Read, Take, Write},
     path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
 };
 
 use crate::initialization::{
@@ -9,6 +12,10 @@ use crate::initialization::{
 use serde::{Deserialize, Serialize};
 
 const CLI_KEYRING_SERVICE: &str = "dev.kakune.cli";
+const MAX_CONTEXT_FILE_BYTES: u64 = 1_048_576;
+const MAX_CONTEXTS: usize = 1_000;
+const CONTEXT_LOCK_WAIT: Duration = Duration::from_secs(5);
+const CONTEXT_LOCK_POLL: Duration = Duration::from_millis(25);
 
 /// Production adapter for the existing CLI environment and OS-keyring
 /// credential conventions.
@@ -88,6 +95,8 @@ pub struct ContextFile {
     pub format: String,
     pub exported_at: String,
     pub active_context_id: Option<String>,
+    #[serde(default)]
+    pub revision: u64,
     pub contexts: Vec<ConnectionContext>,
 }
 
@@ -97,6 +106,7 @@ impl Default for ContextFile {
             format: "kakune-contexts/v1".to_string(),
             exported_at: timestamp().unwrap_or_default(),
             active_context_id: None,
+            revision: 0,
             contexts: Vec::new(),
         }
     }
@@ -107,9 +117,8 @@ impl ContextFile {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let source = fs::read_to_string(path)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        let contexts: Self = serde_json::from_str(&source)
+        let source = read_context_file(path)?;
+        let contexts: Self = serde_json::from_slice(&source)
             .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
         contexts.validate()?;
         Ok(contexts)
@@ -118,25 +127,18 @@ impl ContextFile {
     pub fn save(&mut self, path: &Path) -> Result<(), String> {
         self.validate()?;
         self.exported_at = timestamp()?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| "contexts path has no parent directory".to_string())?;
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("cannot create contexts directory: {error}"))?;
-        let temporary = path.with_extension("json.tmp");
-        fs::write(
-            &temporary,
-            serde_json::to_vec_pretty(self)
-                .map_err(|error| format!("cannot serialize contexts: {error}"))?,
-        )
-        .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
-        fs::rename(&temporary, path)
-            .map_err(|error| format!("cannot replace {}: {error}", path.display()))
+        let contents = serialize_context_file(self)?;
+        atomic_write(path, &contents, true, true)
     }
 
     pub fn validate(&self) -> Result<(), String> {
         if self.format != "kakune-contexts/v1" {
             return Err("contexts format must be kakune-contexts/v1".to_string());
+        }
+        if self.contexts.len() > MAX_CONTEXTS {
+            return Err(format!(
+                "context collections may contain at most {MAX_CONTEXTS} entries"
+            ));
         }
         for context in &self.contexts {
             validate_context(context)?;
@@ -243,21 +245,373 @@ impl ContextFile {
     }
 }
 
+/// A bounded, atomic repository for the user's named Core contexts.
+///
+/// Every writer takes a cross-process lock, rereads the latest collection, and
+/// compares its source bytes again before atomic publication. Reads never
+/// create a collection or resolve credential references.
+#[derive(Clone, Debug)]
+pub struct ContextRepository {
+    path: PathBuf,
+}
+
+impl ContextRepository {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn load(&self) -> Result<ContextFile, String> {
+        ContextFile::load(&self.path)
+    }
+
+    pub fn add(&self, context: ConnectionContext) -> Result<(), String> {
+        validate_context(&context)?;
+        self.transact(true, |collection| {
+            if collection
+                .contexts
+                .iter()
+                .any(|existing| existing.id == context.id)
+            {
+                return Err(format!("context {} already exists", context.id));
+            }
+            if collection.contexts.len() == MAX_CONTEXTS {
+                return Err(format!(
+                    "context collections may contain at most {MAX_CONTEXTS} entries"
+                ));
+            }
+            collection.contexts.push(context);
+            Ok(())
+        })
+    }
+
+    /// Validates the full imported batch before taking the write lock or
+    /// publishing any entry. Imported selection and revision are not portable.
+    pub fn import(&self, source: &Path) -> Result<(), String> {
+        let bytes = read_context_file(source)?;
+        let imported: ContextFile = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("cannot parse {}: {error}", source.display()))?;
+        imported.validate()?;
+        self.transact(true, |collection| {
+            let mut incoming = std::collections::BTreeSet::new();
+            for context in &imported.contexts {
+                if !incoming.insert(context.id.as_str()) {
+                    return Err(format!(
+                        "import contains duplicate context ID {}",
+                        context.id
+                    ));
+                }
+                if collection
+                    .contexts
+                    .iter()
+                    .any(|existing| existing.id == context.id)
+                {
+                    return Err(format!("context {} already exists", context.id));
+                }
+            }
+            if collection
+                .contexts
+                .len()
+                .saturating_add(imported.contexts.len())
+                > MAX_CONTEXTS
+            {
+                return Err(format!(
+                    "context collections may contain at most {MAX_CONTEXTS} entries"
+                ));
+            }
+            collection
+                .contexts
+                .extend(imported.contexts.iter().cloned());
+            Ok(())
+        })
+    }
+
+    pub fn use_context(&self, id: &str) -> Result<(), String> {
+        self.transact(false, |collection| {
+            if !collection.contexts.iter().any(|context| context.id == id) {
+                return Err(format!("context {id} was not found"));
+            }
+            collection.active_context_id = Some(id.to_owned());
+            Ok(())
+        })
+    }
+
+    pub fn remove(&self, id: &str) -> Result<(), String> {
+        self.transact(false, |collection| {
+            let original_len = collection.contexts.len();
+            collection.contexts.retain(|context| context.id != id);
+            if collection.contexts.len() == original_len {
+                return Err(format!("context {id} was not found"));
+            }
+            if collection.active_context_id.as_deref() == Some(id) {
+                collection.active_context_id = None;
+            }
+            Ok(())
+        })
+    }
+
+    /// Exports one context, preserving only its non-secret metadata and the
+    /// collection revision. Destination parents must already exist.
+    pub fn export(&self, id: &str, destination: &Path, replace: bool) -> Result<(), String> {
+        if same_path(&self.path, destination) {
+            return Err(
+                "context export destination must differ from the collection file".to_owned(),
+            );
+        }
+        let collection = self.load()?;
+        let context = collection
+            .contexts
+            .iter()
+            .find(|context| context.id == id)
+            .ok_or_else(|| format!("context {id} was not found"))?;
+        let exported = ContextFile {
+            format: "kakune-contexts/v1".to_owned(),
+            exported_at: timestamp()?,
+            active_context_id: None,
+            revision: collection.revision,
+            contexts: vec![context.clone()],
+        };
+        let bytes = serialize_context_file(&exported)?;
+        atomic_write(destination, &bytes, replace, false)
+    }
+
+    fn transact(
+        &self,
+        create_parent: bool,
+        update: impl FnOnce(&mut ContextFile) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let parent = parent_directory(&self.path);
+        if create_parent {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create contexts directory: {error}"))?;
+        } else if !parent.is_dir() {
+            return Err(format!(
+                "context collection {} is unavailable",
+                self.path.display()
+            ));
+        }
+
+        let _lock = CollectionLock::acquire(&self.path)?;
+        let before = read_optional_context_file(&self.path)?;
+        let mut collection = match &before {
+            Some(bytes) => serde_json::from_slice::<ContextFile>(bytes)
+                .map_err(|error| format!("cannot parse {}: {error}", self.path.display()))?,
+            None => ContextFile::default(),
+        };
+        collection.validate()?;
+        update(&mut collection)?;
+        collection.revision = collection
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| "context collection revision is exhausted".to_owned())?;
+        collection.exported_at = timestamp()?;
+        collection.validate()?;
+        let contents = serialize_context_file(&collection)?;
+
+        if read_optional_context_file(&self.path)? != before {
+            return Err("context collection changed concurrently; refresh and retry".to_owned());
+        }
+        atomic_write(&self.path, &contents, before.is_some(), false)
+    }
+}
+
+struct CollectionLock {
+    _file: File,
+}
+
+impl CollectionLock {
+    fn acquire(collection_path: &Path) -> Result<Self, String> {
+        let file_name = collection_path
+            .file_name()
+            .ok_or_else(|| "contexts path has no file name".to_owned())?;
+        let mut lock_name = file_name.to_os_string();
+        lock_name.push(".lock");
+        let lock_path = collection_path.with_file_name(lock_name);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| format!("cannot lock contexts collection: {error}"))?;
+        let started = Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    let elapsed = started.elapsed();
+                    if elapsed >= CONTEXT_LOCK_WAIT {
+                        return Err(
+                            "context collection is busy; retry after the current update finishes"
+                                .to_owned(),
+                        );
+                    }
+                    thread::sleep(CONTEXT_LOCK_POLL.min(CONTEXT_LOCK_WAIT - elapsed));
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(format!("cannot lock contexts collection: {error}"));
+                }
+            }
+        }
+    }
+}
+
+fn read_optional_context_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            read_context_file(path).map(Some)
+        }
+        Ok(_) => Err(format!("{} is not a regular context file", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot inspect {}: {error}", path.display())),
+    }
+}
+
+fn serialize_context_file(contexts: &ContextFile) -> Result<Vec<u8>, String> {
+    let contents = serde_json::to_vec_pretty(contexts)
+        .map_err(|error| format!("cannot serialize contexts: {error}"))?;
+    if contents.len() as u64 > MAX_CONTEXT_FILE_BYTES {
+        return Err("context files are limited to 1 MiB".to_owned());
+    }
+    Ok(contents)
+}
+
+fn atomic_write(
+    path: &Path,
+    contents: &[u8],
+    replace: bool,
+    create_parent: bool,
+) -> Result<(), String> {
+    let parent = parent_directory(path);
+    if create_parent {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create publication directory: {error}"))?;
+    } else if !parent.is_dir() {
+        return Err(format!(
+            "destination directory {} does not exist",
+            parent.display()
+        ));
+    }
+    if !replace && fs::symlink_metadata(path).is_ok() {
+        return Err(format!(
+            "destination {} already exists; pass --replace to replace it",
+            path.display()
+        ));
+    }
+
+    let mut temporary = None;
+    for _ in 0..8 {
+        let candidate = parent.join(format!(".kakune-context-{}.tmp", uuid::Uuid::new_v4()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(format!(
+                        "cannot prepare atomic context publication: {error}"
+                    ));
+                }
+                temporary = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot create atomic context temporary file: {error}"
+                ));
+            }
+        }
+    }
+    let temporary =
+        temporary.ok_or_else(|| "cannot allocate a unique context temporary file".to_owned())?;
+    let publish = if replace {
+        fs::rename(&temporary, path)
+    } else {
+        fs::hard_link(&temporary, path)
+    };
+    if let Err(error) = publish {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "cannot atomically publish {}: {error}",
+            path.display()
+        ));
+    }
+    if !replace {
+        let _ = fs::remove_file(&temporary);
+    }
+    Ok(())
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 pub fn default_contexts_path(data_dir: PathBuf) -> PathBuf {
     data_dir.join("cli").join("contexts.json")
 }
 
 fn validate_context(context: &ConnectionContext) -> Result<(), String> {
-    if context.id.is_empty() || context.id.len() > 256 {
+    if context.id.trim().is_empty()
+        || context.id.len() > 256
+        || context.id.contains(char::is_control)
+    {
         return Err("context ID must be 1-256 characters".to_string());
     }
-    if context.name.is_empty() || context.name.len() > 200 {
+    if context.name.trim().is_empty()
+        || context.name.len() > 200
+        || context.name.contains(char::is_control)
+    {
         return Err("context name must be 1-200 characters".to_string());
     }
-    if !(context.endpoint.starts_with("http://") || context.endpoint.starts_with("https://"))
-        || context.endpoint.contains(char::is_whitespace)
+    let endpoint = reqwest::Url::parse(&context.endpoint)
+        .map_err(|_| "context endpoint must be a valid HTTP or HTTPS URL".to_string())?;
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.fragment().is_some()
     {
         return Err("context endpoint must be an HTTP or HTTPS URL".to_string());
+    }
+    if endpoint.query_pairs().any(|(key, _)| {
+        matches!(
+            key.to_ascii_lowercase().as_str(),
+            "token"
+                | "access_token"
+                | "api_key"
+                | "apikey"
+                | "secret"
+                | "password"
+                | "authorization"
+                | "credential"
+        )
+    }) {
+        return Err("context endpoint must not contain credential query parameters".to_string());
+    }
+    if let Some(expected) = &context.expected_core_id
+        && (expected.trim().is_empty()
+            || expected.len() > 256
+            || expected.contains(char::is_control))
+    {
+        return Err("expected Core identity must be 1-256 non-control characters".to_string());
     }
     if let Some(color) = &context.color
         && (color.len() != 7
@@ -266,10 +620,39 @@ fn validate_context(context: &ConnectionContext) -> Result<(), String> {
     {
         return Err("context color must be a #RRGGBB value".to_string());
     }
-    if context.credential_ref.as_deref().is_some_and(str::is_empty) {
-        return Err("context credentialRef must not be empty".to_string());
+    if context.credential_ref.as_deref().is_some_and(|reference| {
+        reference.trim().is_empty()
+            || reference.len() > 1_024
+            || reference.contains(char::is_whitespace)
+            || reference.contains(char::is_control)
+    }) {
+        return Err(
+            "context credentialRef must be a non-secret reference without whitespace".to_string(),
+        );
     }
     Ok(())
+}
+
+fn read_context_file(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular context file", path.display()));
+    }
+    if metadata.len() > MAX_CONTEXT_FILE_BYTES {
+        return Err("context files are limited to 1 MiB".to_string());
+    }
+    let file =
+        File::open(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut capped: Take<File> = file.take(MAX_CONTEXT_FILE_BYTES.saturating_add(1));
+    let mut source = Vec::new();
+    capped
+        .read_to_end(&mut source)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if source.len() as u64 > MAX_CONTEXT_FILE_BYTES {
+        return Err("context files are limited to 1 MiB".to_string());
+    }
+    Ok(source)
 }
 
 fn timestamp() -> Result<String, String> {

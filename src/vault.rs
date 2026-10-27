@@ -18,7 +18,7 @@ pub struct Ciphertext {
 /// Encrypts the portable headless vault with a user-supplied passphrase.
 /// OS keychain backends can replace this boundary without changing storage callers.
 pub fn encrypt(data_dir: &Path, plaintext: &[u8]) -> Result<Ciphertext, String> {
-    let mut key = derive_key(data_dir)?;
+    let mut key = derive_key(data_dir, true)?;
     let nonce_uuid = Uuid::new_v4();
     let nonce = nonce_uuid.as_bytes()[..12].to_vec();
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "cannot initialize vault cipher")?;
@@ -33,7 +33,7 @@ pub fn decrypt(data_dir: &Path, nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u
     if nonce.len() != 12 {
         return Err("stored secret has an invalid vault nonce".to_string());
     }
-    let mut key = derive_key(data_dir)?;
+    let mut key = derive_key(data_dir, false)?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "cannot initialize vault cipher")?;
     let plaintext = cipher
         .decrypt(Nonce::from_slice(nonce), ciphertext)
@@ -42,18 +42,37 @@ pub fn decrypt(data_dir: &Path, nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u
     Ok(plaintext)
 }
 
-fn derive_key(data_dir: &Path) -> Result<[u8; 32], String> {
-    let passphrase = std::env::var("KAKUNE_VAULT_PASSPHRASE")
+fn derive_key(data_dir: &Path, create_salt: bool) -> Result<[u8; 32], String> {
+    let mut passphrase = std::env::var("KAKUNE_VAULT_PASSPHRASE")
         .map_err(|_| "vault is locked; set KAKUNE_VAULT_PASSPHRASE".to_string())?;
     if passphrase.is_empty() {
         return Err("vault is locked; KAKUNE_VAULT_PASSPHRASE must not be empty".to_string());
     }
-    let salt = load_or_create_salt(data_dir)?;
+    let salt = if create_salt {
+        load_or_create_salt(data_dir)?
+    } else {
+        load_existing_salt(data_dir)?
+    };
     let mut key = [0_u8; 32];
-    Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
-        .map_err(|error| format!("cannot derive vault key: {error}"))?;
+    let result = Argon2::default().hash_password_into(passphrase.as_bytes(), &salt, &mut key);
+    passphrase.zeroize();
+    result.map_err(|error| format!("cannot derive vault key: {error}"))?;
     Ok(key)
+}
+
+fn load_existing_salt(data_dir: &Path) -> Result<[u8; 16], String> {
+    let path = data_dir.join(SALT_FILE);
+    let bytes = fs::read(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "vault salt is unavailable; read-only resolution did not initialize the vault"
+                .to_string()
+        } else {
+            "cannot read vault salt".to_string()
+        }
+    })?;
+    bytes
+        .try_into()
+        .map_err(|_| "stored vault salt is invalid".to_string())
 }
 
 fn load_or_create_salt(data_dir: &Path) -> Result<[u8; 16], String> {

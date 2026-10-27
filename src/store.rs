@@ -1,13 +1,16 @@
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use reqwest::Url;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,17 +18,43 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::{
     ArtifactRef, WorkflowDocument, artifacts,
+    lifecycle::{Deadline, MonotonicClock, SystemMonotonicClock},
     workflow::{ConcurrencyPolicy, OverflowPolicy},
 };
+
+const MAX_STORE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadOnlyDatabaseStatus {
+    Absent,
+    Current,
+    Legacy,
+    Corrupt,
+    Newer,
+    Unavailable,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReadOnlyDatabaseObservation {
+    pub status: ReadOnlyDatabaseStatus,
+    pub schema_version: Option<u32>,
+    pub workflow_count: Option<u64>,
+    pub execution_count: Option<u64>,
+    pub guidance: String,
+}
 
 #[derive(Clone)]
 pub struct Store {
     connection: Arc<Mutex<Connection>>,
     data_dir: Arc<PathBuf>,
     initialization_issuance_eligible: Arc<AtomicBool>,
+    native_credentials: Arc<dyn NativeCredentialBackend>,
+    secret_backend: SecretBackendKind,
+    secret_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,31 +103,35 @@ pub struct OperationalMetrics {
     pub database_bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SecretBackend {
-    Native,
-    Vault,
-    NativeWithVaultBackup,
-}
+type SecretBackend = SecretBackendKind;
 
-impl SecretBackend {
-    fn current() -> Result<Self, String> {
-        match std::env::var("KAKUNE_SECRET_STORE").as_deref() {
-            Ok("native") | Err(std::env::VarError::NotPresent) => Ok(Self::Native),
-            Ok("vault") => Ok(Self::Vault),
-            Ok("native-with-vault-backup") => Ok(Self::NativeWithVaultBackup),
-            Ok(value) => Err(format!(
-                "KAKUNE_SECRET_STORE must be native, vault, or native-with-vault-backup; got {value}"
-            )),
-            Err(error) => Err(format!("cannot read KAKUNE_SECRET_STORE: {error}")),
+struct SystemNativeCredentialBackend;
+
+impl NativeCredentialBackend for SystemNativeCredentialBackend {
+    fn write(&self, key: &str, value: &[u8]) -> Result<(), String> {
+        let entry = keyring::Entry::new("dev.kakune.core.credentials.v1", key)
+            .map_err(|_| "native secret store is unavailable".to_owned())?;
+        entry
+            .set_secret(value)
+            .map_err(|_| "native secret store is unavailable".to_owned())
+    }
+
+    fn read(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        let entry = keyring::Entry::new("dev.kakune.core.credentials.v1", key)
+            .map_err(|_| "native secret store is unavailable".to_owned())?;
+        match entry.get_secret() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(_) => Err("native secret store is unavailable".to_owned()),
         }
     }
 
-    fn database_value(self) -> &'static str {
-        match self {
-            Self::Native => "native",
-            Self::Vault => "vault",
-            Self::NativeWithVaultBackup => "native-with-vault-backup",
+    fn delete(&self, key: &str) -> Result<(), String> {
+        let entry = keyring::Entry::new("dev.kakune.core.credentials.v1", key)
+            .map_err(|_| "native secret store is unavailable".to_owned())?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err("native secret store is unavailable".to_owned()),
         }
     }
 }
@@ -221,10 +254,17 @@ pub enum WorkflowSourceUpdate {
     Conflict { current_revision: String },
 }
 
+pub enum WorkflowStatusUpdate {
+    Updated(WorkflowRecord),
+    NotFound,
+    Conflict { current_revision: String },
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ScheduledTriggerRecord {
     pub next_run_at: OffsetDateTime,
     pub completed_at: Option<String>,
+    pub schedule_identity: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -261,6 +301,33 @@ pub struct EventRecord {
     pub resource_id: String,
     pub execution_id: Option<String>,
     pub payload: Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionNodeSummary {
+    pub row_id: u64,
+    pub node_id: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScheduledTriggerObservation {
+    pub workflow_id: String,
+    pub trigger_id: String,
+    pub next_run_at: Option<String>,
+    pub last_run_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutionCancellationOutcome {
+    Requested { observed_status: String },
+    AlreadyRequested { observed_status: String },
+    CancelledBeforeStart { observed_status: String },
+    TerminalUnchanged { observed_status: String },
+    NotFound,
 }
 
 /// API permissions are intentionally small and composable. `admin` includes every scope.
@@ -323,6 +390,99 @@ pub struct AuthPairingStatus {
 pub struct SecretRecord {
     pub name: String,
     pub updated_at: String,
+    pub backend: String,
+}
+
+/// The credential backend selected for explicit secret writes. Existing secrets
+/// retain the backend recorded with their metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretBackendKind {
+    Native,
+    Vault,
+    NativeWithVaultBackup,
+}
+
+impl SecretBackendKind {
+    fn database_value(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Vault => "vault",
+            Self::NativeWithVaultBackup => "native-with-vault-backup",
+        }
+    }
+
+    fn current() -> Result<Self, String> {
+        match std::env::var("KAKUNE_SECRET_STORE").as_deref() {
+            Ok("native") | Err(std::env::VarError::NotPresent) => Ok(Self::Native),
+            Ok("vault") => Ok(Self::Vault),
+            Ok("native-with-vault-backup") => Ok(Self::NativeWithVaultBackup),
+            Ok(value) => Err(format!(
+                "KAKUNE_SECRET_STORE must be native, vault, or native-with-vault-backup; got {value}"
+            )),
+            Err(error) => Err(format!("cannot read KAKUNE_SECRET_STORE: {error}")),
+        }
+    }
+}
+
+/// A testable boundary around native OS credential-manager operations.
+/// Production stores use the platform keyring adapter; deterministic fixtures
+/// can inject an in-memory implementation without touching the host keyring.
+pub trait NativeCredentialBackend: Send + Sync {
+    fn write(&self, key: &str, value: &[u8]) -> Result<(), String>;
+    fn read(&self, key: &str) -> Result<Option<Vec<u8>>, String>;
+    fn delete(&self, key: &str) -> Result<(), String>;
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(
+    tag = "type",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase"
+)]
+pub enum McpConnectionTransport {
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        working_directory: PathBuf,
+        #[serde(default)]
+        environment_secret_refs: BTreeMap<String, String>,
+    },
+    Http {
+        endpoint: String,
+        bearer_secret_ref: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NewNamedMcpConnection {
+    pub name: String,
+    pub transport: McpConnectionTransport,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NamedMcpConnection {
+    pub name: String,
+    pub transport: McpConnectionTransport,
+    pub revision: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretSetOutcome {
+    pub record: SecretRecord,
+    pub cleanup_warning: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretRemoveOutcome {
+    pub removed: bool,
+    pub cleanup_warning: Option<String>,
 }
 
 /// The supported provider implementations in the profile catalog.
@@ -337,7 +497,11 @@ pub enum ProviderType {
 ///
 /// This deliberately contains a secret *reference*, not the secret itself.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ProviderAuth {
     #[serde(rename = "apiKey")]
     ApiKeySecret { secret_ref: String },
@@ -430,12 +594,42 @@ pub struct PreparedPluginInstallRecord {
 
 impl Store {
     pub fn open(data_dir: PathBuf) -> Result<Self, String> {
-        Self::open_with_busy_timeout(data_dir, None)
+        Self::open_with_busy_timeout(data_dir, Some(MAX_STORE_WAIT))
     }
 
     fn open_with_busy_timeout(
         data_dir: PathBuf,
         busy_timeout: Option<std::time::Duration>,
+    ) -> Result<Self, String> {
+        Self::open_with_busy_timeout_and_secret_backend(
+            data_dir,
+            busy_timeout,
+            SecretBackendKind::current()?,
+            Arc::new(SystemNativeCredentialBackend),
+        )
+    }
+
+    /// Opens an isolated Store with an explicitly selected and injectable
+    /// credential backend. This is also the deterministic seam used by tests;
+    /// production callers normally use [`Store::open`].
+    pub fn open_with_secret_backend(
+        data_dir: PathBuf,
+        secret_backend: SecretBackendKind,
+        native_credentials: Arc<dyn NativeCredentialBackend>,
+    ) -> Result<Self, String> {
+        Self::open_with_busy_timeout_and_secret_backend(
+            data_dir,
+            Some(MAX_STORE_WAIT),
+            secret_backend,
+            native_credentials,
+        )
+    }
+
+    fn open_with_busy_timeout_and_secret_backend(
+        data_dir: PathBuf,
+        busy_timeout: Option<std::time::Duration>,
+        secret_backend: SecretBackendKind,
+        native_credentials: Arc<dyn NativeCredentialBackend>,
     ) -> Result<Self, String> {
         fs::create_dir_all(&data_dir)
             .map_err(|error| format!("cannot create Kakune data directory: {error}"))?;
@@ -445,6 +639,27 @@ impl Store {
                 .map_err(|error| format!("cannot inspect Kakune database: {error}"))?
                 .len()
                 > 0;
+        if database_existed {
+            let source = Connection::open_with_flags(
+                &database_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|error| {
+                format!("cannot inspect Kakune database read-only before upgrade: {error}")
+            })?;
+            if let Some(busy_timeout) = busy_timeout {
+                source.busy_timeout(busy_timeout).map_err(database_error)?;
+            }
+            let current = schema_version_before_migration(&source)?;
+            if current > LATEST_SCHEMA_VERSION {
+                return Err(format!(
+                    "Kakune database schema version {current} is newer than this Core supports ({LATEST_SCHEMA_VERSION})"
+                ));
+            }
+            if current < LATEST_SCHEMA_VERSION {
+                backup_before_migration(&source, &data_dir, current + 1)?;
+            }
+        }
         let mut connection = Connection::open(&database_path)
             .map_err(|error| format!("cannot open Kakune database: {error}"))?;
         if let Some(busy_timeout) = busy_timeout {
@@ -458,7 +673,7 @@ impl Store {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| format!("cannot configure Kakune database: {error}"))?;
-        if let Err(error) = migrate(&mut connection, &data_dir, database_existed) {
+        if let Err(error) = migrate(&mut connection) {
             return Err(if busy_timeout.is_some() {
                 format!("Kakune storage migration failed: {error}")
             } else {
@@ -469,6 +684,9 @@ impl Store {
             connection: Arc::new(Mutex::new(connection)),
             data_dir: Arc::new(data_dir),
             initialization_issuance_eligible: Arc::new(AtomicBool::new(false)),
+            native_credentials,
+            secret_backend,
+            secret_locks: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -494,8 +712,7 @@ impl Store {
             }
         };
 
-        let store =
-            Self::open_with_busy_timeout(data_dir, Some(std::time::Duration::from_secs(5)))?;
+        let store = Self::open_with_busy_timeout(data_dir, Some(MAX_STORE_WAIT))?;
         store
             .initialization_issuance_eligible
             .store(is_new, Ordering::Release);
@@ -840,6 +1057,19 @@ impl Store {
                 )
                 .map_err(database_error)?
                 == 1)
+        })
+    }
+
+    pub fn execution_is_pinned(&self, id: &str) -> Result<Option<bool>, String> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT pinned != 0 FROM executions WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(database_error)
         })
     }
 
@@ -1310,20 +1540,25 @@ impl Store {
                     params![name, encrypted.nonce, encrypted.ciphertext, updated_at, backend.database_value()],
                 )
                 .map_err(database_error)?;
-            Ok(SecretRecord { name: name.to_string(), updated_at })
+            Ok(SecretRecord {
+                name: name.to_string(),
+                updated_at,
+                backend: backend.database_value().to_string(),
+            })
         })
     }
 
     pub fn list_secrets(&self) -> Result<Vec<SecretRecord>, String> {
         self.with_connection(|connection| {
             let mut statement = connection
-                .prepare("SELECT name, updated_at FROM secrets ORDER BY name")
+                .prepare("SELECT name, updated_at, backend FROM secrets ORDER BY name")
                 .map_err(database_error)?;
             statement
                 .query_map([], |row| {
                     Ok(SecretRecord {
                         name: row.get(0)?,
                         updated_at: row.get(1)?,
+                        backend: row.get(2)?,
                     })
                 })
                 .map_err(database_error)?
@@ -1361,17 +1596,18 @@ impl Store {
 
     pub fn resolve_secret(&self, name: &str) -> Result<String, String> {
         validate_secret_name(name)?;
-        let (nonce, ciphertext, backend) = self
+        let (nonce, ciphertext, backend, credential_version) = self
             .with_connection(|connection| {
                 connection
                     .query_row(
-                        "SELECT nonce, ciphertext, backend FROM secrets WHERE name = ?1",
+                        "SELECT nonce, ciphertext, backend, credential_version FROM secrets WHERE name = ?1",
                         [name],
                         |row| {
                             Ok((
                                 row.get::<_, Vec<u8>>(0)?,
                                 row.get::<_, Vec<u8>>(1)?,
                                 row.get::<_, String>(2)?,
+                                row.get::<_, Option<String>>(3)?,
                             ))
                         },
                     )
@@ -1379,16 +1615,275 @@ impl Store {
                     .map_err(database_error)
             })?
             .ok_or_else(|| format!("secret {name} was not found"))?;
-        if backend == "native" || backend == "native-with-vault-backup" {
-            let value = self
-                .native_secret_entry(name)?
-                .get_secret()
-                .map_err(|error| format!("cannot read native secret {name}: {error}"))?;
-            return String::from_utf8(value)
+        if backend == "vault" {
+            return String::from_utf8(crate::vault::decrypt(self.data_dir(), &nonce, &ciphertext)?)
                 .map_err(|_| format!("secret {name} is not valid UTF-8"));
+        }
+        if !matches!(backend.as_str(), "native" | "native-with-vault-backup") {
+            return Err("secret metadata names an unsupported credential backend".to_owned());
+        }
+        if let Some(version) = credential_version {
+            match self.native_credentials.read(&version) {
+                Ok(Some(value)) => {
+                    return String::from_utf8(value)
+                        .map_err(|_| format!("secret {name} is not valid UTF-8"));
+                }
+                Ok(None) if backend == "native-with-vault-backup" => {}
+                Err(_) if backend == "native-with-vault-backup" => {}
+                Ok(None) => return Err(format!("secret {name} is unavailable")),
+                Err(_) => return Err("native secret store is unavailable".to_owned()),
+            }
+        } else {
+            match self.native_secret_entry(name)?.get_secret() {
+                Ok(value) => {
+                    return String::from_utf8(value)
+                        .map_err(|_| format!("secret {name} is not valid UTF-8"));
+                }
+                Err(_) if backend == "native-with-vault-backup" => {}
+                Err(_) => return Err("native secret store is unavailable".to_owned()),
+            }
         }
         String::from_utf8(crate::vault::decrypt(self.data_dir(), &nonce, &ciphertext)?)
             .map_err(|_| format!("secret {name} is not valid UTF-8"))
+    }
+
+    /// Publishes a new secret version without exposing its value in metadata.
+    /// Existing access remains valid until the metadata reference is committed.
+    pub fn set_secret_versioned(
+        &self,
+        name: &str,
+        value: &str,
+    ) -> Result<SecretSetOutcome, String> {
+        validate_secret_name(name)?;
+        if value.is_empty() || value.len() > 64 * 1024 {
+            return Err("secret value must contain 1 to 65536 UTF-8 bytes".to_owned());
+        }
+        self.with_secret_name_lock(name, || self.publish_secret_version(name, value))
+    }
+
+    fn publish_secret_version(&self, name: &str, value: &str) -> Result<SecretSetOutcome, String> {
+        let backend = self.secret_backend;
+        let previous = self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT backend, credential_version FROM secrets WHERE name = ?1",
+                    [name],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()
+                .map_err(database_error)
+        })?;
+        let encrypted = if matches!(
+            backend,
+            SecretBackendKind::Vault | SecretBackendKind::NativeWithVaultBackup
+        ) {
+            Some(crate::vault::encrypt(self.data_dir(), value.as_bytes())?)
+        } else {
+            None
+        };
+        let version = Uuid::new_v4().to_string();
+        let has_native_version = matches!(
+            backend,
+            SecretBackendKind::Native | SecretBackendKind::NativeWithVaultBackup
+        );
+        if has_native_version
+            && self
+                .native_credentials
+                .write(&version, value.as_bytes())
+                .is_err()
+        {
+            let _ = self.native_credentials.delete(&version);
+            return Err("native secret staging failed; prior access was preserved".to_owned());
+        }
+        if has_native_version {
+            match self.native_credentials.read(&version) {
+                Ok(Some(readback)) if readback == value.as_bytes() => {}
+                _ => {
+                    let _ = self.native_credentials.delete(&version);
+                    return Err(
+                        "native secret readback verification failed; prior access was preserved"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        if let Some(encrypted) = &encrypted {
+            let readback = match crate::vault::decrypt(
+                self.data_dir(),
+                &encrypted.nonce,
+                &encrypted.ciphertext,
+            ) {
+                Ok(readback) => readback,
+                Err(error) => {
+                    if has_native_version {
+                        let _ = self.native_credentials.delete(&version);
+                    }
+                    return Err(error);
+                }
+            };
+            if readback != value.as_bytes() {
+                if has_native_version {
+                    let _ = self.native_credentials.delete(&version);
+                }
+                return Err(
+                    "vault secret readback verification failed; prior access was preserved"
+                        .to_owned(),
+                );
+            }
+        }
+
+        let timestamp = now()?;
+        let (nonce, ciphertext) = encrypted
+            .map(|value| (value.nonce, value.ciphertext))
+            .unwrap_or_else(|| (Vec::new(), Vec::new()));
+        let publication = self.with_connection(|connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            transaction
+                .execute(
+                    "INSERT INTO secrets (name, nonce, ciphertext, updated_at, backend, credential_version)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(name) DO UPDATE SET nonce = excluded.nonce, ciphertext = excluded.ciphertext,
+                         updated_at = excluded.updated_at, backend = excluded.backend,
+                         credential_version = excluded.credential_version",
+                    params![
+                        name,
+                        nonce,
+                        ciphertext,
+                        timestamp,
+                        backend.database_value(),
+                        version,
+                    ],
+                )
+                .map_err(database_error)?;
+            transaction.commit().map_err(database_error)
+        });
+        if let Err(error) = publication {
+            if has_native_version {
+                let _ = self.native_credentials.delete(&version);
+            }
+            return Err(format!(
+                "secret publication failed; prior access was preserved: {error}"
+            ));
+        }
+
+        let cleanup_warning = previous.and_then(|(old_backend, old_version)| {
+            if !matches!(old_backend.as_str(), "native" | "native-with-vault-backup") {
+                return None;
+            }
+            let cleanup = match old_version {
+                Some(old_version) => self.native_credentials.delete(&old_version),
+                None => self.native_secret_entry(name).and_then(|entry| {
+                    match entry.delete_credential() {
+                        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                        Err(_) => Err("native secret cleanup failed".to_owned()),
+                    }
+                }),
+            };
+            cleanup.err().map(|_| {
+                "secret was committed, but the previous credential version could not be removed"
+                    .to_owned()
+            })
+        });
+        Ok(SecretSetOutcome {
+            record: SecretRecord {
+                name: name.to_owned(),
+                updated_at: timestamp,
+                backend: backend.database_value().to_owned(),
+            },
+            cleanup_warning,
+        })
+    }
+
+    /// Removes the published reference first, then attempts physical cleanup.
+    pub fn remove_secret_versioned(&self, name: &str) -> Result<SecretRemoveOutcome, String> {
+        validate_secret_name(name)?;
+        self.with_secret_name_lock(name, || {
+            let previous = self.with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT backend, credential_version FROM secrets WHERE name = ?1",
+                        [name],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                    )
+                    .optional()
+                    .map_err(database_error)
+            })?;
+            let Some((backend, version)) = previous else {
+                return Ok(SecretRemoveOutcome {
+                    removed: false,
+                    cleanup_warning: None,
+                });
+            };
+            let removed = self.with_connection(|connection| {
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(database_error)?;
+                let changed = transaction
+                    .execute("DELETE FROM secrets WHERE name = ?1", [name])
+                    .map_err(database_error)?;
+                transaction.commit().map_err(database_error)?;
+                Ok(changed == 1)
+            })?;
+            if !removed {
+                return Ok(SecretRemoveOutcome {
+                    removed: false,
+                    cleanup_warning: None,
+                });
+            }
+            let cleanup = if matches!(backend.as_str(), "native" | "native-with-vault-backup") {
+                match version {
+                    Some(version) => self.native_credentials.delete(&version),
+                    None => self.native_secret_entry(name).and_then(|entry| {
+                        match entry.delete_credential() {
+                            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                            Err(_) => Err("native secret cleanup failed".to_owned()),
+                        }
+                    }),
+                }
+            } else {
+                Ok(())
+            };
+            Ok(SecretRemoveOutcome {
+                removed: true,
+                cleanup_warning: cleanup.err().map(|_| {
+                    "secret reference was removed, but physical credential cleanup failed"
+                        .to_owned()
+                }),
+            })
+        })
+    }
+
+    fn with_secret_name_lock<T>(
+        &self,
+        name: &str,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let lock = {
+            let mut locks = self
+                .secret_locks
+                .lock()
+                .map_err(|_| "secret lock registry is unavailable".to_owned())?;
+            Arc::clone(locks.entry(name.to_owned()).or_default())
+        };
+        let started = Instant::now();
+        let _guard = loop {
+            match lock.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let elapsed = started.elapsed();
+                    if elapsed >= MAX_STORE_WAIT {
+                        return Err("secret name is busy; retry explicitly".to_owned());
+                    }
+                    std::thread::sleep(
+                        std::time::Duration::from_millis(10).min(MAX_STORE_WAIT - elapsed),
+                    );
+                }
+            }
+        };
+        operation()
     }
 
     fn native_secret_entry(&self, name: &str) -> Result<keyring::Entry, String> {
@@ -1558,6 +2053,157 @@ impl Store {
                 return Ok(None);
             }
             get_provider_profile(connection, id)
+        })
+    }
+
+    /// Adds a named MCP endpoint without starting a process or making a
+    /// connection. Secret material is represented only by references.
+    pub fn create_named_mcp_connection(
+        &self,
+        connection: NewNamedMcpConnection,
+    ) -> Result<NamedMcpConnection, String> {
+        validate_named_mcp_connection(&connection)?;
+        let (transport, configuration, secret_references) =
+            named_mcp_connection_values(&connection.transport)?;
+        let revision = Uuid::new_v4().to_string();
+        let timestamp = now()?;
+        self.with_connection(|connection_db| {
+            let transaction = connection_db
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            let exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM named_mcp_connections WHERE name = ?1)",
+                    [&connection.name],
+                    |row| row.get(0),
+                )
+                .map_err(database_error)?;
+            if exists {
+                return Err(format!(
+                    "named MCP connection {} already exists",
+                    connection.name
+                ));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO named_mcp_connections
+                     (name, transport, configuration_json, secret_references_json, revision, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                    params![
+                        connection.name,
+                        transport,
+                        serde_json::to_string(&configuration).map_err(|error| error.to_string())?,
+                        serde_json::to_string(&secret_references).map_err(|error| error.to_string())?,
+                        revision,
+                        timestamp,
+                    ],
+                )
+                .map_err(database_error)?;
+            let created = named_mcp_connection_by_name(&transaction, &connection.name)?
+                .ok_or_else(|| "named MCP connection was created but could not be read".to_owned())?;
+            transaction.commit().map_err(database_error)?;
+            Ok(created)
+        })
+    }
+
+    pub fn list_named_mcp_connections(&self) -> Result<Vec<NamedMcpConnection>, String> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT name, transport, configuration_json, secret_references_json, revision, created_at, updated_at
+                     FROM named_mcp_connections ORDER BY name",
+                )
+                .map_err(database_error)?;
+            statement
+                .query_map([], named_mcp_connection_from_row)
+                .map_err(database_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error)
+        })
+    }
+
+    pub fn get_named_mcp_connection(
+        &self,
+        name: &str,
+    ) -> Result<Option<NamedMcpConnection>, String> {
+        self.with_connection(|connection| named_mcp_connection_by_name(connection, name))
+    }
+
+    /// Rebinds only the HTTP bearer reference, guarded by the previously
+    /// observed connection revision. The caller must verify that the referenced
+    /// secret is available before invoking this publication boundary.
+    pub fn update_named_mcp_bearer_reference(
+        &self,
+        name: &str,
+        expected_revision: &str,
+        secret_reference: &str,
+    ) -> Result<NamedMcpConnection, String> {
+        validate_secret_name(secret_reference)?;
+        self.with_connection(|connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            let current = named_mcp_connection_by_name(&transaction, name)?
+                .ok_or_else(|| format!("named MCP connection {name} was not found"))?;
+            if current.revision != expected_revision {
+                return Err(format!("named MCP connection {name} revision is stale"));
+            }
+            let McpConnectionTransport::Http {
+                endpoint,
+                bearer_secret_ref: _,
+            } = current.transport
+            else {
+                return Err("only HTTP MCP connections support bearer reference binding".into());
+            };
+            let revision = Uuid::new_v4().to_string();
+            let updated_at = now()?;
+            let configuration = serde_json::json!({ "endpoint": endpoint });
+            let secret_references = serde_json::json!({ "bearer": secret_reference });
+            let changed = transaction
+                .execute(
+                    "UPDATE named_mcp_connections
+                     SET configuration_json = ?1, secret_references_json = ?2, revision = ?3, updated_at = ?4
+                     WHERE name = ?5 AND revision = ?6 AND transport = 'http'",
+                    params![
+                        serde_json::to_string(&configuration).map_err(|error| error.to_string())?,
+                        serde_json::to_string(&secret_references).map_err(|error| error.to_string())?,
+                        revision,
+                        updated_at,
+                        name,
+                        expected_revision,
+                    ],
+                )
+                .map_err(database_error)?;
+            if changed != 1 {
+                return Err(format!("named MCP connection {name} revision is stale"));
+            }
+            let updated = named_mcp_connection_by_name(&transaction, name)?
+                .ok_or_else(|| "updated MCP connection could not be read".to_owned())?;
+            transaction.commit().map_err(database_error)?;
+            Ok(updated)
+        })
+    }
+
+    /// Checks the referenced credential and publishes an HTTP binding while
+    /// holding the same per-secret lock used by canonical set/remove. The
+    /// revision check remains transactional in the publication method.
+    pub fn bind_named_mcp_bearer_reference(
+        &self,
+        name: &str,
+        expected_revision: &str,
+        secret_reference: &str,
+    ) -> Result<NamedMcpConnection, String> {
+        validate_secret_name(secret_reference)?;
+        self.with_secret_name_lock(secret_reference, || {
+            let current = self
+                .get_named_mcp_connection(name)?
+                .ok_or_else(|| format!("named MCP connection {name} was not found"))?;
+            if current.revision != expected_revision {
+                return Err(format!("named MCP connection {name} revision is stale"));
+            }
+            let mut resolved = self.resolve_secret(secret_reference)?;
+            resolved.zeroize();
+            self.update_named_mcp_bearer_reference(name, expected_revision, secret_reference)
         })
     }
 
@@ -1797,7 +2443,12 @@ impl Store {
                 .query_row(
                     "SELECT status, revision FROM workflows WHERE id = ?1",
                     [&id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(database_error)?;
@@ -1865,13 +2516,42 @@ impl Store {
         })
     }
 
-    pub fn list_enabled_workflow_sources(&self) -> Result<Vec<(String, String)>, String> {
+    pub fn list_workflows_after(
+        &self,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<WorkflowRecord>, String> {
+        let limit = i64::try_from(limit).map_err(|_| "workflow page limit is too large")?;
+        let after_id = after_id.unwrap_or("");
         self.with_connection(|connection| {
             let mut statement = connection
-                .prepare("SELECT id, source FROM workflows WHERE status = 'enabled' ORDER BY id")
+                .prepare(
+                    "SELECT id, name, status, revision, updated_at FROM workflows
+                     WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+                )
                 .map_err(database_error)?;
             let rows = statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .query_map(params![after_id, limit], |row| {
+                    Ok(WorkflowRecord {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        status: row.get(2)?,
+                        revision: row.get(3)?,
+                        updated_at: row.get(4)?,
+                    })
+                })
+                .map_err(database_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(database_error)
+        })
+    }
+
+    pub fn list_enabled_workflow_sources(&self) -> Result<Vec<(String, String, String)>, String> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare("SELECT id, source, revision FROM workflows WHERE status = 'enabled' ORDER BY id")
+                .map_err(database_error)?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                 .map_err(database_error)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(database_error)
         })
@@ -1885,7 +2565,7 @@ impl Store {
         self.with_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT next_run_at, completed_at FROM scheduled_triggers
+                    "SELECT next_run_at, completed_at, misfire_policy FROM scheduled_triggers
                      WHERE workflow_id = ?1 AND trigger_id = ?2",
                     params![workflow_id, trigger_id],
                     |row| {
@@ -1901,6 +2581,7 @@ impl Store {
                         Ok(ScheduledTriggerRecord {
                             next_run_at,
                             completed_at: row.get(1)?,
+                            schedule_identity: row.get(2)?,
                         })
                     },
                 )
@@ -1909,15 +2590,51 @@ impl Store {
         })
     }
 
-    /// Initializes a durable schedule without claiming a run. Existing deadlines
-    /// remain authoritative across restarts while the persisted policy is updated.
+    /// Returns durable schedule observations only; callers must not interpret
+    /// their presence as proof that a live scheduler or watcher is active.
+    pub fn list_scheduled_trigger_observations(
+        &self,
+    ) -> Result<Vec<ScheduledTriggerObservation>, String> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT workflow_id, trigger_id, next_run_at, last_run_at, completed_at, updated_at
+                     FROM scheduled_triggers
+                     ORDER BY workflow_id ASC, trigger_id ASC
+                     LIMIT 10001",
+                )
+                .map_err(database_error)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(ScheduledTriggerObservation {
+                        workflow_id: row.get(0)?,
+                        trigger_id: row.get(1)?,
+                        next_run_at: row.get(2)?,
+                        last_run_at: row.get(3)?,
+                        completed_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                })
+                .map_err(database_error)?;
+            let records = rows.collect::<Result<Vec<_>, _>>().map_err(database_error)?;
+            if records.len() > 10_000 {
+                return Err("scheduled trigger observation exceeds its 10,000-record limit".to_owned());
+            }
+            Ok(records)
+        })
+    }
+
+    /// Initializes or reconciles a durable schedule without claiming a run.
+    /// Callers preserve a legacy deadline during fingerprint migration, and
+    /// reset it only when the definition's revision or trigger config changed.
     pub(crate) fn ensure_scheduled_trigger(
         &self,
         workflow_id: &str,
         trigger_id: &str,
         next_run_at: OffsetDateTime,
-        misfire_policy: &str,
+        schedule_identity: &str,
         now_time: OffsetDateTime,
+        reset_existing: bool,
     ) -> Result<(), String> {
         let next_run_at = next_run_at
             .format(&Rfc3339)
@@ -1930,9 +2647,12 @@ impl Store {
                 "INSERT INTO scheduled_triggers (workflow_id, trigger_id, next_run_at, misfire_policy, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(workflow_id, trigger_id) DO UPDATE SET
+                   next_run_at = CASE WHEN ?6 THEN excluded.next_run_at ELSE scheduled_triggers.next_run_at END,
+                   last_run_at = CASE WHEN ?6 THEN NULL ELSE scheduled_triggers.last_run_at END,
+                   completed_at = CASE WHEN ?6 THEN NULL ELSE scheduled_triggers.completed_at END,
                    misfire_policy = excluded.misfire_policy,
                    updated_at = excluded.updated_at",
-                params![workflow_id, trigger_id, next_run_at, misfire_policy, now_time],
+                params![workflow_id, trigger_id, next_run_at, schedule_identity, now_time, reset_existing],
             ).map_err(database_error)?;
             Ok(())
         })
@@ -2145,6 +2865,65 @@ impl Store {
         })
     }
 
+    /// Changes trigger eligibility only when the caller still observes the
+    /// workflow revision supplied with the request.
+    pub fn set_workflow_status_if_revision(
+        &self,
+        id: &str,
+        status: &str,
+        expected_revision: &str,
+    ) -> Result<WorkflowStatusUpdate, String> {
+        if !matches!(status, "enabled" | "disabled") {
+            return Err("workflow status must be enabled or disabled".to_owned());
+        }
+        let now = now()?;
+        self.with_connection(|connection| {
+            let transaction = connection.transaction().map_err(database_error)?;
+            let current: Option<(String, String, String, String)> = transaction
+                .query_row(
+                    "SELECT name, status, revision, updated_at FROM workflows WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(database_error)?;
+            let Some((name, current_status, current_revision, current_updated_at)) = current else {
+                return Ok(WorkflowStatusUpdate::NotFound);
+            };
+            if current_revision != expected_revision {
+                return Ok(WorkflowStatusUpdate::Conflict { current_revision });
+            }
+            let updated_at = if current_status == status {
+                current_updated_at
+            } else {
+                transaction
+                    .execute(
+                        "UPDATE workflows SET status = ?1, updated_at = ?2
+                         WHERE id = ?3 AND revision = ?4",
+                        params![status, now, id, expected_revision],
+                    )
+                    .map_err(database_error)?;
+                append_event(
+                    &transaction,
+                    "workflow.status_changed",
+                    id,
+                    None,
+                    serde_json::json!({ "status": status, "revision": current_revision }),
+                    &now,
+                )?;
+                now
+            };
+            transaction.commit().map_err(database_error)?;
+            Ok(WorkflowStatusUpdate::Updated(WorkflowRecord {
+                id: id.to_owned(),
+                name,
+                status: status.to_owned(),
+                revision: current_revision,
+                updated_at,
+            }))
+        })
+    }
+
     pub fn create_execution(&self, workflow_name: &str) -> Result<ExecutionRecord, String> {
         let execution = ExecutionRecord {
             id: Uuid::new_v4().to_string(),
@@ -2205,6 +2984,46 @@ impl Store {
         plan: &Value,
         identity: Option<(&str, &str)>,
     ) -> Result<(ExecutionRecord, bool), String> {
+        self.create_execution_with_plan_guarded(
+            workflow_name,
+            workflow_revision,
+            plan,
+            identity,
+            false,
+            false,
+        )
+    }
+
+    /// Admits work only if the workflow still has the exact revision used to
+    /// compile `plan`. Automatic callers additionally require current
+    /// eligibility in the same SQLite transaction.
+    pub fn create_execution_with_plan_if_current_revision_request(
+        &self,
+        workflow_id: &str,
+        workflow_revision: &str,
+        plan: &Value,
+        identity: Option<(&str, &str)>,
+        require_enabled: bool,
+    ) -> Result<(ExecutionRecord, bool), String> {
+        self.create_execution_with_plan_guarded(
+            workflow_id,
+            workflow_revision,
+            plan,
+            identity,
+            true,
+            require_enabled,
+        )
+    }
+
+    fn create_execution_with_plan_guarded(
+        &self,
+        workflow_name: &str,
+        workflow_revision: &str,
+        plan: &Value,
+        identity: Option<(&str, &str)>,
+        require_current_revision: bool,
+        require_enabled: bool,
+    ) -> Result<(ExecutionRecord, bool), String> {
         let policy = serde_json::from_value::<crate::workflow::WorkflowPolicy>(
             plan.get("policy").cloned().unwrap_or(Value::Null),
         )
@@ -2220,6 +3039,27 @@ impl Store {
                 && let Some(record) = idempotent_execution(&transaction, key, hash)?
             {
                 return Ok((record, false));
+            }
+            if require_current_revision {
+                let current: Option<(String, String)> = transaction
+                    .query_row(
+                        "SELECT revision, status FROM workflows WHERE id = ?1",
+                        [workflow_name],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(database_error)?;
+                let Some((current_revision, status)) = current else {
+                    return Err(format!("workflow {workflow_name} was not found"));
+                };
+                if current_revision != workflow_revision {
+                    return Err(format!(
+                        "workflow revision conflict; current revision is {current_revision}"
+                    ));
+                }
+                if require_enabled && status != "enabled" {
+                    return Err(format!("workflow {workflow_name} is not enabled"));
+                }
             }
             let status = execution_admission(&transaction, workflow_name, policy.concurrency.as_ref())?;
             transaction
@@ -2257,7 +3097,7 @@ impl Store {
             created_at,
             completed_at: None,
             error: None,
-        }, true))
+            }, true))
         })
     }
 
@@ -2335,6 +3175,19 @@ impl Store {
                         .map_err(|error| format!("cannot decode execution plan: {error}"))
                 })
                 .transpose()
+        })
+    }
+
+    pub fn execution_workflow_revision(&self, id: &str) -> Result<Option<String>, String> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT workflow_revision FROM execution_plans WHERE execution_id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(database_error)
         })
     }
 
@@ -2425,21 +3278,34 @@ impl Store {
         let completed_at = now()?;
         self.with_connection(|connection| {
             let transaction = connection.transaction().map_err(database_error)?;
-            let workflow_id: String = transaction
+            let execution = transaction
                 .query_row(
-                    "SELECT workflow_name FROM executions WHERE id = ?1",
+                    "SELECT workflow_name, status FROM executions WHERE id = ?1",
                     [id],
-                    |row| row.get(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(database_error)?
                 .ok_or_else(|| format!("execution {id} was not found"))?;
-            transaction
+            let (workflow_id, observed_status) = execution;
+            if !matches!(observed_status.as_str(), "queued" | "running" | "cancelling") {
+                return Ok(());
+            }
+            let changed = transaction
                 .execute(
-                    "UPDATE executions SET status = ?1, completed_at = ?2, error = ?3 WHERE id = ?4",
+                    "UPDATE executions SET status = ?1, completed_at = ?2, error = ?3
+                     WHERE id = ?4 AND status IN ('queued', 'running', 'cancelling')",
                     params![status, completed_at, error, id],
                 )
                 .map_err(database_error)?;
+            if changed == 0 {
+                return Ok(());
+            }
             transaction.execute("UPDATE execution_trace_spans SET status=?2,completed_at=?3,error=COALESCE(?4,'Execution ended before this span was closed') WHERE execution_id=?1 AND status='running'", params![id,if status == "failed" { "failed" } else { "cancelled" },completed_at,error]).map_err(database_error)?;
             append_event(
                 &transaction,
@@ -2600,6 +3466,90 @@ impl Store {
                 )
                 .map_err(database_error)?
                 == 1)
+        })
+    }
+
+    /// Requests cooperative cancellation with a conditional status transition.
+    /// Queued cancellation, its terminal timestamp, and its event are atomic.
+    pub fn request_execution_cancel_outcome(
+        &self,
+        id: &str,
+    ) -> Result<ExecutionCancellationOutcome, String> {
+        self.with_connection(|connection| {
+            let transaction = connection.transaction().map_err(database_error)?;
+            let current: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT workflow_name, status FROM executions WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(database_error)?;
+            let Some((workflow_id, status)) = current else {
+                return Ok(ExecutionCancellationOutcome::NotFound);
+            };
+            let outcome = match status.as_str() {
+                "queued" => {
+                    let completed_at = now()?;
+                    let changed = transaction
+                        .execute(
+                            "UPDATE executions SET status = 'cancelled', completed_at = ?1
+                             WHERE id = ?2 AND status = 'queued'",
+                            params![completed_at, id],
+                        )
+                        .map_err(database_error)?;
+                    if changed == 1 {
+                        append_event(
+                            &transaction,
+                            "execution.cancelled",
+                            &workflow_id,
+                            Some(id),
+                            serde_json::json!({ "status": "cancelled", "outcome": "cancelled_before_start" }),
+                            &completed_at,
+                        )?;
+                        ExecutionCancellationOutcome::CancelledBeforeStart {
+                            observed_status: "cancelled".to_owned(),
+                        }
+                    } else {
+                        let observed = execution_status(&transaction, id)?;
+                        cancellation_outcome_for_observed(&observed)
+                    }
+                }
+                "running" => {
+                    let requested_at = now()?;
+                    let changed = transaction
+                        .execute(
+                            "UPDATE executions SET status = 'cancelling'
+                             WHERE id = ?1 AND status = 'running'",
+                            [id],
+                        )
+                        .map_err(database_error)?;
+                    if changed == 1 {
+                        append_event(
+                            &transaction,
+                            "execution.cancel.requested",
+                            &workflow_id,
+                            Some(id),
+                            serde_json::json!({ "status": "cancelling", "outcome": "requested" }),
+                            &requested_at,
+                        )?;
+                        ExecutionCancellationOutcome::Requested {
+                            observed_status: "cancelling".to_owned(),
+                        }
+                    } else {
+                        let observed = execution_status(&transaction, id)?;
+                        cancellation_outcome_for_observed(&observed)
+                    }
+                }
+                "cancelling" => ExecutionCancellationOutcome::AlreadyRequested {
+                    observed_status: status,
+                },
+                _ => ExecutionCancellationOutcome::TerminalUnchanged {
+                    observed_status: status,
+                },
+            };
+            transaction.commit().map_err(database_error)?;
+            Ok(outcome)
         })
     }
 
@@ -2865,6 +3815,208 @@ impl Store {
         })
     }
 
+    pub fn list_execution_page(
+        &self,
+        workflow_id: Option<&str>,
+        status: Option<&str>,
+        before: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<(Vec<ExecutionRecord>, bool), String> {
+        if limit == 0 || limit > 1_000 {
+            return Err("execution page limit must be between 1 and 1000".to_owned());
+        }
+        let query_limit = i64::try_from(limit + 1)
+            .map_err(|_| "execution page limit exceeds SQLite range".to_owned())?;
+        let (before_created, before_id) =
+            before.map_or((None, None), |(created, id)| (Some(created), Some(id)));
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, workflow_name, status, created_at, completed_at, error
+                     FROM executions
+                     WHERE (?1 IS NULL OR workflow_name = ?1)
+                       AND (?2 IS NULL OR status = ?2)
+                       AND (?3 IS NULL OR created_at < ?3 OR (created_at = ?3 AND id > ?4))
+                     ORDER BY created_at DESC, id ASC
+                     LIMIT ?5",
+                )
+                .map_err(database_error)?;
+            let mut records = statement
+                .query_map(
+                    params![workflow_id, status, before_created, before_id, query_limit],
+                    execution_from_row,
+                )
+                .map_err(database_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error)?;
+            let has_more = records.len() > limit;
+            if has_more {
+                records.truncate(limit);
+            }
+            Ok((records, has_more))
+        })
+    }
+
+    pub fn execution_started_at(&self, id: &str) -> Result<Option<String>, String> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT MIN(timestamp) FROM events WHERE execution_id = ?1 AND type = 'execution.started'",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(database_error)
+        })
+    }
+
+    pub fn execution_result_size(&self, id: &str) -> Result<Option<u64>, String> {
+        self.with_connection(|connection| {
+            let size: Option<i64> = connection
+                .query_row(
+                    "SELECT length(result_json) FROM execution_results WHERE execution_id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(database_error)?;
+            size.map(|size| {
+                u64::try_from(size).map_err(|_| "execution result size is invalid".to_owned())
+            })
+            .transpose()
+        })
+    }
+
+    pub fn execution_trace_span_count(&self, id: &str) -> Result<u64, String> {
+        self.with_connection(|connection| {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM execution_trace_spans WHERE execution_id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(database_error)?;
+            u64::try_from(count).map_err(|_| "execution trace count is invalid".to_owned())
+        })
+    }
+
+    pub fn execution_node_page(
+        &self,
+        execution_id: &str,
+        after_row_id: u64,
+        limit: usize,
+    ) -> Result<(Vec<ExecutionNodeSummary>, bool), String> {
+        if limit == 0 || limit > 1_001 {
+            return Err(
+                "execution node read limit exceeds its 1001-record internal cap".to_owned(),
+            );
+        }
+        let after_row_id = i64::try_from(after_row_id)
+            .map_err(|_| "execution node cursor is out of range".to_owned())?;
+        let query_limit = i64::try_from(limit + 1)
+            .map_err(|_| "execution node page limit is out of range".to_owned())?;
+        self.with_connection(|connection| {
+            if !execution_exists(connection, execution_id)? {
+                return Err(format!("execution {execution_id} was not found"));
+            }
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, node_id, status FROM node_runs
+                     WHERE execution_id = ?1 AND id > ?2
+                     ORDER BY id ASC LIMIT ?3",
+                )
+                .map_err(database_error)?;
+            let mut nodes = statement
+                .query_map(params![execution_id, after_row_id, query_limit], |row| {
+                    let row_id: i64 = row.get(0)?;
+                    let row_id = u64::try_from(row_id)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, row_id))?;
+                    Ok(ExecutionNodeSummary {
+                        row_id,
+                        node_id: row.get(1)?,
+                        status: row.get(2)?,
+                    })
+                })
+                .map_err(database_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error)?;
+            let has_more = nodes.len() > limit;
+            if has_more {
+                nodes.truncate(limit);
+            }
+            Ok((nodes, has_more))
+        })
+    }
+
+    pub fn execution_event_bounds(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<(u64, Option<u64>)>, String> {
+        self.with_connection(|connection| {
+            if !execution_exists(connection, execution_id)? {
+                return Ok(None);
+            }
+            let (high_water, first_retained): (i64, Option<i64>) = connection
+                .query_row(
+                    "SELECT COALESCE(MAX(sequence), 0), MIN(sequence)
+                     FROM events WHERE execution_id = ?1",
+                    [execution_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(database_error)?;
+            let high_water =
+                u64::try_from(high_water).map_err(|_| "event sequence is invalid".to_owned())?;
+            let first_retained = first_retained
+                .map(|sequence| {
+                    u64::try_from(sequence).map_err(|_| "event sequence is invalid".to_owned())
+                })
+                .transpose()?;
+            Ok(Some((high_water, first_retained)))
+        })
+    }
+
+    pub fn execution_event_page(
+        &self,
+        execution_id: &str,
+        after_sequence: u64,
+        high_water: u64,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>, String> {
+        if limit == 0 || limit > 1_001 {
+            return Err(
+                "execution event read limit exceeds its 1001-record internal cap".to_owned(),
+            );
+        }
+        let after_sequence =
+            i64::try_from(after_sequence).map_err(|_| "event cursor is out of range".to_owned())?;
+        let high_water =
+            i64::try_from(high_water).map_err(|_| "event snapshot is out of range".to_owned())?;
+        let query_limit =
+            i64::try_from(limit).map_err(|_| "event page limit is out of range".to_owned())?;
+        self.with_connection(|connection| {
+            if !execution_exists(connection, execution_id)? {
+                return Err(format!("execution {execution_id} was not found"));
+            }
+            let mut statement = connection
+                .prepare(
+                    "SELECT CASE event_version WHEN 1 THEN '1.0' ELSE CAST(event_version AS TEXT) END,
+                            core_id, event_id, sequence, timestamp, type, resource_id, execution_id,
+                            CASE WHEN length(payload) <= 2048 THEN payload ELSE NULL END
+                     FROM events
+                     WHERE execution_id = ?1 AND sequence > ?2 AND sequence <= ?3
+                     ORDER BY sequence ASC LIMIT ?4",
+                )
+                .map_err(database_error)?;
+            statement
+                .query_map(
+                    params![execution_id, after_sequence, high_water, query_limit],
+                    safe_event_from_row,
+                )
+                .map_err(database_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error)
+        })
+    }
+
     pub fn list_executions(&self) -> Result<Vec<ExecutionRecord>, String> {
         self.with_connection(|connection| {
             let mut statement = connection
@@ -2927,11 +4079,61 @@ impl Store {
         &self,
         operation: impl FnOnce(&mut Connection) -> Result<T, String>,
     ) -> Result<T, String> {
-        let mut connection = self
-            .connection
-            .lock()
-            .map_err(|_| "Kakune database lock was poisoned".to_string())?;
-        operation(&mut connection)
+        let clock = SystemMonotonicClock::default();
+        self.with_connection_until(Deadline::after(&clock, MAX_STORE_WAIT), &clock, operation)
+    }
+
+    /// Runs one Store operation under the caller's remaining lifecycle budget.
+    /// Connection-mutex acquisition and SQLite busy waits are capped by both
+    /// that remaining budget and the five-second store maximum. SQLite/file
+    /// operations themselves remain attached to this call and are never
+    /// detached after a timeout.
+    pub(crate) fn with_connection_until<T>(
+        &self,
+        deadline: Deadline,
+        clock: &dyn MonotonicClock,
+        operation: impl FnOnce(&mut Connection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let initial_remaining = deadline.remaining(clock).min(MAX_STORE_WAIT);
+        if initial_remaining.is_zero() {
+            return Err("Kakune database operation deadline expired".to_owned());
+        }
+        let real_deadline = Instant::now() + initial_remaining;
+        let mut connection = loop {
+            match self.connection.try_lock() {
+                Ok(connection) => break connection,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err("Kakune database lock was poisoned".to_owned());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let remaining = deadline
+                        .remaining(clock)
+                        .min(real_deadline.saturating_duration_since(Instant::now()));
+                    if remaining.is_zero() {
+                        return Err("timed out acquiring Kakune database connection".to_owned());
+                    }
+                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(2)));
+                }
+            }
+        };
+        let remaining = deadline
+            .remaining(clock)
+            .min(real_deadline.saturating_duration_since(Instant::now()));
+        if remaining.is_zero() {
+            return Err("Kakune database operation deadline expired".to_owned());
+        }
+        connection.busy_timeout(remaining).map_err(database_error)?;
+        let operation_result = operation(&mut connection);
+        // Restore the finite store default even when the operation returns an
+        // error, so a shortened phase budget cannot poison later callers.
+        let reset_result = connection
+            .busy_timeout(MAX_STORE_WAIT)
+            .map_err(database_error);
+        match (operation_result, reset_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 }
 
@@ -2966,13 +4168,16 @@ fn execution_admission(
     Ok("queued".to_string())
 }
 
-const LATEST_SCHEMA_VERSION: u32 = 15;
+const LATEST_SCHEMA_VERSION: u32 = 16;
 
-fn migrate(
-    connection: &mut Connection,
-    data_dir: &Path,
-    database_existed: bool,
-) -> Result<(), String> {
+fn migrate(connection: &mut Connection) -> Result<(), String> {
+    migrate_through_version(connection, LATEST_SCHEMA_VERSION)
+}
+
+fn migrate_through_version(connection: &mut Connection, target_version: u32) -> Result<(), String> {
+    if target_version > LATEST_SCHEMA_VERSION {
+        return Err("requested schema version is newer than this Core supports".to_owned());
+    }
     connection
         .execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)")
         .map_err(database_error)?;
@@ -2982,10 +4187,7 @@ fn migrate(
             "Kakune database schema version {current} is newer than this Core supports ({LATEST_SCHEMA_VERSION})"
         ));
     }
-    if current < LATEST_SCHEMA_VERSION && database_existed {
-        backup_before_migration(connection, data_dir, current + 1)?;
-    }
-    for version in current + 1..=LATEST_SCHEMA_VERSION {
+    for version in current + 1..=target_version {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
@@ -3003,6 +4205,7 @@ fn migrate(
             11 => add_retention_fields(&transaction)?,
             12 => add_secret_backend(&transaction)?,
             15 => add_auth_pairing_codes(&transaction)?,
+            16 => add_management_storage(&transaction)?,
             14 => transaction.execute_batch("CREATE TABLE execution_idempotency (request_key TEXT PRIMARY KEY, request_hash TEXT NOT NULL, execution_id TEXT NOT NULL REFERENCES executions(id) ON DELETE CASCADE);").map_err(database_error)?,
             13 => transaction
                 .execute_batch(
@@ -3037,6 +4240,203 @@ fn schema_version(connection: &Connection) -> Result<u32, String> {
         )
         .map_err(database_error)?;
     u32::try_from(version).map_err(|_| "database schema version is invalid".to_string())
+}
+
+fn schema_version_before_migration(connection: &Connection) -> Result<u32, String> {
+    let has_migrations: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    if has_migrations {
+        schema_version(connection)
+    } else {
+        Ok(0)
+    }
+}
+
+/// Inspects an existing database without enabling WAL, creating a directory,
+/// running migrations, or using SQLite's `immutable=1` mode. Live WAL stores
+/// are deliberately reported unavailable: a read-only view cannot establish
+/// a safe, stable view of their auxiliary state without stronger guarantees.
+pub(crate) fn observe_database_read_only(path: &Path) -> ReadOnlyDatabaseObservation {
+    let absent = || ReadOnlyDatabaseObservation {
+        status: ReadOnlyDatabaseStatus::Absent,
+        schema_version: None,
+        workflow_count: None,
+        execution_count: None,
+        guidance: "Initialize Kakune explicitly to create local storage.".to_owned(),
+    };
+    let unavailable = |guidance: &str| ReadOnlyDatabaseObservation {
+        status: ReadOnlyDatabaseStatus::Unavailable,
+        schema_version: None,
+        workflow_count: None,
+        execution_count: None,
+        guidance: guidance.to_owned(),
+    };
+    let corrupt = |guidance: &str| ReadOnlyDatabaseObservation {
+        status: ReadOnlyDatabaseStatus::Corrupt,
+        schema_version: None,
+        workflow_count: None,
+        execution_count: None,
+        guidance: guidance.to_owned(),
+    };
+
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return absent(),
+        Err(_) => return unavailable("Database access could not be verified without mutation."),
+    };
+    if !metadata.is_file() || metadata.len() == 0 {
+        return corrupt(
+            "The database is empty or is not a regular file; preserve it and investigate before repair.",
+        );
+    }
+
+    let wal_path = sidecar_path(path, "-wal");
+    let shm_path = sidecar_path(path, "-shm");
+    if sidecar_state(&wal_path).is_some() || sidecar_state(&shm_path).is_some() {
+        return unavailable(
+            "A live or stale SQLite WAL sidecar is present. Close the Core and retry observation; no immutable read was attempted.",
+        );
+    }
+
+    let before_database = file_state(path);
+    let before_wal = file_state(&wal_path);
+    let before_shm = file_state(&shm_path);
+    let inspection = (|| -> Result<ReadOnlyDatabaseObservation, String> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| "database could not be opened read-only".to_owned())?;
+        connection
+            .busy_timeout(MAX_STORE_WAIT)
+            .map_err(|_| "database read-only wait policy could not be configured".to_owned())?;
+        connection
+            .pragma_update(None, "query_only", "ON")
+            .map_err(|_| "database could not be restricted to queries".to_owned())?;
+
+        let tables = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|_| "database catalog could not be read".to_owned())?;
+        let has_table = |name: &str| tables.iter().any(|table| table == name);
+        let recognized_legacy = ["workflows", "node_runs", "auth_tokens"]
+            .iter()
+            .all(|name| has_table(name));
+        if !recognized_legacy {
+            return Err("database does not contain a recognized Kakune schema".to_owned());
+        }
+
+        let version = if has_table("schema_migrations") {
+            schema_version(&connection)?
+        } else {
+            0
+        };
+        let count = |table: &str| -> Result<Option<u64>, String> {
+            if !has_table(table) {
+                return Ok(None);
+            }
+            let value: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .map_err(|_| format!("{table} catalog could not be read"))?;
+            u64::try_from(value)
+                .map(Some)
+                .map_err(|_| format!("{table} catalog count is invalid"))
+        };
+        let workflow_count = count("workflows")?;
+        let execution_count = count("executions")?;
+        let (status, guidance) = if version > LATEST_SCHEMA_VERSION {
+            (
+                ReadOnlyDatabaseStatus::Newer,
+                format!(
+                    "Database schema {version} is newer than this Core supports ({LATEST_SCHEMA_VERSION}); use a compatible Core."
+                ),
+            )
+        } else if version < LATEST_SCHEMA_VERSION {
+            (
+                ReadOnlyDatabaseStatus::Legacy,
+                format!(
+                    "Database schema {version} requires a supported backup-first upgrade before normal Core use."
+                ),
+            )
+        } else {
+            (
+                ReadOnlyDatabaseStatus::Current,
+                "Database schema is supported; observation did not initialize or migrate it."
+                    .to_owned(),
+            )
+        };
+        Ok(ReadOnlyDatabaseObservation {
+            status,
+            schema_version: Some(version),
+            workflow_count,
+            execution_count,
+            guidance,
+        })
+    })();
+
+    let unchanged = before_database == file_state(path)
+        && before_wal == file_state(&wal_path)
+        && before_shm == file_state(&shm_path);
+    if !unchanged {
+        return unavailable(
+            "Database or SQLite auxiliary-file state changed during read-only observation; results are unavailable.",
+        );
+    }
+    match inspection {
+        Ok(observation) => observation,
+        Err(guidance) if guidance == "database does not contain a recognized Kakune schema" => {
+            corrupt(
+                "The database schema is not recognized; preserve it and use a compatible recovery path.",
+            )
+        }
+        Err(_) => corrupt(
+            "The database is unreadable or corrupt; preserve it and investigate before repair.",
+        ),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ObservedFileState {
+    exists: bool,
+    length: Option<u64>,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn file_state(path: &Path) -> ObservedFileState {
+    match fs::metadata(path) {
+        Ok(metadata) => ObservedFileState {
+            exists: true,
+            length: Some(metadata.len()),
+            modified: metadata.modified().ok(),
+        },
+        Err(_) => ObservedFileState {
+            exists: false,
+            length: None,
+            modified: None,
+        },
+    }
+}
+
+fn sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut name = database.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn sidecar_state(path: &Path) -> Option<ObservedFileState> {
+    let state = file_state(path);
+    state.exists.then_some(state)
 }
 
 fn validate_initialization_database(path: &Path) -> Result<(), String> {
@@ -3119,16 +4519,92 @@ fn backup_before_migration(
     let backup_dir = data_dir.join("backups");
     fs::create_dir_all(&backup_dir)
         .map_err(|error| format!("cannot create migration backup directory: {error}"))?;
-    let path = backup_dir.join(format!(
+    let base_path = backup_dir.join(format!(
         "kakune.sqlite3.before-migration-v{next_version}.sqlite3"
     ));
-    let mut destination = Connection::open(&path)
-        .map_err(|error| format!("cannot create migration backup {}: {error}", path.display()))?;
-    let backup =
-        rusqlite::backup::Backup::new(connection, &mut destination).map_err(database_error)?;
-    backup
-        .run_to_completion(128, std::time::Duration::from_millis(5), None)
-        .map_err(database_error)
+    let path = reserve_backup_path(&base_path)?;
+    let result = (|| {
+        let mut destination = Connection::open(&path).map_err(|error| {
+            format!("cannot create migration backup {}: {error}", path.display())
+        })?;
+        let started = Instant::now();
+        let backup =
+            rusqlite::backup::Backup::new(connection, &mut destination).map_err(database_error)?;
+        loop {
+            let step = backup.step(128).map_err(database_error)?;
+            if step == rusqlite::backup::StepResult::Done {
+                break;
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(30) {
+                return Err("migration backup exceeded its 30-second controlled budget".to_owned());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(backup);
+        let integrity: String = destination
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(database_error)?;
+        if integrity != "ok" {
+            return Err(format!(
+                "migration backup failed integrity verification: {integrity}"
+            ));
+        }
+        drop(destination);
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("cannot flush migration backup {}: {error}", path.display()))
+    })();
+    if result.is_err() {
+        remove_owned_backup_files(&path);
+    }
+    result
+}
+
+fn reserve_backup_path(base_path: &Path) -> Result<PathBuf, String> {
+    for attempt in 0..8 {
+        let path = if attempt == 0 {
+            base_path.to_path_buf()
+        } else {
+            let file_name = base_path
+                .file_name()
+                .ok_or_else(|| "migration backup path has no file name".to_owned())?
+                .to_string_lossy();
+            base_path.with_file_name(format!(
+                "{}-{}-{attempt}.sqlite3",
+                file_name.trim_end_matches(".sqlite3"),
+                Uuid::new_v4().simple()
+            ))
+        };
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                drop(file);
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot reserve migration backup {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Err("cannot reserve a unique migration backup path after eight attempts".to_owned())
+}
+
+fn remove_owned_backup_files(path: &Path) {
+    let _ = fs::remove_file(path);
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let sidecar = sidecar_path(path, suffix);
+        let _ = fs::remove_file(sidecar);
+    }
 }
 
 fn create_initial_schema(transaction: &rusqlite::Transaction<'_>) -> Result<(), String> {
@@ -3275,6 +4751,50 @@ fn add_auth_pairing_codes(transaction: &rusqlite::Transaction<'_>) -> Result<(),
              CREATE INDEX auth_pairing_codes_expiration ON auth_pairing_codes(expires_at);",
         )
         .map_err(database_error)
+}
+
+fn add_management_storage(transaction: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    transaction
+        .execute_batch(
+            "CREATE TABLE named_mcp_connections (
+               name TEXT PRIMARY KEY CHECK(length(name) BETWEEN 1 AND 120),
+               transport TEXT NOT NULL CHECK(transport IN ('stdio', 'http')),
+               configuration_json TEXT NOT NULL CHECK(json_valid(configuration_json)),
+               secret_references_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(secret_references_json)),
+               revision TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );",
+        )
+        .map_err(database_error)?;
+    let has_secrets: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'secrets')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    if has_secrets {
+        transaction
+            .execute("ALTER TABLE secrets ADD COLUMN credential_version TEXT", [])
+            .map_err(database_error)?;
+    }
+    let has_events: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    if has_events {
+        transaction
+            .execute_batch(
+                "CREATE INDEX execution_events_lookup
+                   ON events(execution_id, sequence) WHERE execution_id IS NOT NULL;",
+            )
+            .map_err(database_error)?;
+    }
+    Ok(())
 }
 
 fn add_ai_accounting(transaction: &rusqlite::Transaction<'_>) -> Result<(), String> {
@@ -3530,7 +5050,7 @@ fn append_event(
                 event_type,
                 resource_id,
                 execution_id,
-                serde_json::to_string(&payload)
+                serde_json::to_string(&sanitize_event_payload(&payload))
                     .map_err(|error| format!("cannot serialize event payload: {error}"))?,
             ],
         )
@@ -4166,6 +5686,190 @@ fn validate_secret_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_named_mcp_connection(connection: &NewNamedMcpConnection) -> Result<(), String> {
+    validate_secret_name(&connection.name).map_err(|_| {
+        "MCP connection name must be 1-120 ASCII letters, digits, '.', '_' or '-'".to_owned()
+    })?;
+    match &connection.transport {
+        McpConnectionTransport::Stdio {
+            command,
+            args,
+            working_directory,
+            environment_secret_refs,
+        } => {
+            validate_process_value("MCP executable", command)?;
+            if !working_directory.is_absolute() {
+                return Err("MCP working directory must be an absolute path".to_owned());
+            }
+            for argument in args {
+                if argument.contains('\0') {
+                    return Err("MCP arguments must not contain NUL".to_owned());
+                }
+                let normalized = argument
+                    .trim_start_matches('-')
+                    .split(['=', ':'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .replace(['-', '_'], "");
+                let credential_argument = [
+                    "token",
+                    "apikey",
+                    "secret",
+                    "password",
+                    "authorization",
+                    "credential",
+                    "accesstoken",
+                    "refreshtoken",
+                ]
+                .iter()
+                .any(|marker| normalized.contains(marker));
+                if credential_argument {
+                    return Err(
+                        "MCP command arguments must not contain credential values".to_owned()
+                    );
+                }
+            }
+            for (environment_name, secret_reference) in environment_secret_refs {
+                if environment_name.is_empty()
+                    || !environment_name.as_bytes()[0].is_ascii_alphabetic()
+                        && environment_name.as_bytes()[0] != b'_'
+                    || !environment_name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                {
+                    return Err("MCP environment names must be valid ASCII identifiers".to_owned());
+                }
+                validate_secret_name(secret_reference)?;
+            }
+        }
+        McpConnectionTransport::Http {
+            endpoint,
+            bearer_secret_ref,
+        } => {
+            let parsed = Url::parse(endpoint)
+                .map_err(|_| "MCP HTTP endpoint must be an absolute URL".to_owned())?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+            {
+                return Err(
+                    "MCP HTTP endpoint must not contain credentials, a query, or a fragment"
+                        .to_owned(),
+                );
+            }
+            if let Some(reference) = bearer_secret_ref {
+                validate_secret_name(reference)?;
+                let loopback = parsed.host_str().is_some_and(|host| {
+                    host.eq_ignore_ascii_case("localhost")
+                        || host
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|address| address.is_loopback())
+                });
+                if parsed.scheme() == "http" && !loopback {
+                    return Err("MCP bearer references require HTTPS outside loopback".to_owned());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_process_value(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() || value.contains('\0') {
+        Err(format!("{field} must not be empty or contain NUL"))
+    } else {
+        Ok(())
+    }
+}
+
+fn named_mcp_connection_values(
+    transport: &McpConnectionTransport,
+) -> Result<(&'static str, Value, Value), String> {
+    match transport {
+        McpConnectionTransport::Stdio {
+            command,
+            args,
+            working_directory,
+            environment_secret_refs,
+        } => Ok((
+            "stdio",
+            serde_json::json!({
+                "command": command,
+                "args": args,
+                "workingDirectory": working_directory,
+            }),
+            serde_json::to_value(environment_secret_refs)
+                .map_err(|error| format!("cannot serialize MCP secret references: {error}"))?,
+        )),
+        McpConnectionTransport::Http {
+            endpoint,
+            bearer_secret_ref,
+        } => Ok((
+            "http",
+            serde_json::json!({"endpoint": endpoint}),
+            serde_json::json!({"bearer": bearer_secret_ref}),
+        )),
+    }
+}
+
+fn named_mcp_connection_by_name(
+    connection: &Connection,
+    name: &str,
+) -> Result<Option<NamedMcpConnection>, String> {
+    connection
+        .query_row(
+            "SELECT name, transport, configuration_json, secret_references_json, revision, created_at, updated_at
+             FROM named_mcp_connections WHERE name = ?1",
+            [name],
+            named_mcp_connection_from_row,
+        )
+        .optional()
+        .map_err(database_error)
+}
+
+fn named_mcp_connection_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NamedMcpConnection> {
+    let transport_name = row.get::<_, String>(1)?;
+    let configuration: Value = json_from_column(row, 2)?;
+    let secret_references: Value = json_from_column(row, 3)?;
+    let mut value = configuration
+        .as_object()
+        .cloned()
+        .ok_or_else(|| invalid_persisted_value(2, "MCP configuration must be a JSON object"))?;
+    value.insert("type".to_owned(), Value::String(transport_name.clone()));
+    match transport_name.as_str() {
+        "stdio" => {
+            value.insert("environmentSecretRefs".to_owned(), secret_references);
+        }
+        "http" => {
+            let reference = secret_references
+                .get("bearer")
+                .cloned()
+                .unwrap_or(Value::Null);
+            value.insert("bearerSecretRef".to_owned(), reference);
+        }
+        other => {
+            return Err(invalid_persisted_value(
+                1,
+                format!("unknown MCP transport {other}"),
+            ));
+        }
+    }
+    let transport = serde_json::from_value(Value::Object(value)).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(NamedMcpConnection {
+        name: row.get(0)?,
+        transport,
+        revision: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
 fn execution_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExecutionRecord> {
     Ok(ExecutionRecord {
         id: row.get(0)?,
@@ -4177,7 +5881,45 @@ fn execution_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExecutionReco
     })
 }
 
+fn execution_status(transaction: &rusqlite::Transaction<'_>, id: &str) -> Result<String, String> {
+    transaction
+        .query_row("SELECT status FROM executions WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .map_err(database_error)
+}
+
+fn cancellation_outcome_for_observed(status: &str) -> ExecutionCancellationOutcome {
+    match status {
+        "cancelling" => ExecutionCancellationOutcome::AlreadyRequested {
+            observed_status: status.to_owned(),
+        },
+        "cancelled" => ExecutionCancellationOutcome::CancelledBeforeStart {
+            observed_status: status.to_owned(),
+        },
+        _ if matches!(status, "queued" | "running") => ExecutionCancellationOutcome::Requested {
+            observed_status: status.to_owned(),
+        },
+        _ => ExecutionCancellationOutcome::TerminalUnchanged {
+            observed_status: status.to_owned(),
+        },
+    }
+}
+
+fn execution_exists(connection: &Connection, id: &str) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM executions WHERE id = ?1)",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(database_error)
+}
+
 fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
+    let payload: Value = serde_json::from_str(&row.get::<_, String>(8)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(error))
+    })?;
     Ok(EventRecord {
         event_version: row.get(0)?,
         core_id: row.get(1)?,
@@ -4187,14 +5929,84 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
         event_type: row.get(5)?,
         resource_id: row.get(6)?,
         execution_id: row.get(7)?,
-        payload: serde_json::from_str(&row.get::<_, String>(8)?).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                8,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })?,
+        payload: sanitize_event_payload(&payload),
     })
+}
+
+fn safe_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
+    let payload = row.get::<_, Option<String>>(8)?;
+    let payload = match payload {
+        Some(payload) => {
+            let value = serde_json::from_str(&payload).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            sanitize_event_payload(&value)
+        }
+        None => serde_json::json!({
+            "availability": "truncated",
+            "guidance": "The stored event payload exceeded its safe page limit and was omitted."
+        }),
+    };
+    Ok(EventRecord {
+        event_version: row.get(0)?,
+        core_id: row.get(1)?,
+        event_id: row.get(2)?,
+        sequence: row.get::<_, i64>(3)? as u64,
+        timestamp: row.get(4)?,
+        event_type: row.get(5)?,
+        resource_id: row.get(6)?,
+        execution_id: row.get(7)?,
+        payload,
+    })
+}
+
+/// Events are a durable public history, so retain only known-safe identifiers
+/// and state labels. Free-form and secret-bearing payloads cannot be proven
+/// safe without resolving every referenced credential and are omitted.
+fn sanitize_event_payload(payload: &Value) -> Value {
+    let Some(object) = payload.as_object() else {
+        return serde_json::json!({
+            "availability": "unavailable",
+            "guidance": "Free-form historical event payload was omitted because its safety cannot be verified."
+        });
+    };
+    let safe_keys = [
+        "workflowId",
+        "executionId",
+        "nodeId",
+        "triggerId",
+        "status",
+        "previousStatus",
+        "outcome",
+        "revision",
+        "workflowRevision",
+        "planHash",
+        "reasonCode",
+    ];
+    let mut safe = serde_json::Map::new();
+    let mut omitted = false;
+    for (key, value) in object {
+        if safe_keys.contains(&key.as_str())
+            && (value.is_string() || value.is_number() || value.is_boolean())
+        {
+            safe.insert(key.clone(), value.clone());
+        } else {
+            omitted = true;
+        }
+    }
+    if omitted {
+        safe.insert(
+            "safetyNotice".to_owned(),
+            Value::String(
+                "Free-form or unverified event fields were omitted from this snapshot.".to_owned(),
+            ),
+        );
+    }
+    Value::Object(safe)
 }
 
 fn now() -> Result<String, String> {
@@ -5085,6 +6897,83 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_schema_zero_and_every_supported_version_through_fifteen() {
+        for initial_version in 0..=15 {
+            let directory = std::env::temp_dir().join("opencode").join(format!(
+                "kakune-schema-upgrade-{initial_version}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(&directory).expect("isolated test directory should be created");
+            let database = directory.join("kakune.sqlite3");
+            let mut connection = rusqlite::Connection::open(&database)
+                .expect("historical test database should be created");
+            if initial_version == 0 {
+                connection
+                    .execute_batch(
+                        "CREATE TABLE workflows (
+                           id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, source TEXT NOT NULL,
+                           status TEXT NOT NULL, updated_at TEXT NOT NULL
+                         );
+                         CREATE TABLE node_runs (
+                           id INTEGER PRIMARY KEY, execution_id TEXT NOT NULL, node_id TEXT NOT NULL,
+                           status TEXT NOT NULL, message TEXT, created_at TEXT NOT NULL
+                         );
+                         CREATE TABLE auth_tokens (
+                           id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,
+                           created_at TEXT NOT NULL, revoked_at TEXT
+                         );",
+                    )
+                    .expect("version-zero legacy fixture should be created");
+            } else {
+                super::migrate_through_version(&mut connection, initial_version)
+                    .expect("historical schema should be constructed through its migrations");
+            }
+            drop(connection);
+
+            let upgraded = Store::open(directory.clone())
+                .unwrap_or_else(|error| panic!("schema {initial_version} should upgrade: {error}"));
+            assert_eq!(
+                upgraded
+                    .schema_version()
+                    .expect("latest schema should be readable"),
+                super::LATEST_SCHEMA_VERSION,
+                "schema {initial_version} should migrate through schema 16"
+            );
+            drop(upgraded);
+
+            let backup = fs::read_dir(directory.join("backups"))
+                .expect("upgrade should publish a recoverable backup")
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.file_name().is_some_and(|name| {
+                        name.to_string_lossy()
+                            .contains(&format!("before-migration-v{}", initial_version + 1))
+                    })
+                })
+                .unwrap_or_else(|| panic!("schema {initial_version} backup should be present"));
+            let backup_connection = rusqlite::Connection::open(&backup)
+                .expect("pre-upgrade backup should be independently readable");
+            let backup_version: i64 = backup_connection
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|_| {
+                    if initial_version == 0 {
+                        0
+                    } else {
+                        panic!("schema {initial_version} backup bookkeeping should be readable")
+                    }
+                });
+            assert_eq!(backup_version, i64::from(initial_version));
+            drop(backup_connection);
+            fs::remove_dir_all(directory).expect("only this unique fixture should be removed");
+        }
+    }
+
+    #[test]
     fn initialization_opening_provenance_is_lost_when_an_unissued_store_is_reopened() {
         let directory = std::env::temp_dir()
             .join("opencode")
@@ -5236,5 +7125,71 @@ mod tests {
         assert_eq!(store.list_auth_tokens().unwrap().len(), 1);
         drop(store);
         fs::remove_dir_all(directory).expect("temporary data should be removed");
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_wait_tests {
+    use std::{
+        fs,
+        time::{Duration, Instant},
+    };
+
+    use rusqlite::Connection;
+
+    use crate::lifecycle::{Deadline, SystemMonotonicClock};
+
+    use super::{MAX_STORE_WAIT, Store, database_error};
+
+    #[test]
+    fn store_connection_mutex_acquisition_is_bounded() {
+        let data_dir =
+            std::env::temp_dir().join(format!("kakune-store-wait-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(data_dir.clone()).expect("isolated store should open");
+        let guard = store.connection.lock().expect("store mutex should lock");
+        let clock = SystemMonotonicClock::default();
+        let deadline = Deadline::after(&clock, Duration::from_millis(30));
+        let start = Instant::now();
+        let result = store.with_connection_until(deadline, &clock, |_| Ok(()));
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        drop(guard);
+        drop(store);
+        fs::remove_dir_all(data_dir).expect("test-owned store directory should be removable");
+    }
+
+    #[test]
+    fn sqlite_busy_wait_is_shortened_to_remaining_lifecycle_budget() {
+        let data_dir =
+            std::env::temp_dir().join(format!("kakune-store-busy-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(data_dir.clone()).expect("isolated store should open");
+        let database = data_dir.join("kakune.sqlite3");
+        let blocker = Connection::open(database).expect("second connection should open");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("test connection should hold the SQLite writer lock");
+
+        let clock = SystemMonotonicClock::default();
+        let deadline = Deadline::after(&clock, Duration::from_millis(35));
+        let start = Instant::now();
+        let result = store.with_connection_until(deadline, &clock, |connection| {
+            connection
+                .execute_batch("CREATE TABLE lifecycle_busy_probe(value INTEGER)")
+                .map_err(database_error)
+        });
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        blocker
+            .execute_batch("ROLLBACK")
+            .expect("test connection should release its lock");
+        drop(blocker);
+        drop(store);
+        fs::remove_dir_all(data_dir).expect("test-owned store directory should be removable");
+    }
+
+    #[test]
+    fn default_store_wait_is_finite_and_remains_five_seconds() {
+        assert_eq!(MAX_STORE_WAIT, Duration::from_secs(5));
     }
 }

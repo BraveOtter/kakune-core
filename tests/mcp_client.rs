@@ -114,6 +114,49 @@ async fn verifies_timeout_terminates_the_child() {
 }
 
 #[tokio::test]
+async fn enforces_mcp_discovery_page_and_stderr_caps_and_reaps_the_subprocess() {
+    let mut page_env = BTreeMap::new();
+    page_env.insert("KAKUNE_MCP_HELPER_PAGE_LOOP".to_owned(), "true".to_owned());
+    let mut paginating = McpClient::connect(
+        helper_config(page_env),
+        McpClientOptions {
+            max_tool_pages: 2,
+            ..McpClientOptions::default()
+        },
+    )
+    .await
+    .expect("paginated helper should initialize");
+    assert!(matches!(
+        paginating.list_tools().await,
+        Err(McpError::ToolPageLimit { limit: 2 })
+    ));
+    assert!(matches!(
+        paginating.list_tools().await,
+        Err(McpError::Stopped)
+    ));
+
+    let mut stderr_env = BTreeMap::new();
+    stderr_env.insert("KAKUNE_MCP_HELPER_STDERR".to_owned(), "large".to_owned());
+    let mut noisy = McpClient::connect(
+        helper_config(stderr_env),
+        McpClientOptions {
+            max_stderr_bytes: 128,
+            ..McpClientOptions::default()
+        },
+    )
+    .await
+    .expect("noisy helper should initialize");
+    noisy
+        .list_tools()
+        .await
+        .expect("tools should be discovered");
+    noisy.cancel().await.expect("subprocess should be reaped");
+    let stderr = noisy.stderr();
+    assert_eq!(stderr.bytes.len(), 128);
+    assert!(stderr.truncated);
+}
+
+#[tokio::test]
 async fn verifies_output_limit_terminates_the_child() {
     let mut client = McpClient::connect(
         helper_config(BTreeMap::new()),

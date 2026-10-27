@@ -28,6 +28,293 @@ impl WorkflowAnalysis {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanView {
+    pub format: String,
+    pub workflow_id: Option<String>,
+    pub workflow_revision: Option<String>,
+    pub scopes: Vec<PlanScopeView>,
+    pub bounds: PlanBoundsView,
+    pub capability_availability: std::collections::BTreeMap<String, String>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanScopeView {
+    pub id: String,
+    pub kind: String,
+    pub entry: String,
+    pub nodes: Vec<PlanNodeView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanNodeView {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub node_type: String,
+    pub data_dependencies: Vec<String>,
+    pub control_dependencies: Vec<String>,
+    pub routes: std::collections::BTreeMap<String, Vec<String>>,
+    pub branches: std::collections::BTreeMap<String, String>,
+    pub body: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanBoundsView {
+    pub node_count: usize,
+    pub control_edge_count: usize,
+    pub nesting_depth: usize,
+    pub maximum_nodes: usize,
+    pub maximum_control_edges: usize,
+    pub maximum_nesting_depth: usize,
+    pub loop_iteration_limits: Vec<u64>,
+    pub retry_attempt_limits: Vec<u32>,
+    pub parallelism_limits: Vec<u32>,
+    pub workflow_timeout: Option<String>,
+}
+
+pub(crate) fn plan_view(
+    source: &str,
+    revision: Option<&str>,
+    plugins: &PluginRegistry,
+) -> PlanView {
+    let analysis = analyze(source, plugins);
+    let mut scopes = Vec::new();
+    let mut capability_availability = std::collections::BTreeMap::new();
+    let (workflow_id, bounds) = if let Some(workflow) = analysis.workflow.as_ref() {
+        append_plan_scope(
+            workflow.nodes.as_slice(),
+            &workflow.entry,
+            "workflow",
+            "workflow",
+            &mut scopes,
+            &mut capability_availability,
+            plugins,
+        );
+        let (node_count, control_edge_count, nesting_depth) = graph_metrics(&workflow.nodes, 0);
+        let mut loop_iteration_limits = Vec::new();
+        let mut retry_attempt_limits = Vec::new();
+        let mut parallelism_limits = Vec::new();
+        collect_runtime_limits(
+            &workflow.nodes,
+            &mut loop_iteration_limits,
+            &mut retry_attempt_limits,
+            &mut parallelism_limits,
+        );
+        (
+            Some(workflow.metadata.id.clone()),
+            PlanBoundsView {
+                node_count,
+                control_edge_count,
+                nesting_depth,
+                maximum_nodes: MAX_NODES,
+                maximum_control_edges: MAX_EDGES,
+                maximum_nesting_depth: 32,
+                loop_iteration_limits,
+                retry_attempt_limits,
+                parallelism_limits,
+                workflow_timeout: workflow.policy.timeout.clone(),
+            },
+        )
+    } else {
+        (
+            None,
+            PlanBoundsView {
+                node_count: 0,
+                control_edge_count: 0,
+                nesting_depth: 0,
+                maximum_nodes: MAX_NODES,
+                maximum_control_edges: MAX_EDGES,
+                maximum_nesting_depth: 32,
+                loop_iteration_limits: Vec::new(),
+                retry_attempt_limits: Vec::new(),
+                parallelism_limits: Vec::new(),
+                workflow_timeout: None,
+            },
+        )
+    };
+    PlanView {
+        format: "kakune-plan/v1".to_owned(),
+        workflow_id,
+        workflow_revision: revision.map(str::to_owned),
+        scopes,
+        bounds,
+        capability_availability,
+        diagnostics: analysis.diagnostics,
+    }
+}
+
+fn append_plan_scope(
+    nodes: &[WorkflowNode],
+    entry: &str,
+    scope_id: &str,
+    scope_kind: &str,
+    scopes: &mut Vec<PlanScopeView>,
+    capabilities: &mut std::collections::BTreeMap<String, String>,
+    plugins: &PluginRegistry,
+) {
+    let mut view_nodes = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let mut data_dependencies = Vec::new();
+        for binding in node.inputs.values() {
+            collect_binding_dependencies(binding, &mut data_dependencies);
+        }
+        data_dependencies.sort();
+        data_dependencies.dedup();
+        let control_dependencies = nodes
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .on
+                    .values()
+                    .any(|targets| targets.iter().any(|target| target == node.id))
+            })
+            .map(|candidate| candidate.id.clone())
+            .collect();
+        let routes = node
+            .on
+            .iter()
+            .map(|(route, targets)| (route.clone(), targets.iter().map(str::to_owned).collect()))
+            .collect();
+        let branches = node
+            .branches
+            .keys()
+            .map(|branch| {
+                (
+                    branch.clone(),
+                    format!("{scope_id}/{}/branches/{branch}", node.id),
+                )
+            })
+            .collect();
+        let body = node
+            .body
+            .as_ref()
+            .map(|_| format!("{scope_id}/{}/body", node.id));
+        let capability = if node_definition(&node.node_type).is_some()
+            || crate::runtime::is_builtin_node_type(&node.node_type)
+            || plugins.get(&node.node_type).is_some()
+        {
+            "available"
+        } else {
+            "unavailable"
+        };
+        capabilities.insert(node.node_type.clone(), capability.to_owned());
+        view_nodes.push(PlanNodeView {
+            id: node.id.clone(),
+            node_type: node.node_type.clone(),
+            data_dependencies,
+            control_dependencies,
+            routes,
+            branches,
+            body,
+        });
+    }
+    scopes.push(PlanScopeView {
+        id: scope_id.to_owned(),
+        kind: scope_kind.to_owned(),
+        entry: entry.to_owned(),
+        nodes: view_nodes,
+    });
+    for node in nodes {
+        for (branch, graph) in &node.branches {
+            let id = format!("{scope_id}/{}/branches/{branch}", node.id);
+            append_plan_scope(
+                &graph.nodes,
+                &graph.entry,
+                &id,
+                "branch",
+                scopes,
+                capabilities,
+                plugins,
+            );
+        }
+        if let Some(graph) = &node.body {
+            let id = format!("{scope_id}/{}/body", node.id);
+            append_plan_scope(
+                &graph.nodes,
+                &graph.entry,
+                &id,
+                "body",
+                scopes,
+                capabilities,
+                plugins,
+            );
+        }
+    }
+}
+
+fn collect_binding_dependencies(binding: &WorkflowBinding, dependencies: &mut Vec<String>) {
+    match binding {
+        WorkflowBinding::From { from } => {
+            if let Some((node_id, _)) = from.split_once('.')
+                && !from.starts_with('$')
+            {
+                dependencies.push(node_id.to_owned());
+            }
+        }
+        WorkflowBinding::Expr { expr } => collect_expression_dependencies(expr, dependencies),
+        _ => {}
+    }
+}
+
+fn collect_expression_dependencies(value: &Value, dependencies: &mut Vec<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_expression_dependencies(value, dependencies);
+            }
+        }
+        Value::Object(values) => {
+            if let Some(from) = values.get("from").and_then(Value::as_str)
+                && let Some((node_id, _)) = from.split_once('.')
+                && !from.starts_with('$')
+            {
+                dependencies.push(node_id.to_owned());
+            }
+            for value in values.values() {
+                collect_expression_dependencies(value, dependencies);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_runtime_limits(
+    nodes: &[WorkflowNode],
+    loops: &mut Vec<u64>,
+    retries: &mut Vec<u32>,
+    parallelism: &mut Vec<u32>,
+) {
+    for node in nodes {
+        if let Some(value) = node.with.get("maxIterations").and_then(Value::as_u64) {
+            loops.push(value);
+        }
+        if let Some(retry) = &node.retry {
+            retries.push(retry.max_attempts);
+        }
+        if let Some(value) = node.with.get("maxConcurrency").and_then(Value::as_u64)
+            && let Ok(value) = u32::try_from(value)
+        {
+            parallelism.push(value);
+        }
+        if let Some(value) = node.with.get("maxParallelNodes").and_then(Value::as_u64)
+            && let Ok(value) = u32::try_from(value)
+        {
+            parallelism.push(value);
+        }
+        for graph in node.branches.values() {
+            collect_runtime_limits(&graph.nodes, loops, retries, parallelism);
+        }
+        if let Some(graph) = &node.body {
+            collect_runtime_limits(&graph.nodes, loops, retries, parallelism);
+        }
+    }
+}
+
 /// The private, semantic plan recorded with every execution. It is JSON only
 /// for durable inspection; it is not a public compatibility contract.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -264,7 +551,8 @@ fn validate_semantics(
     index: &YamlIndex<'_>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    if workflow.nodes.len() > MAX_NODES {
+    let (node_count, edge_count, nesting_depth) = graph_metrics(&workflow.nodes, 0);
+    if node_count > MAX_NODES {
         diagnostics.push(diagnostic(
             source,
             index,
@@ -273,16 +561,6 @@ fn validate_semantics(
             Some("/nodes".to_string()),
         ));
     }
-    let edge_count = workflow
-        .nodes
-        .iter()
-        .map(|node| {
-            node.on
-                .values()
-                .map(crate::workflow::ControlTargets::len)
-                .sum::<usize>()
-        })
-        .sum::<usize>();
     if edge_count > MAX_EDGES {
         diagnostics.push(diagnostic(
             source,
@@ -292,6 +570,61 @@ fn validate_semantics(
             Some("/nodes".to_string()),
         ));
     }
+    if nesting_depth > 32 {
+        diagnostics.push(diagnostic(
+            source,
+            index,
+            "workflow.nesting_limit",
+            "workflow exceeds the maximum control nesting depth of 32",
+            Some("/nodes".to_string()),
+        ));
+    }
+    validate_scope_semantics(
+        workflow,
+        plugins,
+        source,
+        index,
+        "",
+        &HashSet::new(),
+        &mut diagnostics,
+    );
+    diagnostics
+}
+
+fn graph_metrics(nodes: &[WorkflowNode], depth: usize) -> (usize, usize, usize) {
+    let mut node_count = nodes.len();
+    let mut edge_count = nodes
+        .iter()
+        .flat_map(|node| node.on.values())
+        .map(crate::workflow::ControlTargets::len)
+        .sum::<usize>();
+    let mut maximum_depth = depth;
+    for node in nodes {
+        for graph in node.branches.values() {
+            let (children, edges, nested_depth) = graph_metrics(&graph.nodes, depth + 1);
+            node_count += children;
+            edge_count += edges;
+            maximum_depth = maximum_depth.max(nested_depth);
+        }
+        if let Some(graph) = &node.body {
+            let (children, edges, nested_depth) = graph_metrics(&graph.nodes, depth + 1);
+            node_count += children;
+            edge_count += edges;
+            maximum_depth = maximum_depth.max(nested_depth);
+        }
+    }
+    (node_count, edge_count, maximum_depth)
+}
+
+fn validate_scope_semantics(
+    workflow: &WorkflowDocument,
+    plugins: &PluginRegistry,
+    source: &str,
+    index: &YamlIndex<'_>,
+    pointer_base: &str,
+    lexical_bindings: &HashSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     if let Some(timeout) = workflow.policy.timeout.as_deref()
         && !valid_duration(timeout)
     {
@@ -310,7 +643,8 @@ fn validate_semantics(
         .collect::<HashMap<_, _>>();
     let reachable = reachable_nodes(workflow);
     for (node_index, node) in workflow.nodes.iter().enumerate() {
-        let pointer = format!("/nodes/{node_index}");
+        let available_bindings = lexical_bindings_before_node(workflow, node, lexical_bindings);
+        let pointer = format!("{pointer_base}/nodes/{node_index}");
         if !reachable.contains(node.id.as_str()) {
             diagnostics.push(diagnostic(
                 source,
@@ -332,14 +666,17 @@ fn validate_semantics(
                 source,
                 index,
                 "catalog.unknown_node",
-                format!("node {} uses unknown type {}", node.id, node.node_type),
+                format!(
+                    "node {} uses unregistered node type {}",
+                    node.id, node.node_type
+                ),
                 Some(format!("{pointer}/type")),
             ));
             continue;
         }
         if let Some(definition) = definition {
-            validate_node(node, definition, &pointer, source, index, &mut diagnostics);
-            validate_routes(node, definition, &pointer, source, index, &mut diagnostics);
+            validate_node(node, definition, &pointer, source, index, diagnostics);
+            validate_routes(node, definition, &pointer, source, index, diagnostics);
         }
         for (name, binding) in &node.inputs {
             validate_binding_reference(
@@ -351,22 +688,129 @@ fn validate_semantics(
                 source,
                 index,
                 &pointer,
-                &mut diagnostics,
+                &available_bindings,
+                diagnostics,
             );
         }
     }
+    let output_bindings = lexical_bindings_for_outputs(workflow, lexical_bindings);
     for (name, binding) in &workflow.outputs {
         validate_output_binding(
             binding,
             name,
-            &by_id,
-            workflow,
-            source,
-            index,
-            &mut diagnostics,
+            OutputBindingContext {
+                by_id: &by_id,
+                workflow,
+                source,
+                index,
+                diagnostics,
+                lexical_bindings: &output_bindings,
+            },
         );
     }
-    diagnostics
+    for (node_index, node) in workflow.nodes.iter().enumerate() {
+        let pointer = format!("{pointer_base}/nodes/{node_index}");
+        for (branch, graph) in &node.branches {
+            let child = scoped_workflow(workflow, graph);
+            let available_bindings = lexical_bindings_before_node(workflow, node, lexical_bindings);
+            let child_bindings = child_lexical_bindings(&available_bindings, &node.node_type);
+            validate_scope_semantics(
+                &child,
+                plugins,
+                source,
+                index,
+                &format!("{pointer}/branches/{}", escape_pointer(branch)),
+                &child_bindings,
+                diagnostics,
+            );
+        }
+        if let Some(graph) = &node.body {
+            let child = scoped_workflow(workflow, graph);
+            let available_bindings = lexical_bindings_before_node(workflow, node, lexical_bindings);
+            let child_bindings = child_lexical_bindings(&available_bindings, &node.node_type);
+            validate_scope_semantics(
+                &child,
+                plugins,
+                source,
+                index,
+                &format!("{pointer}/body"),
+                &child_bindings,
+                diagnostics,
+            );
+        }
+    }
+}
+
+fn child_lexical_bindings(inherited: &HashSet<String>, node_type: &str) -> HashSet<String> {
+    let mut bindings = inherited.clone();
+    match node_type {
+        "kakune.flow.foreach@1" => {
+            bindings.extend(["$item".to_owned(), "$index".to_owned()]);
+        }
+        "kakune.flow.loop@1" => {
+            bindings.extend(["$state".to_owned(), "$iteration".to_owned()]);
+        }
+        "kakune.flow.switch@1" => {
+            bindings.insert("$value".to_owned());
+        }
+        _ => {}
+    }
+    bindings
+}
+
+fn lexical_bindings_before_node(
+    workflow: &WorkflowDocument,
+    consumer: &WorkflowNode,
+    inherited: &HashSet<String>,
+) -> HashSet<String> {
+    let ancestors = control_ancestors(workflow, &consumer.id);
+    let mut bindings = inherited.clone();
+    for node in &workflow.nodes {
+        if node.node_type == "kakune.flow.set-variable@1"
+            && ancestors.contains(node.id.as_str())
+            && let Some(name) = node.with.get("name").and_then(Value::as_str)
+        {
+            bindings.insert(format!("${name}"));
+        }
+    }
+    bindings
+}
+
+fn lexical_bindings_for_outputs(
+    workflow: &WorkflowDocument,
+    inherited: &HashSet<String>,
+) -> HashSet<String> {
+    let mut bindings = inherited.clone();
+    for node in &workflow.nodes {
+        if node.node_type == "kakune.flow.set-variable@1"
+            && let Some(name) = node.with.get("name").and_then(Value::as_str)
+        {
+            bindings.insert(format!("${name}"));
+        }
+    }
+    bindings
+}
+
+fn scoped_workflow(
+    parent: &WorkflowDocument,
+    graph: &crate::workflow::WorkflowSubgraph,
+) -> WorkflowDocument {
+    WorkflowDocument {
+        api_version: parent.api_version.clone(),
+        kind: parent.kind.clone(),
+        metadata: parent.metadata.clone(),
+        inputs: parent.inputs.clone(),
+        triggers: parent.triggers.clone(),
+        entry: graph.entry.clone(),
+        nodes: graph.nodes.clone(),
+        outputs: graph.outputs.clone(),
+        policy: parent.policy.clone(),
+        layout: Default::default(),
+    }
+}
+
+fn escape_pointer(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
 }
 
 #[derive(Clone, Copy)]
@@ -759,21 +1203,162 @@ fn validate_binding_reference(
     source: &str,
     index: &YamlIndex<'_>,
     pointer: &str,
+    lexical_bindings: &HashSet<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let WorkflowBinding::From { from } = binding else {
-        return;
-    };
+    match binding {
+        WorkflowBinding::From { from } => validate_from_reference(
+            from,
+            Some(name),
+            Some(consumer),
+            by_id,
+            workflow,
+            source,
+            index,
+            pointer,
+            lexical_bindings,
+            diagnostics,
+        ),
+        WorkflowBinding::Expr { expr } => {
+            validate_expression_references(
+                expr,
+                name,
+                consumer,
+                by_id,
+                workflow,
+                source,
+                index,
+                pointer,
+                lexical_bindings,
+                diagnostics,
+            );
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_expression_references(
+    expression: &Value,
+    name: &str,
+    consumer: &WorkflowNode,
+    by_id: &HashMap<&str, &WorkflowNode>,
+    workflow: &WorkflowDocument,
+    source: &str,
+    index: &YamlIndex<'_>,
+    pointer: &str,
+    lexical_bindings: &HashSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match expression {
+        Value::Array(values) => {
+            for value in values {
+                validate_expression_references(
+                    value,
+                    name,
+                    consumer,
+                    by_id,
+                    workflow,
+                    source,
+                    index,
+                    pointer,
+                    lexical_bindings,
+                    diagnostics,
+                );
+            }
+        }
+        Value::Object(values) => {
+            if let Some(from) = values.get("from").and_then(Value::as_str) {
+                validate_from_reference(
+                    from,
+                    Some(name),
+                    Some(consumer),
+                    by_id,
+                    workflow,
+                    source,
+                    index,
+                    pointer,
+                    lexical_bindings,
+                    diagnostics,
+                );
+            }
+            for value in values.values() {
+                validate_expression_references(
+                    value,
+                    name,
+                    consumer,
+                    by_id,
+                    workflow,
+                    source,
+                    index,
+                    pointer,
+                    lexical_bindings,
+                    diagnostics,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_from_reference(
+    from: &str,
+    input_name: Option<&str>,
+    consumer: Option<&WorkflowNode>,
+    by_id: &HashMap<&str, &WorkflowNode>,
+    workflow: &WorkflowDocument,
+    source: &str,
+    index: &YamlIndex<'_>,
+    pointer: &str,
+    lexical_bindings: &HashSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     if from.starts_with('$') {
+        let binding = from.split('.').next().unwrap_or(from);
+        if !matches!(binding, "$input" | "$trigger") && !lexical_bindings.contains(binding) {
+            diagnostics.push(diagnostic(
+                source,
+                index,
+                "binding.unknown_scope",
+                format!("binding source {from} is not available in this lexical scope"),
+                Some(format!(
+                    "{pointer}/inputs/{}/from",
+                    input_name.unwrap_or("value")
+                )),
+            ));
+        }
         return;
     }
     let Some((producer_id, output)) = from.split_once('.') else {
+        diagnostics.push(diagnostic(
+            source,
+            index,
+            "binding.invalid_reference",
+            format!("binding reference {from} must name a node output"),
+            Some(format!(
+                "{pointer}/inputs/{}/from",
+                input_name.unwrap_or("value")
+            )),
+        ));
         return;
     };
     let Some(producer) = by_id.get(producer_id) else {
+        diagnostics.push(diagnostic(
+            source,
+            index,
+            "binding.unknown_node",
+            format!("binding source {from} references unknown node {producer_id}"),
+            Some(format!(
+                "{pointer}/inputs/{}/from",
+                input_name.unwrap_or("value")
+            )),
+        ));
         return;
     };
-    if !control_reaches(workflow, producer_id, &consumer.id) {
+    if let Some(consumer) = consumer
+        && !control_reaches(workflow, producer_id, &consumer.id)
+    {
         diagnostics.push(diagnostic(
             source,
             index,
@@ -782,7 +1367,10 @@ fn validate_binding_reference(
                 "binding source {from} is not guaranteed before node {}",
                 consumer.id
             ),
-            Some(format!("{pointer}/inputs/{name}/from")),
+            Some(format!(
+                "{pointer}/inputs/{}/from",
+                input_name.unwrap_or("value")
+            )),
         ));
     }
     if let Some(definition) = node_definition(&producer.node_type)
@@ -794,27 +1382,95 @@ fn validate_binding_reference(
             index,
             "binding.unknown_output",
             format!("node {producer_id} does not expose output {output}"),
-            Some(format!("{pointer}/inputs/{name}/from")),
+            Some(format!(
+                "{pointer}/inputs/{}/from",
+                input_name.unwrap_or("value")
+            )),
         ));
     }
+    if let Some(consumer) = consumer
+        && let (Some(expected), Some(actual)) = (
+            input_kind(&consumer.node_type, input_name.unwrap_or_default()),
+            output_kind(&producer.node_type, output),
+        )
+        && expected != ValueKind::Any
+        && actual != ValueKind::Any
+        && expected != actual
+    {
+        diagnostics.push(diagnostic(
+            source,
+            index,
+            "binding.incompatible_type",
+            format!(
+                "binding source {from} has type {}, but input {} expects {}",
+                value_kind_name(actual),
+                input_name.unwrap_or("value"),
+                value_kind_name(expected)
+            ),
+            Some(format!(
+                "{pointer}/inputs/{}/from",
+                input_name.unwrap_or("value")
+            )),
+        ));
+    }
+}
+
+struct OutputBindingContext<'a, 'id> {
+    by_id: &'a HashMap<&'id str, &'id WorkflowNode>,
+    workflow: &'a WorkflowDocument,
+    source: &'a str,
+    index: &'a YamlIndex<'a>,
+    diagnostics: &'a mut Vec<Diagnostic>,
+    lexical_bindings: &'a HashSet<String>,
 }
 
 fn validate_output_binding(
     binding: &WorkflowBinding,
     name: &str,
-    by_id: &HashMap<&str, &WorkflowNode>,
-    workflow: &WorkflowDocument,
-    source: &str,
-    index: &YamlIndex<'_>,
-    diagnostics: &mut Vec<Diagnostic>,
+    context: OutputBindingContext<'_, '_>,
 ) {
+    let OutputBindingContext {
+        by_id,
+        workflow,
+        source,
+        index,
+        diagnostics,
+        lexical_bindings,
+    } = context;
     let WorkflowBinding::From { from } = binding else {
         return;
     };
+    if from.starts_with('$') {
+        let binding = from.split('.').next().unwrap_or(from);
+        if !matches!(binding, "$input" | "$trigger") && !lexical_bindings.contains(binding) {
+            diagnostics.push(diagnostic(
+                source,
+                index,
+                "binding.unknown_scope",
+                format!("workflow output {name} uses unavailable lexical binding {from}"),
+                Some(format!("/outputs/{name}/from")),
+            ));
+        }
+        return;
+    }
     let Some((node_id, output)) = from.split_once('.') else {
+        diagnostics.push(diagnostic(
+            source,
+            index,
+            "binding.invalid_reference",
+            format!("workflow output {name} must reference a node output"),
+            Some(format!("/outputs/{name}/from")),
+        ));
         return;
     };
     let Some(node) = by_id.get(node_id) else {
+        diagnostics.push(diagnostic(
+            source,
+            index,
+            "binding.unknown_node",
+            format!("workflow output {name} references unknown node {node_id}"),
+            Some(format!("/outputs/{name}/from")),
+        ));
         return;
     };
     if !reachable_nodes(workflow).contains(node_id) {
@@ -838,6 +1494,26 @@ fn validate_output_binding(
             Some(format!("/outputs/{name}/from")),
         ));
     }
+}
+
+fn input_kind(node_type: &str, name: &str) -> Option<ValueKind> {
+    let definition = node_definition(node_type)?;
+    definition
+        .required_inputs
+        .iter()
+        .chain(definition.optional_inputs)
+        .find_map(|(known, kind)| (*known == name).then_some(*kind))
+}
+
+fn output_kind(node_type: &str, name: &str) -> Option<ValueKind> {
+    let definition = node_definition(node_type)?;
+    if definition.dynamic_outputs {
+        return Some(ValueKind::Any);
+    }
+    definition
+        .outputs
+        .iter()
+        .find_map(|(known, kind)| (*known == name).then_some(*kind))
 }
 
 fn reachable_nodes(workflow: &WorkflowDocument) -> HashSet<&str> {
@@ -887,6 +1563,29 @@ fn control_reaches(workflow: &WorkflowDocument, from: &str, target: &str) -> boo
         }
     }
     false
+}
+
+fn control_ancestors<'a>(workflow: &'a WorkflowDocument, target: &str) -> HashSet<&'a str> {
+    let mut predecessors = HashMap::<&str, Vec<&str>>::new();
+    for node in &workflow.nodes {
+        for next in node
+            .on
+            .values()
+            .flat_map(crate::workflow::ControlTargets::iter)
+        {
+            predecessors.entry(next).or_default().push(node.id.as_str());
+        }
+    }
+    let mut pending = predecessors.get(target).cloned().unwrap_or_default();
+    let mut ancestors = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if ancestors.insert(id)
+            && let Some(previous) = predecessors.get(id)
+        {
+            pending.extend(previous.iter().copied());
+        }
+    }
+    ancestors
 }
 
 fn diagnostic(

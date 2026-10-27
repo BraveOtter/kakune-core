@@ -26,6 +26,7 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
+use zeroize::Zeroize;
 
 /// Default maximum size of a single newline-delimited JSON-RPC message.
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -35,6 +36,8 @@ pub const DEFAULT_MAX_STDERR_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_TOOL_PAGES: usize = 100;
 /// Default maximum number of tools accepted from one server.
 pub const DEFAULT_MAX_TOOLS: usize = 1024;
+/// Maximum number of server notifications retained per client connection.
+pub const DEFAULT_MAX_NOTIFICATIONS: usize = 256;
 /// Preferred MCP protocol version for new connections.
 pub const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 /// Legacy protocol version used only after an explicit server rejection.
@@ -44,12 +47,39 @@ pub const MCP_LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
 ///
 /// The child process starts with an empty environment. Values in [`Self::env`]
 /// are the only environment variables forwarded, including any credentials.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct McpStdioServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub current_dir: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for McpStdioServerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpStdioServerConfig")
+            .field("command", &self.command)
+            .field("args", &"[omitted]")
+            .field("current_dir", &self.current_dir)
+            .field(
+                "env",
+                &self
+                    .env
+                    .keys()
+                    .map(|name| (name, "[redacted]"))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .finish()
+    }
+}
+
+impl Drop for McpStdioServerConfig {
+    fn drop(&mut self) {
+        for value in self.env.values_mut() {
+            value.zeroize();
+        }
+    }
 }
 
 /// An explicitly configured MCP Streamable HTTP endpoint.
@@ -72,6 +102,14 @@ impl fmt::Debug for McpHttpServerConfig {
                 &self.bearer_token.as_ref().map(|_| "<redacted>"),
             )
             .finish()
+    }
+}
+
+impl Drop for McpHttpServerConfig {
+    fn drop(&mut self) {
+        if let Some(token) = &mut self.bearer_token {
+            token.zeroize();
+        }
     }
 }
 
@@ -308,6 +346,7 @@ impl McpClient {
         let (endpoint, authorization) = validate_http_config(&config)?;
         validate_options(&options)?;
         let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10).min(options.request_timeout))
             .timeout(options.request_timeout)
             // Never forward an explicitly configured bearer token to a redirect target.
             .redirect(Policy::none())
@@ -400,6 +439,16 @@ impl McpClient {
 
     /// Discovers all tools, following bounded pagination cursors.
     pub async fn list_tools(&mut self) -> Result<Vec<McpTool>, McpError> {
+        match timeout(Duration::from_secs(30), self.list_tools_inner()).await {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = self.terminate().await;
+                Err(McpError::AggregateDeadline(Duration::from_secs(30)))
+            }
+        }
+    }
+
+    async fn list_tools_inner(&mut self) -> Result<Vec<McpTool>, McpError> {
         self.require_tools()?;
         let mut tools = Vec::new();
         let mut cursor = None;
@@ -429,6 +478,61 @@ impl McpClient {
         };
         let _ = self.terminate().await;
         Err(error)
+    }
+
+    /// Discovers tools, validates the supplied arguments against exactly one
+    /// matching schema, then invokes that tool once.
+    pub async fn call_validated_tool(
+        &mut self,
+        name: &str,
+        arguments: Map<String, Value>,
+    ) -> Result<McpToolCallResult, McpError> {
+        match timeout(
+            Duration::from_secs(60),
+            self.call_validated_tool_inner(name, arguments),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = self.terminate().await;
+                Err(McpError::AggregateDeadline(Duration::from_secs(60)))
+            }
+        }
+    }
+
+    async fn call_validated_tool_inner(
+        &mut self,
+        name: &str,
+        arguments: Map<String, Value>,
+    ) -> Result<McpToolCallResult, McpError> {
+        let encoded_arguments = serde_json::to_vec(&arguments).map_err(McpError::Serialize)?;
+        if encoded_arguments.len() > DEFAULT_MAX_MESSAGE_BYTES {
+            return Err(McpError::MessageTooLarge {
+                limit: DEFAULT_MAX_MESSAGE_BYTES,
+            });
+        }
+        let tools = self.list_tools().await?;
+        let mut matching = tools.into_iter().filter(|tool| tool.name == name);
+        let tool = matching.next().ok_or(McpError::ToolNotFound)?;
+        if matching.next().is_some() {
+            return Err(McpError::Protocol(
+                "MCP server advertised an ambiguous tool name".to_owned(),
+            ));
+        }
+        let validator = jsonschema::validator_for(tool.input_schema.as_value())
+            .map_err(|_| McpError::InvalidToolSchema)?;
+        if validator
+            .validate(&Value::Object(arguments.clone()))
+            .is_err()
+        {
+            return Err(McpError::InvalidToolInput);
+        }
+        let result = self.call_tool(name, arguments).await?;
+        if result.is_error {
+            return Err(McpError::ToolCallFailed);
+        }
+        Ok(result)
     }
 
     /// Calls one discovered MCP tool with a JSON object of arguments.
@@ -679,7 +783,7 @@ fn validate_http_config(
             "endpoint must not include a fragment".to_string(),
         ));
     }
-    let authorization = config
+    let mut authorization = config
         .bearer_token
         .as_deref()
         .map(|token| {
@@ -693,6 +797,9 @@ fn validate_http_config(
             })
         })
         .transpose()?;
+    if let Some(authorization) = &mut authorization {
+        authorization.set_sensitive(true);
+    }
     Ok((endpoint, authorization))
 }
 
@@ -770,7 +877,14 @@ async fn read_stdio_response(
     loop {
         let message = read_message(stdout, max_message_bytes).await?;
         match parse_incoming(&message, request_id)? {
-            Incoming::Notification(notification) => notifications.push(notification),
+            Incoming::Notification(notification) => {
+                if notifications.len() >= DEFAULT_MAX_NOTIFICATIONS {
+                    return Err(McpError::NotificationLimit {
+                        limit: DEFAULT_MAX_NOTIFICATIONS,
+                    });
+                }
+                notifications.push(notification);
+            }
             Incoming::Response(response) => return Ok(response),
         }
     }
@@ -1291,6 +1405,18 @@ pub enum McpError {
     ToolPageLimit { limit: usize },
     #[error("MCP tools/list exceeded the {limit}-tool limit")]
     ToolLimit { limit: usize },
+    #[error("MCP discovery or tool operation exceeded its {0:?} aggregate deadline")]
+    AggregateDeadline(Duration),
+    #[error("MCP server advertised no matching tool")]
+    ToolNotFound,
+    #[error("MCP tool schema is invalid")]
+    InvalidToolSchema,
+    #[error("MCP tool arguments do not match the discovered input schema")]
+    InvalidToolInput,
+    #[error("MCP tool returned an operation error")]
+    ToolCallFailed,
+    #[error("MCP server exceeded the {limit}-notification limit")]
+    NotificationLimit { limit: usize },
     #[error("MCP server does not support required capability {0}")]
     UnsupportedCapability(&'static str),
 }
@@ -1309,6 +1435,7 @@ impl McpError {
                 | Self::HttpStatus(_)
                 | Self::HttpContentType
                 | Self::Exited(_)
+                | Self::NotificationLimit { .. }
         )
     }
 }

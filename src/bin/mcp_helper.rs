@@ -8,6 +8,10 @@ use std::io::{BufRead, Write};
 use serde_json::{Value, json};
 
 fn main() {
+    let mode = std::env::args().nth(1).unwrap_or_default();
+    if std::env::var("KAKUNE_MCP_HELPER_STDERR").as_deref() == Ok("large") {
+        eprint!("{}", "diagnostic ".repeat(8 * 1024));
+    }
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut initialized = false;
@@ -26,27 +30,45 @@ fn main() {
         let id = request.get("id").cloned().expect("request ID");
         assert!(initialized || method == "initialize");
         match method {
-            "initialize" => respond(
-                &mut stdout,
-                id,
-                json!({
+            "initialize" => {
+                let mut result = json!({
                     "protocolVersion": "2025-11-25",
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "test-mcp-server", "version": "1.0.0"}
-                }),
-            ),
-            "tools/list" => respond(
-                &mut stdout,
-                id,
-                json!({
+                });
+                if mode == "large-init" {
+                    result["serverInfo"]["name"] = json!("x".repeat(1024));
+                }
+                respond(&mut stdout, id, result);
+            }
+            "tools/list" => {
+                if mode == "notification-flood" {
+                    for _ in 0..=256 {
+                        writeln!(
+                            stdout,
+                            "{}",
+                            json!({
+                                "jsonrpc":"2.0",
+                                "method":"notifications/progress",
+                                "params":{}
+                            })
+                        )
+                        .expect("notification written");
+                    }
+                }
+                let mut result = json!({
                     "tools": [{
                         "name": "greet",
                         "description": "Greets a name",
                         "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}},
                         "outputSchema": {"type": "object"}
                     }]
-                }),
-            ),
+                });
+                if std::env::var("KAKUNE_MCP_HELPER_PAGE_LOOP").as_deref() == Ok("true") {
+                    result["nextCursor"] = json!("next-page");
+                }
+                respond(&mut stdout, id, result)
+            }
             "tools/call" => {
                 let params = request
                     .get("params")

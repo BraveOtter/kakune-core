@@ -186,11 +186,7 @@ case ":${PATH:-}:" in
 esac
 
 printf "Run '%s/kakune init' to initialize Kakune Core.\n" "$install_dir"
-case "$system" in
-  Linux)
-    printf 'After an update, restart an installed user service with: systemctl --user restart kakune-core.service\n'
-    ;;
-  Darwin)
-    printf 'After an update, restart an installed launchd agent with: launchctl kickstart -k gui/%s/dev.kakune.core\n' "$(id -u)"
-    ;;
-esac
+printf 'Machine-wide service templates and the bounded service-command procedure are documented in packaging/README.md. Do not use per-user systemd or LaunchAgents commands for the system service.\n'
+if [ "$system" = "Darwin" ]; then
+  printf 'macOS launchd service support is theoretical and has not been natively verified.\n'
+fi

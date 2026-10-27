@@ -4,16 +4,20 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
-ExecStart=/usr/local/bin/kakune daemon --data-dir %h/.local/share/kakune
+Type=notify
+NotifyAccess=main
+User=root
+ExecStart=/usr/local/bin/kakune service run --data-dir /var/lib/kakune
 Restart=on-failure
 RestartSec=5
-KillMode=control-group
+KillMode=mixed
+SendSIGKILL=no
+TimeoutStartSec=30
 TimeoutStopSec=30
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=%h/.local/share/kakune
+ReadWritePaths=/var/lib/kakune
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

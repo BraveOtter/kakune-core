@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Component, Path, PathBuf},
     str::FromStr,
@@ -17,16 +17,27 @@ use notify::{
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
     event::{CreateKind, ModifyKind, RemoveKind},
 };
-use serde_json::Value;
+use serde::Serialize;
+use serde_json::{Map as JsonMap, Value};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::{
-    sync::mpsc::{self, Receiver, Sender, error::TrySendError},
+    sync::{
+        mpsc::{self, Receiver, Sender, error::TrySendError},
+        oneshot,
+    },
+    task::JoinHandle,
     time::Instant,
 };
 
 use crate::{
-    PluginRegistry, Store, WorkflowDocument, load_installed_plugin_registry,
-    run_workflow_with_context,
+    PluginRegistry, Store, WorkflowDocument,
+    lifecycle::{CoreLifecycle, execution::TrackedExecutionState},
+    load_installed_plugin_registry,
+    reporting::{CoreDiagnosticSource, DiagnosticReporter},
+    runtime::{
+        execute_prepared_workflow_with_plugins_and_shutdown,
+        prepare_automatic_execution_with_context,
+    },
     workflow::{WorkflowBinding, WorkflowTrigger},
 };
 
@@ -35,6 +46,212 @@ const FILESYSTEM_CHANNEL_CAPACITY: usize = 1_024;
 const DEFAULT_FILESYSTEM_DEBOUNCE: Duration = Duration::from_millis(500);
 const MIN_FILESYSTEM_DEBOUNCE: Duration = Duration::from_millis(10);
 const MAX_FILESYSTEM_DEBOUNCE: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisteredTriggerProjection {
+    pub composite_id: String,
+    pub workflow_id: String,
+    pub workflow_name: Option<String>,
+    pub workflow_revision: Option<String>,
+    pub trigger_id: String,
+    pub trigger_type: Option<String>,
+    pub configuration: Value,
+    pub eligibility: String,
+    pub effective_state: String,
+    pub last_run_at: Option<String>,
+    pub next_run_at: Option<String>,
+    pub observation_at: String,
+    pub unavailable_reason: Option<String>,
+    pub orphan: bool,
+}
+
+/// Projects workflow trigger definitions over durable schedule observations.
+/// It deliberately does not start, reconcile, or query a live watcher: durable
+/// schedule data alone cannot prove active scheduling.
+pub fn registered_trigger_projections(
+    store: &Store,
+) -> Result<Vec<RegisteredTriggerProjection>, String> {
+    let workflows = store.list_workflows()?;
+    let schedules = store.list_scheduled_trigger_observations()?;
+    let schedules = schedules
+        .into_iter()
+        .map(|schedule| {
+            (
+                (schedule.workflow_id.clone(), schedule.trigger_id.clone()),
+                schedule,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let observed_at = OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|error| format!("cannot format trigger observation time: {error}"))?;
+    let records = workflows
+        .iter()
+        .map(|workflow| (workflow.id.as_str(), workflow))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    let mut projections = Vec::new();
+
+    for workflow_record in &workflows {
+        let source = store.get_workflow_source(&workflow_record.id)?;
+        let document = source
+            .as_ref()
+            .and_then(|record| crate::WorkflowDocument::parse(&record.source).ok());
+        let Some(document) = document else {
+            continue;
+        };
+        for trigger in &document.triggers {
+            let key = (workflow_record.id.clone(), trigger.id.clone());
+            seen.insert(key.clone());
+            let schedule = schedules.get(&key);
+            let is_manual = trigger.node_type == "kakune.trigger.manual@1";
+            let disabled = workflow_record.status != "enabled";
+            let effective_state = if disabled {
+                "disabled"
+            } else if is_manual {
+                "manual"
+            } else {
+                "unknown"
+            };
+            let unavailable_reason = if disabled || is_manual {
+                None
+            } else {
+                Some(
+                    "Live scheduler and watcher evidence is unavailable; durable schedule metadata does not prove activity."
+                        .to_owned(),
+                )
+            };
+            projections.push(RegisteredTriggerProjection {
+                composite_id: format!(
+                    "{}/{}",
+                    encode_trigger_path_component(&workflow_record.id),
+                    encode_trigger_path_component(&trigger.id)
+                ),
+                workflow_id: workflow_record.id.clone(),
+                workflow_name: Some(workflow_record.name.clone()),
+                workflow_revision: Some(workflow_record.revision.clone()),
+                trigger_id: trigger.id.clone(),
+                trigger_type: Some(trigger.node_type.clone()),
+                configuration: sanitize_trigger_configuration(&trigger.with),
+                eligibility: workflow_record.status.clone(),
+                effective_state: effective_state.to_owned(),
+                last_run_at: schedule.and_then(|schedule| schedule.last_run_at.clone()),
+                next_run_at: schedule.and_then(|schedule| schedule.next_run_at.clone()),
+                observation_at: observed_at.clone(),
+                unavailable_reason,
+                orphan: false,
+            });
+        }
+    }
+
+    for ((workflow_id, trigger_id), schedule) in &schedules {
+        if seen.contains(&(workflow_id.clone(), trigger_id.clone())) {
+            continue;
+        }
+        let workflow = records.get(workflow_id.as_str());
+        projections.push(RegisteredTriggerProjection {
+            composite_id: format!(
+                "{}/{}",
+                encode_trigger_path_component(workflow_id),
+                encode_trigger_path_component(trigger_id)
+            ),
+            workflow_id: workflow_id.clone(),
+            workflow_name: workflow.map(|record| record.name.clone()),
+            workflow_revision: workflow.map(|record| record.revision.clone()),
+            trigger_id: trigger_id.clone(),
+            trigger_type: None,
+            configuration: Value::Object(JsonMap::new()),
+            eligibility: workflow
+                .map(|record| record.status.clone())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            effective_state: "unknown".to_owned(),
+            last_run_at: schedule.last_run_at.clone(),
+            next_run_at: schedule.next_run_at.clone(),
+            observation_at: observed_at.clone(),
+            unavailable_reason: Some(if workflow.is_some() {
+                "Durable schedule record has no matching trigger definition and may be orphaned."
+                    .to_owned()
+            } else {
+                "Durable schedule record references a missing workflow and is orphaned.".to_owned()
+            }),
+            orphan: true,
+        });
+    }
+    Ok(projections)
+}
+
+fn encode_trigger_path_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    encoded
+}
+
+fn sanitize_trigger_configuration(configuration: &JsonMap<String, Value>) -> Value {
+    let mut safe = JsonMap::new();
+    for (key, value) in configuration {
+        let normalized = key.to_ascii_lowercase();
+        if [
+            "secret",
+            "token",
+            "auth",
+            "credential",
+            "password",
+            "bearer",
+            "api_key",
+        ]
+        .iter()
+        .any(|sensitive| normalized.contains(sensitive))
+        {
+            continue;
+        }
+        safe.insert(key.clone(), sanitize_trigger_value(value));
+    }
+    Value::Object(safe)
+}
+
+fn sanitize_trigger_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut safe = JsonMap::new();
+            for (key, value) in object {
+                let normalized = key.to_ascii_lowercase();
+                if [
+                    "secret",
+                    "token",
+                    "auth",
+                    "credential",
+                    "password",
+                    "bearer",
+                    "api_key",
+                ]
+                .iter()
+                .any(|sensitive| normalized.contains(sensitive))
+                {
+                    continue;
+                }
+                safe.insert(key.clone(), sanitize_trigger_value(value));
+            }
+            Value::Object(safe)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(sanitize_trigger_value).collect()),
+        Value::String(text)
+            if text.to_ascii_lowercase().contains("bearer ")
+                || text.to_ascii_lowercase().contains("token=")
+                || text.to_ascii_lowercase().contains("api_key=") =>
+        {
+            Value::String("[redacted]".to_owned())
+        }
+        other => other.clone(),
+    }
+}
 
 trait SchedulerClock: Send + Sync {
     fn now(&self) -> OffsetDateTime;
@@ -49,54 +266,185 @@ impl SchedulerClock for SystemClock {
 }
 
 pub fn start(store: Store) {
-    let plugins = load_installed_plugin_registry(&store).unwrap_or_else(|error| {
-        eprintln!("kakune scheduler: cannot load installed plugins: {error}");
-        PluginRegistry::default()
-    });
-    start_with_clock(store, Arc::new(SystemClock), plugins);
+    start_with_reporter(store, DiagnosticReporter::default());
 }
 
-fn start_with_clock(store: Store, clock: Arc<dyn SchedulerClock>, plugins: PluginRegistry) {
+pub(crate) fn start_with_reporter(store: Store, reporter: DiagnosticReporter) {
+    let plugins = load_installed_plugin_registry(&store).unwrap_or_else(|error| {
+        reporter.report(
+            CoreDiagnosticSource::Scheduler,
+            format!("cannot load installed plugins: {error}"),
+        );
+        PluginRegistry::default()
+    });
+    let plugins = plugins.with_diagnostic_reporter(reporter.clone());
+    start_with_clock(
+        store,
+        Arc::new(SystemClock),
+        plugins,
+        None,
+        None,
+        None,
+        reporter,
+    );
+}
+
+pub struct SchedulerHandle {
+    shutdown: Option<oneshot::Sender<()>>,
+    started: Option<oneshot::Receiver<Result<(), String>>>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl SchedulerHandle {
+    pub async fn wait_started(&mut self) -> Result<(), String> {
+        let Some(started) = self.started.take() else {
+            return Ok(());
+        };
+        started
+            .await
+            .map_err(|_| "scheduler exited before trigger handling initialized".to_string())?
+    }
+
+    pub async fn stop_until(&mut self, deadline: Instant) -> Result<(), String> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let Some(task) = self.task.as_mut() else {
+            return Ok(());
+        };
+        match tokio::time::timeout_at(deadline, task).await {
+            Ok(Ok(())) => {
+                self.task = None;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                self.task = None;
+                Err(format!("scheduler task failed while stopping: {error}"))
+            }
+            Err(_) => Err("scheduler did not stop before the Core grace deadline".to_string()),
+        }
+    }
+
+    /// Keeps the scheduler task and filesystem watchers owned after a bounded
+    /// stop wait expires; callers must not release the runtime lease first.
+    pub async fn join(&mut self) -> Result<(), String> {
+        let Some(task) = self.task.as_mut() else {
+            return Ok(());
+        };
+        let result = task
+            .await
+            .map_err(|error| format!("scheduler task failed while stopping: {error}"));
+        self.task = None;
+        result
+    }
+}
+
+pub(crate) fn start_managed(
+    store: Store,
+    lifecycle: CoreLifecycle,
+    reporter: DiagnosticReporter,
+) -> SchedulerHandle {
+    let (shutdown, receiver) = oneshot::channel();
+    let (started, started_receiver) = oneshot::channel();
+    let plugins = match load_installed_plugin_registry(&store) {
+        Ok(plugins) => plugins.with_diagnostic_reporter(reporter.clone()),
+        Err(error) => {
+            let task = tokio::spawn(async move {
+                let _ = started.send(Err(format!(
+                    "cannot load installed plugins before scheduler startup: {error}"
+                )));
+                let _ = receiver.await;
+            });
+            return SchedulerHandle {
+                shutdown: Some(shutdown),
+                started: Some(started_receiver),
+                task: Some(task),
+            };
+        }
+    };
+    let task = start_with_clock(
+        store,
+        Arc::new(SystemClock),
+        plugins,
+        Some(receiver),
+        Some(lifecycle),
+        Some(started),
+        reporter,
+    );
+    SchedulerHandle {
+        shutdown: Some(shutdown),
+        started: Some(started_receiver),
+        task: Some(task),
+    }
+}
+
+fn start_with_clock(
+    store: Store,
+    clock: Arc<dyn SchedulerClock>,
+    plugins: PluginRegistry,
+    mut shutdown: Option<oneshot::Receiver<()>>,
+    lifecycle: Option<CoreLifecycle>,
+    ready_sender: Option<oneshot::Sender<Result<(), String>>>,
+    reporter: DiagnosticReporter,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut started = HashSet::new();
         let mut seen_schedules = HashSet::new();
-        let mut filesystem = FilesystemScheduler::new();
+        let mut filesystem = FilesystemScheduler::new(reporter.clone());
+        if let Some(ready_sender) = ready_sender {
+            let _ = ready_sender.send(Ok(()));
+        }
         let mut next_scan = Instant::now();
         loop {
             let monotonic_now = Instant::now();
             if monotonic_now >= next_scan {
-                refresh(
-                    &store,
-                    &mut started,
-                    &mut seen_schedules,
-                    &mut filesystem,
-                    clock.now(),
-                    &plugins,
-                );
+                if lifecycle.as_ref().is_none_or(CoreLifecycle::is_ready) {
+                    refresh(
+                        &store,
+                        &mut started,
+                        &mut seen_schedules,
+                        &mut filesystem,
+                        clock.now(),
+                        &plugins,
+                        lifecycle.as_ref(),
+                    );
+                }
                 next_scan = monotonic_now + WORKFLOW_SCAN_INTERVAL;
             }
 
             filesystem.drain_events(Instant::now());
             filesystem.record_overflow(&store);
             for pending in filesystem.take_due(Instant::now()) {
-                execute(
-                    store.clone(),
-                    plugins.clone(),
-                    pending.workflow,
-                    Some(&pending.trigger),
-                    pending.trigger_values,
-                );
+                execute(ScheduledExecution {
+                    store: store.clone(),
+                    plugins: plugins.clone(),
+                    workflow_id: pending.workflow.metadata.id,
+                    source: pending.source,
+                    revision: pending.revision,
+                    trigger: Some(pending.trigger),
+                    trigger_values: pending.trigger_values,
+                    lifecycle: lifecycle.as_ref(),
+                    reporter: reporter.clone(),
+                });
             }
 
             let wake_at = filesystem
                 .next_due()
                 .map_or(next_scan, |due| due.min(next_scan));
-            tokio::select! {
-                _ = tokio::time::sleep_until(wake_at) => {}
-                Some(event) = filesystem.events.recv() => filesystem.handle_event(event, Instant::now()),
+            if let Some(shutdown) = shutdown.as_mut() {
+                tokio::select! {
+                    _ = shutdown => break,
+                    _ = tokio::time::sleep_until(wake_at) => {}
+                    Some(event) = filesystem.events.recv() => filesystem.handle_event(event, Instant::now()),
+                }
+            } else {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(wake_at) => {}
+                    Some(event) = filesystem.events.recv() => filesystem.handle_event(event, Instant::now()),
+                }
             }
         }
-    });
+    })
 }
 
 pub(crate) fn validate_enabled_triggers(
@@ -134,28 +482,38 @@ fn refresh(
     filesystem: &mut FilesystemScheduler,
     now: OffsetDateTime,
     plugins: &PluginRegistry,
+    lifecycle: Option<&CoreLifecycle>,
 ) {
     let workflows = match store.list_enabled_workflow_sources() {
         Ok(workflows) => workflows,
         Err(error) => {
-            eprintln!("kakune scheduler: cannot list workflows: {error}");
+            filesystem.reporter.report(
+                CoreDiagnosticSource::Scheduler,
+                format!("cannot list workflows: {error}"),
+            );
             return;
         }
     };
     let workspace = match store.workspace_dir() {
         Ok(workspace) => workspace,
         Err(error) => {
-            eprintln!("kakune scheduler: cannot access workspace: {error}");
+            filesystem.reporter.report(
+                CoreDiagnosticSource::Scheduler,
+                format!("cannot access workspace: {error}"),
+            );
             return;
         }
     };
     let mut filesystem_specs = Vec::new();
 
-    for (workflow_id, source) in workflows {
+    for (workflow_id, source, revision) in workflows {
         let workflow = match WorkflowDocument::parse(&source) {
             Ok(workflow) => workflow,
             Err(error) => {
-                eprintln!("kakune scheduler: workflow {workflow_id} is invalid: {error}");
+                filesystem.reporter.report(
+                    CoreDiagnosticSource::Scheduler,
+                    format!("workflow {workflow_id} is invalid: {error}"),
+                );
                 continue;
             }
         };
@@ -164,13 +522,17 @@ fn refresh(
                 "kakune.trigger.startup@1" => {
                     let key = trigger_key(&workflow_id, &trigger.id);
                     if started.insert(key) {
-                        execute(
-                            store.clone(),
-                            plugins.clone(),
-                            workflow.clone(),
-                            Some(trigger),
-                            serde_json::json!({ "type": "startup", "timestamp": now.unix_timestamp() }),
-                        );
+                        execute(ScheduledExecution {
+                            store: store.clone(),
+                            plugins: plugins.clone(),
+                            workflow_id: workflow_id.clone(),
+                            source: source.clone(),
+                            revision: revision.clone(),
+                            trigger: Some(trigger.clone()),
+                            trigger_values: serde_json::json!({ "type": "startup", "timestamp": now.unix_timestamp() }),
+                            lifecycle,
+                            reporter: filesystem.reporter.clone(),
+                        });
                     }
                 }
                 "kakune.trigger.datetime@1"
@@ -179,22 +541,27 @@ fn refresh(
                 | "kakune.trigger.cron@1" => {
                     let key = trigger_key(&workflow_id, &trigger.id);
                     let recovering = !seen_schedules.contains(&key);
-                    match schedule_trigger(store, &workflow_id, trigger, now, recovering) {
+                    match schedule_trigger(store, &workflow_id, trigger, &revision, now, recovering)
+                    {
                         Ok(count) => {
                             seen_schedules.insert(key);
                             for _ in 0..count {
-                                execute(
-                                    store.clone(),
-                                    plugins.clone(),
-                                    workflow.clone(),
-                                    Some(trigger),
-                                    serde_json::json!({ "type": trigger.node_type, "timestamp": now.unix_timestamp() }),
-                                );
+                                execute(ScheduledExecution {
+                                    store: store.clone(),
+                                    plugins: plugins.clone(),
+                                    workflow_id: workflow_id.clone(),
+                                    source: source.clone(),
+                                    revision: revision.clone(),
+                                    trigger: Some(trigger.clone()),
+                                    trigger_values: serde_json::json!({ "type": trigger.node_type, "timestamp": now.unix_timestamp() }),
+                                    lifecycle,
+                                    reporter: filesystem.reporter.clone(),
+                                });
                             }
                         }
-                        Err(error) => eprintln!(
-                            "kakune scheduler: cannot schedule {workflow_id}/{}: {error}",
-                            trigger.id
+                        Err(error) => filesystem.reporter.report(
+                            CoreDiagnosticSource::Scheduler,
+                            format!("cannot schedule {workflow_id}/{}: {error}", trigger.id),
                         ),
                     }
                 }
@@ -202,12 +569,17 @@ fn refresh(
                     Ok(config) => filesystem_specs.push(FilesystemSpec {
                         key: trigger_key(&workflow_id, &trigger.id),
                         workflow: workflow.clone(),
+                        source: source.clone(),
+                        revision: revision.clone(),
                         trigger: trigger.clone(),
                         config,
                     }),
-                    Err(error) => eprintln!(
-                        "kakune scheduler: invalid filesystem trigger {workflow_id}/{}: {error}",
-                        trigger.id
+                    Err(error) => filesystem.reporter.report(
+                        CoreDiagnosticSource::Scheduler,
+                        format!(
+                            "invalid filesystem trigger {workflow_id}/{}: {error}",
+                            trigger.id
+                        ),
                     ),
                 },
                 _ => {}
@@ -217,31 +589,96 @@ fn refresh(
     filesystem.sync(filesystem_specs);
 }
 
-fn execute(
+struct ScheduledExecution<'a> {
     store: Store,
     plugins: PluginRegistry,
-    workflow: WorkflowDocument,
-    trigger: Option<&WorkflowTrigger>,
+    workflow_id: String,
+    source: String,
+    revision: String,
+    trigger: Option<WorkflowTrigger>,
     trigger_values: Value,
-) {
-    let inputs = trigger.map_or_else(
+    lifecycle: Option<&'a CoreLifecycle>,
+    reporter: DiagnosticReporter,
+}
+
+fn execute(invocation: ScheduledExecution<'_>) {
+    let ScheduledExecution {
+        store,
+        plugins,
+        workflow_id,
+        source,
+        revision,
+        trigger,
+        trigger_values,
+        lifecycle,
+        reporter,
+    } = invocation;
+    let inputs = trigger.as_ref().map_or_else(
         || Ok(Value::Object(Default::default())),
         |trigger| trigger_inputs(trigger, &trigger_values),
     );
     let Ok(inputs) = inputs else {
-        eprintln!(
-            "kakune scheduler: invalid trigger map: {}",
-            inputs.expect_err("only errors reach this branch")
+        reporter.report(
+            CoreDiagnosticSource::Scheduler,
+            format!(
+                "invalid trigger map: {}",
+                inputs.expect_err("only errors reach this branch")
+            ),
         );
         return;
     };
+    let mut permit = lifecycle.and_then(|lifecycle| {
+        lifecycle
+            .admission()
+            .admit(TrackedExecutionState::Preparation)
+            .ok()
+    });
+    if lifecycle.is_some() && permit.is_none() {
+        return;
+    }
+    let execution = match prepare_automatic_execution_with_context(
+        &store,
+        &source,
+        &revision,
+        &plugins,
+        inputs,
+        trigger_values.clone(),
+    ) {
+        Ok((execution, true)) => execution,
+        Ok((_, false)) => return,
+        Err(error) => {
+            reporter.report(
+                CoreDiagnosticSource::Scheduler,
+                format!("workflow {} was not admitted: {error}", workflow_id),
+            );
+            return;
+        }
+    };
+    if let Some(permit) = permit.as_mut()
+        && permit.transition(TrackedExecutionState::Queued).is_err()
+    {
+        return;
+    }
+    let shutdown_requested = lifecycle
+        .map(CoreLifecycle::shutdown_signal)
+        .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
     tokio::task::spawn_blocking(move || {
-        if let Err(error) =
-            run_workflow_with_context(&store, &workflow, &plugins, inputs, trigger_values)
+        let mut permit = permit;
+        if let Some(permit) = permit.as_mut()
+            && permit.transition(TrackedExecutionState::Active).is_err()
         {
-            eprintln!(
-                "kakune scheduler: workflow {} failed: {error}",
-                workflow.metadata.id
+            return;
+        }
+        if let Err(error) = execute_prepared_workflow_with_plugins_and_shutdown(
+            &store,
+            execution,
+            &plugins,
+            shutdown_requested,
+        ) && error != "Core shutdown requested"
+        {
+            reporter.report(
+                CoreDiagnosticSource::Scheduler,
+                format!("workflow {} failed: {error}", workflow_id),
             );
         }
     });
@@ -319,10 +756,19 @@ fn schedule_trigger(
     store: &Store,
     workflow_id: &str,
     trigger: &WorkflowTrigger,
+    workflow_revision: &str,
     now: OffsetDateTime,
     recovering: bool,
 ) -> Result<u32, String> {
     let policy = misfire_config(trigger)?;
+    let trigger_bytes = serde_json::to_vec(trigger)
+        .map_err(|error| format!("cannot encode scheduled trigger configuration: {error}"))?;
+    let schedule_identity = format!(
+        "{}|revision:{}|trigger:{}",
+        policy.name(),
+        workflow_revision,
+        crate::artifacts::artifact_id(&trigger_bytes)
+    );
     let existing = store.scheduled_trigger(workflow_id, &trigger.id)?;
     let initial_due = initial_due(trigger, now)?;
     let Some(existing) = existing else {
@@ -330,11 +776,26 @@ fn schedule_trigger(
             workflow_id,
             &trigger.id,
             initial_due,
-            policy.name(),
+            &schedule_identity,
             now,
+            false,
         )?;
         return Ok(0);
     };
+    if existing.schedule_identity != schedule_identity {
+        let is_legacy_identity = existing.schedule_identity == policy.name();
+        store.ensure_scheduled_trigger(
+            workflow_id,
+            &trigger.id,
+            initial_due,
+            &schedule_identity,
+            now,
+            !is_legacy_identity,
+        )?;
+        if !is_legacy_identity {
+            return Ok(0);
+        }
+    }
     if existing.completed_at.is_some() {
         return Ok(0);
     }
@@ -618,12 +1079,16 @@ fn filesystem_config(
 struct FilesystemSpec {
     key: String,
     workflow: WorkflowDocument,
+    source: String,
+    revision: String,
     trigger: WorkflowTrigger,
     config: FilesystemConfig,
 }
 
 struct RegisteredFilesystemTrigger {
     workflow: WorkflowDocument,
+    source: String,
+    revision: String,
     trigger: WorkflowTrigger,
     config: FilesystemConfig,
     overflow: Arc<AtomicU64>,
@@ -632,6 +1097,8 @@ struct RegisteredFilesystemTrigger {
 
 struct PendingFilesystemTrigger {
     workflow: WorkflowDocument,
+    source: String,
+    revision: String,
     trigger: WorkflowTrigger,
     trigger_values: Value,
     due_at: Instant,
@@ -644,16 +1111,18 @@ struct FilesystemScheduler {
     events: Receiver<FilesystemNotification>,
     watchers: HashMap<String, RegisteredFilesystemTrigger>,
     pending: HashMap<String, PendingFilesystemTrigger>,
+    reporter: DiagnosticReporter,
 }
 
 impl FilesystemScheduler {
-    fn new() -> Self {
+    fn new(reporter: DiagnosticReporter) -> Self {
         let (sender, events) = mpsc::channel(FILESYSTEM_CHANNEL_CAPACITY);
         Self {
             sender,
             events,
             watchers: HashMap::new(),
             pending: HashMap::new(),
+            reporter,
         }
     }
 
@@ -670,17 +1139,26 @@ impl FilesystemScheduler {
             if let Some(existing) = self.watchers.get_mut(&spec.key)
                 && existing.config == spec.config
             {
+                if existing.revision != spec.revision {
+                    self.pending.remove(&spec.key);
+                }
                 existing.workflow = spec.workflow;
+                existing.source = spec.source;
+                existing.revision = spec.revision;
                 existing.trigger = spec.trigger;
                 continue;
             }
+            self.pending.remove(&spec.key);
             self.watchers.remove(&spec.key);
             match new_filesystem_watcher(&spec, self.sender.clone()) {
                 Ok(watcher) => {
                     self.watchers.insert(spec.key, watcher);
                 }
                 Err(error) => {
-                    eprintln!("kakune scheduler: cannot watch filesystem trigger: {error}")
+                    self.reporter.report(
+                        CoreDiagnosticSource::Scheduler,
+                        format!("cannot watch filesystem trigger: {error}"),
+                    );
                 }
             }
         }
@@ -702,7 +1180,10 @@ impl FilesystemScheduler {
                     serde_json::json!({ "dropped": dropped, "capacity": FILESYSTEM_CHANNEL_CAPACITY }),
                 )
             {
-                eprintln!("kakune scheduler: cannot persist filesystem overflow for {key}: {error}");
+                self.reporter.report(
+                    CoreDiagnosticSource::Scheduler,
+                    format!("cannot persist filesystem overflow for {key}: {error}"),
+                );
             }
         }
     }
@@ -714,7 +1195,10 @@ impl FilesystemScheduler {
         let event = match event {
             Ok(event) => event,
             Err(error) => {
-                eprintln!("kakune scheduler: filesystem watcher {key} reported an error: {error}");
+                self.reporter.report(
+                    CoreDiagnosticSource::Scheduler,
+                    format!("filesystem watcher {key} reported an error: {error}"),
+                );
                 return;
             }
         };
@@ -729,10 +1213,14 @@ impl FilesystemScheduler {
         coalesce_pending(
             &mut self.pending,
             key,
-            watcher.workflow.clone(),
-            watcher.trigger.clone(),
-            filesystem_trigger_values(&event, &watcher.config),
-            now + watcher.config.debounce,
+            PendingFilesystemTrigger {
+                workflow: watcher.workflow.clone(),
+                source: watcher.source.clone(),
+                revision: watcher.revision.clone(),
+                trigger: watcher.trigger.clone(),
+                trigger_values: filesystem_trigger_values(&event, &watcher.config),
+                due_at: now + watcher.config.debounce,
+            },
         );
     }
 
@@ -775,6 +1263,8 @@ fn new_filesystem_watcher(
         .map_err(|error| format!("cannot watch {}: {error}", spec.config.root.display()))?;
     Ok(RegisteredFilesystemTrigger {
         workflow: spec.workflow.clone(),
+        source: spec.source.clone(),
+        revision: spec.revision.clone(),
         trigger: spec.trigger.clone(),
         config: spec.config.clone(),
         overflow,
@@ -799,18 +1289,16 @@ fn filesystem_event_matches(kind: &EventKind, events: &BTreeSet<FilesystemEventK
 fn coalesce_pending(
     pending: &mut HashMap<String, PendingFilesystemTrigger>,
     key: String,
-    workflow: WorkflowDocument,
-    trigger: WorkflowTrigger,
-    trigger_values: Value,
-    due_at: Instant,
+    incoming: PendingFilesystemTrigger,
 ) {
     if let Some(existing) = pending.get_mut(&key) {
-        let paths = trigger_values
+        let paths = incoming
+            .trigger_values
             .get("paths")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let path = trigger_values.get("path").cloned();
+        let path = incoming.trigger_values.get("path").cloned();
         let existing_paths = existing
             .trigger_values
             .as_object_mut()
@@ -829,20 +1317,14 @@ fn coalesce_pending(
                 .expect("filesystem trigger values are objects")
                 .insert("path".to_string(), path);
         }
-        existing.workflow = workflow;
-        existing.trigger = trigger;
-        existing.due_at = due_at;
+        existing.workflow = incoming.workflow;
+        existing.source = incoming.source;
+        existing.revision = incoming.revision;
+        existing.trigger = incoming.trigger;
+        existing.due_at = incoming.due_at;
         return;
     }
-    pending.insert(
-        key,
-        PendingFilesystemTrigger {
-            workflow,
-            trigger,
-            trigger_values,
-            due_at,
-        },
-    );
+    pending.insert(key, incoming);
 }
 
 fn take_due_pending(
@@ -861,21 +1343,27 @@ fn take_due_pending(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, fs, time::Duration};
+    use std::{
+        collections::HashMap,
+        fs,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use notify::{Event, EventKind, event::CreateKind};
     use serde_json::json;
     use tokio::time::Instant;
 
     use crate::{
-        Store, WorkflowDocument,
+        CoreDiagnosticSource, DiagnosticReporter, PluginRegistry, Store, WorkflowDocument,
         workflow::{WorkflowBinding, WorkflowTrigger},
     };
 
     use super::{
-        FilesystemConfig, FilesystemEventKind, PendingFilesystemTrigger, coalesce_pending,
-        cron_next_due, filesystem_config, filesystem_event_matches, filesystem_trigger_values,
-        interval_seconds, schedule_trigger, take_due_pending, trigger_inputs,
+        FilesystemConfig, FilesystemEventKind, PendingFilesystemTrigger, ScheduledExecution,
+        coalesce_pending, cron_next_due, execute, filesystem_config, filesystem_event_matches,
+        filesystem_trigger_values, interval_seconds, schedule_trigger, take_due_pending,
+        trigger_inputs,
     };
 
     fn trigger(
@@ -957,7 +1445,7 @@ mod tests {
         );
         let initial = time::macros::datetime!(2026-09-09 09:00 UTC);
         assert_eq!(
-            schedule_trigger(&store, workflow, &interval, initial, false)
+            schedule_trigger(&store, workflow, &interval, "revision-1", initial, false)
                 .expect("schedule should initialize"),
             0
         );
@@ -966,6 +1454,7 @@ mod tests {
                 &store,
                 workflow,
                 &interval,
+                "revision-1",
                 time::macros::datetime!(2026-09-09 09:05 UTC),
                 true
             )
@@ -977,6 +1466,39 @@ mod tests {
             .expect("state should load")
             .expect("state should exist");
         assert!(state.next_run_at > time::macros::datetime!(2026-09-09 09:05 UTC));
+        let revised_interval = trigger(
+            "kakune.trigger.interval@1",
+            serde_json::Map::from_iter([
+                (String::from("everySeconds"), json!(30)),
+                (String::from("misfire"), json!("catchUp")),
+                (String::from("maxCatchUp"), json!(2)),
+            ]),
+        );
+        let revised_at = time::macros::datetime!(2026-09-09 10:00 UTC);
+        assert_eq!(
+            schedule_trigger(
+                &store,
+                workflow,
+                &revised_interval,
+                "revision-2",
+                revised_at,
+                true,
+            )
+            .expect("changed trigger should reconcile without firing"),
+            0
+        );
+        let reconciled = store
+            .scheduled_trigger(workflow, "tick")
+            .expect("reconciled schedule should load")
+            .expect("reconciled schedule should exist");
+        assert_eq!(reconciled.next_run_at, revised_at);
+        assert_eq!(
+            reconciled.schedule_identity,
+            format!(
+                "catchUp|revision:revision-2|trigger:{}",
+                crate::artifacts::artifact_id(&serde_json::to_vec(&revised_interval).unwrap())
+            )
+        );
         drop(store);
         fs::remove_dir_all(directory).expect("temporary data should be removed");
     }
@@ -1029,18 +1551,26 @@ mod tests {
         coalesce_pending(
             &mut pending,
             "sample/incoming".to_string(),
-            workflow.clone(),
-            trigger.clone(),
-            json!({ "paths": ["one.txt"] }),
-            now + std::time::Duration::from_secs(1),
+            PendingFilesystemTrigger {
+                workflow: workflow.clone(),
+                source: String::new(),
+                revision: "revision".to_owned(),
+                trigger: trigger.clone(),
+                trigger_values: json!({ "paths": ["one.txt"] }),
+                due_at: now + std::time::Duration::from_secs(1),
+            },
         );
         coalesce_pending(
             &mut pending,
             "sample/incoming".to_string(),
-            workflow,
-            trigger,
-            json!({ "paths": ["two.txt"] }),
-            now + std::time::Duration::from_secs(2),
+            PendingFilesystemTrigger {
+                workflow,
+                source: String::new(),
+                revision: "revision".to_owned(),
+                trigger,
+                trigger_values: json!({ "paths": ["two.txt"] }),
+                due_at: now + std::time::Duration::from_secs(2),
+            },
         );
         assert!(take_due_pending(&mut pending, now + std::time::Duration::from_secs(1)).is_empty());
         assert_eq!(
@@ -1093,18 +1623,26 @@ mod tests {
         coalesce_pending(
             &mut pending,
             "sample/incoming".to_string(),
-            document.clone(),
-            trigger.clone(),
-            first,
-            now,
+            PendingFilesystemTrigger {
+                workflow: document.clone(),
+                source: String::new(),
+                revision: "revision".to_owned(),
+                trigger: trigger.clone(),
+                trigger_values: first,
+                due_at: now,
+            },
         );
         coalesce_pending(
             &mut pending,
             "sample/incoming".to_string(),
-            document,
-            trigger,
-            second,
-            now,
+            PendingFilesystemTrigger {
+                workflow: document,
+                source: String::new(),
+                revision: "revision".to_owned(),
+                trigger,
+                trigger_values: second,
+                due_at: now,
+            },
         );
         let due = take_due_pending(&mut pending, now);
         assert_eq!(due.len(), 1);
@@ -1114,5 +1652,60 @@ mod tests {
             json!(["inbox/first.txt", "inbox/second.txt"])
         );
         fs::remove_dir_all(workspace).expect("workspace should remove");
+    }
+
+    #[test]
+    fn invalid_trigger_mapping_uses_the_injected_diagnostic_reporter() {
+        let directory = std::env::temp_dir().join(format!(
+            "kakune-scheduler-reporting-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(directory.clone()).expect("store should open");
+        let workflow = WorkflowDocument::parse(
+            "apiVersion: kakune/v1\nkind: Workflow\nmetadata:\n  id: report\n  name: Report\ntriggers:\n  - id: manual\n    type: kakune.trigger.manual@1\nentry: hello\nnodes:\n  - id: hello\n    type: kakune.flow.pass@1\n",
+        )
+        .expect("workflow should parse");
+        let trigger = WorkflowTrigger {
+            id: "startup".to_string(),
+            node_type: "kakune.trigger.startup@1".to_string(),
+            with: Default::default(),
+            map: std::collections::BTreeMap::from([(
+                "input".to_string(),
+                WorkflowBinding::From {
+                    from: "unsupported".to_string(),
+                },
+            )]),
+        };
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let reporter = {
+            let captured = Arc::clone(&captured);
+            DiagnosticReporter::new(move |diagnostic| {
+                captured.lock().expect("diagnostic lock").push(diagnostic);
+            })
+        };
+
+        execute(ScheduledExecution {
+            store: store.clone(),
+            plugins: PluginRegistry::default(),
+            workflow_id: workflow.metadata.id.clone(),
+            source: String::new(),
+            revision: "revision".to_owned(),
+            trigger: Some(trigger),
+            trigger_values: serde_json::json!({}),
+            lifecycle: None,
+            reporter,
+        });
+
+        let captured = captured.lock().expect("diagnostic lock");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].source, CoreDiagnosticSource::Scheduler);
+        assert!(
+            captured[0]
+                .message
+                .contains("trigger map input must use literal or $trigger")
+        );
+        drop(captured);
+        drop(store);
+        fs::remove_dir_all(directory).expect("temporary store should be removed");
     }
 }

@@ -295,7 +295,7 @@ impl WorkflowDocument {
         ensure_acyclic(&self.nodes)?;
         validate_convergences(&self.nodes, "workflow")?;
         for node in &self.nodes {
-            validate_structured_node(node, "node")?;
+            validate_structured_node(node, "node", 0, &HashSet::new())?;
             validate_retry(node, "node")?;
         }
         Ok(())
@@ -343,7 +343,12 @@ fn validate_node_catalog(
     Ok(())
 }
 
-fn validate_structured_node(node: &WorkflowNode, field: &str) -> Result<(), String> {
+fn validate_structured_node(
+    node: &WorkflowNode,
+    field: &str,
+    depth: usize,
+    lexical_bindings: &HashSet<&'static str>,
+) -> Result<(), String> {
     match node.node_type.as_str() {
         "kakune.flow.switch@1" => {
             validate_control_keys(node, field, &["cases", "default"])?;
@@ -397,6 +402,8 @@ fn validate_structured_node(node: &WorkflowNode, field: &str) -> Result<(), Stri
                     branch,
                     &format!("{field} {} branch {name}", node.id),
                     Some("switch"),
+                    depth + 1,
+                    lexical_bindings,
                 )?;
                 if branch.outputs.contains_key("branch") {
                     return Err(format!(
@@ -422,7 +429,13 @@ fn validate_structured_node(node: &WorkflowNode, field: &str) -> Result<(), Stri
                 .body
                 .as_ref()
                 .ok_or_else(|| format!("{field} {} foreach requires body", node.id))?;
-            validate_subgraph(body, &format!("{field} {} body", node.id), Some("foreach"))?;
+            validate_subgraph(
+                body,
+                &format!("{field} {} body", node.id),
+                Some("foreach"),
+                depth + 1,
+                lexical_bindings,
+            )?;
         }
         "kakune.flow.loop@1" => {
             validate_control_keys(node, field, &["maxIterations"])?;
@@ -437,7 +450,13 @@ fn validate_structured_node(node: &WorkflowNode, field: &str) -> Result<(), Stri
                 .body
                 .as_ref()
                 .ok_or_else(|| format!("{field} {} loop requires body", node.id))?;
-            validate_subgraph(body, &format!("{field} {} body", node.id), Some("loop"))?;
+            validate_subgraph(
+                body,
+                &format!("{field} {} body", node.id),
+                Some("loop"),
+                depth + 1,
+                lexical_bindings,
+            )?;
             for name in ["state", "continue"] {
                 if !body.outputs.contains_key(name) {
                     return Err(format!(
@@ -636,9 +655,29 @@ fn validate_subgraph(
     graph: &WorkflowSubgraph,
     field: &str,
     scope: Option<&str>,
+    depth: usize,
+    outer_lexical_bindings: &HashSet<&'static str>,
 ) -> Result<(), String> {
+    if depth > 32 {
+        return Err(format!(
+            "{field} exceeds the maximum control nesting depth of 32"
+        ));
+    }
     if graph.nodes.is_empty() {
         return Err(format!("{field}.nodes must contain at least one node"));
+    }
+    let mut lexical_bindings = outer_lexical_bindings.clone();
+    match scope {
+        Some("foreach") => {
+            lexical_bindings.extend(["$item", "$index"]);
+        }
+        Some("loop") => {
+            lexical_bindings.extend(["$state", "$iteration"]);
+        }
+        Some("switch") => {
+            lexical_bindings.insert("$value");
+        }
+        _ => {}
     }
     let mut ids = HashSet::new();
     for node in &graph.nodes {
@@ -649,7 +688,7 @@ fn validate_subgraph(
         }
         validate_bindings(&node.inputs, "subgraph node.inputs")?;
         validate_ai_node(node, field)?;
-        validate_structured_node(node, field)?;
+        validate_structured_node(node, field, depth, &lexical_bindings)?;
         validate_retry(node, field)?;
     }
     if !ids.contains(graph.entry.as_str()) {
@@ -687,12 +726,7 @@ fn validate_subgraph(
     {
         if let WorkflowBinding::From { from } = binding
             && from.starts_with('$')
-            && !matches!(
-                (scope, from.as_str()),
-                (Some("foreach"), "$item" | "$index")
-                    | (Some("loop"), "$state" | "$iteration")
-                    | (Some("switch"), "$value")
-            )
+            && !lexical_bindings.contains(from.split('.').next().unwrap_or(from))
             && !(from == "$input"
                 || from == "$trigger"
                 || from.starts_with("$input.")
