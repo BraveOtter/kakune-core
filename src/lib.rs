@@ -140,3 +140,4 @@ pub mod codex_adapter;
 
 pub mod process_supervisor;
 
+mod provider_probe;

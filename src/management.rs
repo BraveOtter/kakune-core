@@ -338,7 +338,10 @@ pub fn admit_workflow_execution(
             ManagementError::new(ManagementErrorCode::PreconditionFailed, error)
         } else if error.contains("was not found") {
             ManagementError::new(ManagementErrorCode::NotFound, error)
-        } else if error.contains("validation") || error.contains("limit") {
+        } else if error.contains("validation")
+            || error.contains("limit")
+            || error.contains("pending removal")
+        {
             ManagementError::new(ManagementErrorCode::InvalidOperation, error)
         } else {
             ManagementError::new(
@@ -1310,7 +1313,15 @@ pub fn commit_provider_auth(
         })
 }
 
-pub fn test_provider(store: &Store, id: &str) -> Result<ProviderTestReport, ManagementError> {
+pub async fn test_provider(store: &Store, id: &str) -> Result<ProviderTestReport, ManagementError> {
+    test_provider_with_ca(store, id, None).await
+}
+
+pub(crate) async fn test_provider_with_ca(
+    store: &Store,
+    id: &str,
+    additional_ca: Option<&reqwest::Certificate>,
+) -> Result<ProviderTestReport, ManagementError> {
     let profile = store
         .get_provider_profile(id)
         .map_err(|_| internal_error("cannot inspect provider profile"))?
@@ -1324,33 +1335,43 @@ pub fn test_provider(store: &Store, id: &str) -> Result<ProviderTestReport, Mana
         crate::ProviderAuth::ApiKeySecret { secret_ref }
         | crate::ProviderAuth::OAuthSecret { secret_ref } => secret_ref,
     };
+    let mut connectivity = IntegrationCheck {
+        status: "unknown".to_owned(),
+        message: "no supported connectivity probe is configured for this provider profile"
+            .to_owned(),
+    };
     let authentication = match store.resolve_secret(reference) {
         Ok(value) => {
             let secret = SecretValue::new(value);
-            let valid_local_bundle = match profile.provider_type {
-                ProviderType::MiniMax => true,
-                ProviderType::Codex => {
-                    match crate::codex::CodexOAuthTokens::from_secret(secret.expose()) {
-                        Ok(mut tokens) => {
-                            tokens.zeroize_secrets();
-                            true
-                        }
-                        Err(_) => false,
-                    }
-                }
-            };
-            drop(secret);
-            if valid_local_bundle {
-                IntegrationCheck {
-                    status: "unknown".to_owned(),
-                    message:
-                        "credential is available locally; upstream authentication was not attempted"
-                            .to_owned(),
-                }
+            if profile.provider_type == ProviderType::MiniMax {
+                let base_url = profile
+                    .config
+                    .get("baseUrl")
+                    .and_then(Value::as_str)
+                    .unwrap_or(crate::minimax::DEFAULT_BASE_URL);
+                let (network, auth) = crate::provider_probe::probe_minimax(
+                    base_url,
+                    secret.expose(),
+                    &profile.default_model,
+                    additional_ca,
+                )
+                .await;
+                connectivity = network;
+                auth
             } else {
-                IntegrationCheck {
-                    status: "failed".to_owned(),
-                    message: "configured credential is invalid".to_owned(),
+                match crate::codex::CodexOAuthTokens::from_secret(secret.expose()) {
+                    Ok(mut tokens) => {
+                        let (network, auth) =
+                            crate::provider_probe::probe_codex(&tokens, &profile.default_model)
+                                .await;
+                        tokens.zeroize_secrets();
+                        connectivity = network;
+                        auth
+                    }
+                    Err(_) => IntegrationCheck {
+                        status: "failed".to_owned(),
+                        message: "configured credential is invalid".to_owned(),
+                    },
                 }
             }
         }
@@ -1362,11 +1383,7 @@ pub fn test_provider(store: &Store, id: &str) -> Result<ProviderTestReport, Mana
     let report = ProviderTestReport {
         profile_id: profile.id.clone(),
         checked_at: None,
-        connectivity: IntegrationCheck {
-            status: "unknown".to_owned(),
-            message: "no supported connectivity probe is configured for this provider profile"
-                .to_owned(),
-        },
+        connectivity: connectivity.clone(),
         authentication: authentication.clone(),
         capabilities: profile
             .capabilities
@@ -1374,13 +1391,15 @@ pub fn test_provider(store: &Store, id: &str) -> Result<ProviderTestReport, Mana
             .map(|capability| ProviderCapabilityCheck {
                 capability: capability.clone(),
                 status: "unsupported".to_owned(),
-                message: "live capability checks are not supported; no generation request was sent"
-                    .to_owned(),
+                message: "the connectivity probe does not verify this capability".to_owned(),
             })
             .collect(),
     };
-    let diagnostic_status = if authentication.status == "failed" {
+    let diagnostic_status = if authentication.status == "failed" || connectivity.status == "failed"
+    {
         ProviderProfileStatus::Unavailable
+    } else if authentication.status == "passed" && connectivity.status == "passed" {
+        ProviderProfileStatus::Available
     } else {
         ProviderProfileStatus::Unknown
     };
@@ -1392,8 +1411,7 @@ pub fn test_provider(store: &Store, id: &str) -> Result<ProviderTestReport, Mana
                 status: diagnostic_status,
                 checked_at: None,
                 message: Some(
-                    "provider checks completed with unsupported or unknown upstream evidence"
-                        .to_owned(),
+                    "provider checks completed; see details for individual outcomes".to_owned(),
                 ),
                 details: Some(details),
             },

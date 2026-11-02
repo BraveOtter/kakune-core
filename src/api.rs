@@ -49,6 +49,7 @@ struct AppState {
     reporter: DiagnosticReporter,
     rate_limit: Mutex<RateLimit>,
     minimax_quota_cache: Mutex<HashMap<String, QuotaCacheEntry>>,
+    provider_additional_ca: Option<reqwest::Certificate>,
 }
 
 struct QuotaCacheEntry {
@@ -118,6 +119,19 @@ pub fn router_with_lifecycle_and_reporter(
     lifecycle: CoreLifecycle,
     reporter: DiagnosticReporter,
 ) -> Router {
+    router_with_provider_ca(store, plugins, api_config, lifecycle, reporter, None)
+}
+
+/// Builds a router with an additional trusted certificate for MiniMax diagnostics.
+/// Certificate and hostname validation remain enabled, and network limits are unchanged.
+pub fn router_with_provider_ca(
+    store: Store,
+    plugins: PluginRegistry,
+    api_config: ApiConfig,
+    lifecycle: CoreLifecycle,
+    reporter: DiagnosticReporter,
+    additional_ca: Option<reqwest::Certificate>,
+) -> Router {
     let body_limit = api_config.request_body_limit_bytes;
     let plugins = plugins.with_diagnostic_reporter(reporter.clone());
     let state = Arc::new(AppState {
@@ -131,6 +145,7 @@ pub fn router_with_lifecycle_and_reporter(
             requests: 0,
         }),
         minimax_quota_cache: Mutex::new(HashMap::new()),
+        provider_additional_ca: additional_ca,
     });
     let protected = Router::new()
         .route("/api/v1/info", get(info))
@@ -1045,7 +1060,13 @@ async fn management_test_provider(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    match crate::management::test_provider(&state.store, &id) {
+    match crate::management::test_provider_with_ca(
+        &state.store,
+        &id,
+        state.provider_additional_ca.as_ref(),
+    )
+    .await
+    {
         Ok(report) => bounded_management_json(
             StatusCode::OK,
             serde_json::to_value(report).unwrap_or(serde_json::Value::Null),

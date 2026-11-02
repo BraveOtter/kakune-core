@@ -30,7 +30,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
-const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+pub(crate) const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const CALLBACK_ADDR: &str = "127.0.0.1:1455";
 const CALLBACK_PATH: &str = "/auth/callback";
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -72,7 +72,7 @@ impl CodexOAuthTokens {
         self.access.zeroize();
     }
 
-    fn expired(&self) -> bool {
+    pub(crate) fn expired(&self) -> bool {
         self.expires_at_ms <= now_millis().saturating_add(30_000)
     }
 }
