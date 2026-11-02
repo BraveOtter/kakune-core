@@ -1,5 +1,8 @@
 //! Explicit, opt-in native acceptance. Default test runs never mutate a native
 //! service or create detached Core processes.
+// The shared native acceptance harness is exercised on Windows and Linux;
+// macOS runs only the portable guard tests until native acceptance exists.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
 
 use std::{
     fs, io,

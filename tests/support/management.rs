@@ -225,6 +225,14 @@ impl InProcessCore {
         store: Store,
         api_config: ApiConfig,
     ) -> Result<Self, String> {
+        Self::start_with_provider_ca(store, api_config, None).await
+    }
+
+    pub async fn start_with_provider_ca(
+        store: Store,
+        api_config: ApiConfig,
+        ca: Option<reqwest::Certificate>,
+    ) -> Result<Self, String> {
         let token = store
             .ensure_bootstrap_token()?
             .ok_or_else(|| "isolated Core did not issue its test bootstrap token".to_owned())?;
@@ -238,8 +246,14 @@ impl InProcessCore {
                 .map_err(|error| format!("cannot inspect isolated Core listener: {error}"))?
         );
         let (stop, stopped) = oneshot::channel();
-        let app =
-            api::router_with_plugins_and_config(store.clone(), Default::default(), api_config);
+        let app = api::router_with_provider_ca(
+            store.clone(),
+            Default::default(),
+            api_config,
+            kakune_core::lifecycle::CoreLifecycle::ready(),
+            Default::default(),
+            ca,
+        );
         let task = tokio::spawn(async move {
             serve(listener, app)
                 .with_graceful_shutdown(async {

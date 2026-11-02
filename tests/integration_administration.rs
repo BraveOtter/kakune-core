@@ -92,7 +92,7 @@ fn provider_profile(id: &str, provider_type: &str, secret_ref: &str) -> Value {
         } else {
             json!({"type":"oauthSecret", "secretRef":secret_ref})
         },
-        "config": {}
+        "config": if provider_type == "minimax" { json!({"baseUrl": "http://invalid.test"}) } else { json!({}) }
     })
 }
 
@@ -251,7 +251,7 @@ async fn providers_are_create_only_and_report_unsupported_auth_and_model_operati
     .await;
     let authenticated: Value = authenticated.json().await.unwrap();
     assert_eq!(authenticated["authentication"]["status"], "unknown");
-    assert_eq!(authenticated["connectivity"]["status"], "unknown");
+    assert_eq!(authenticated["connectivity"]["status"], "failed");
     assert_eq!(authenticated["capabilities"][0]["status"], "unsupported");
     assert!(!authenticated.to_string().contains(PROVIDER_CANARY));
 

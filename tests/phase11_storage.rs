@@ -262,6 +262,11 @@ fn roll_back_fixture_to_schema_14(connection: &rusqlite::Connection) {
     connection
         .execute_batch(
             "DELETE FROM schema_migrations WHERE version >= 15;
+             DROP TRIGGER IF EXISTS installed_plugin_lifecycle_insert;
+             DROP TRIGGER IF EXISTS execution_release_plugin_pins;
+             DROP TABLE IF EXISTS plugin_execution_pins;
+             DROP TABLE IF EXISTS plugin_removal_workflows;
+             DROP TABLE IF EXISTS plugin_lifecycle;
              DROP INDEX IF EXISTS execution_events_lookup;
              DROP TABLE IF EXISTS named_mcp_connections;
              ALTER TABLE secrets DROP COLUMN credential_version;
@@ -353,7 +358,7 @@ fn initialization_migrates_legacy_store_with_recoverable_backup() {
     );
     assert_eq!(credentials.reads.load(Ordering::Relaxed), 1);
     assert_eq!(credentials.writes.load(Ordering::Relaxed), 0);
-    assert_eq!(database_schema_version(&database), 16);
+    assert_eq!(database_schema_version(&database), 17);
     assert_eq!(migration_database_snapshot(&database), before);
 
     let backup = paths

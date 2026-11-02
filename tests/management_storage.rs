@@ -44,7 +44,14 @@ fn absent_and_corrupt_storage_observation_never_creates_or_rewrites_files() {
     let before_corrupt =
         FilesystemSnapshot::capture(&corrupt_dir).expect("corrupt fixture should be snapshot-able");
     let corrupt = observation::observe_database(&database);
-    assert_eq!(corrupt.status, ObservationStatus::Corrupt);
+    assert_eq!(
+        corrupt.status,
+        if cfg!(windows) {
+            ObservationStatus::Corrupt
+        } else {
+            ObservationStatus::Unavailable
+        }
+    );
     before_corrupt
         .ensure_unchanged(&corrupt_dir)
         .expect("corrupt observation must not create sidecars or rewrite the database");
@@ -86,6 +93,7 @@ fn configuration_observation_is_capped_and_never_publishes_defaults() {
     assert!(oversized.guidance.contains("1 MiB"));
 }
 
+#[cfg(windows)]
 #[test]
 fn database_observation_classifies_schema_zero_through_fifteen_and_newer_without_writes() {
     let fixture = ManagementFixture::new().expect("fixture root should be created");
@@ -94,7 +102,7 @@ fn database_observation_classifies_schema_zero_through_fifteen_and_newer_without
     drop(store);
     let database = data_dir.join("kakune.sqlite3");
 
-    for version in 0..=15 {
+    for version in 0..=16 {
         set_claimed_schema_version(&database, version);
         let before =
             FilesystemSnapshot::capture(&data_dir).expect("schema fixture should be snapshot-able");
@@ -106,22 +114,22 @@ fn database_observation_classifies_schema_zero_through_fifteen_and_newer_without
             .expect("legacy observation must not change database or sidecars");
     }
 
-    set_claimed_schema_version(&database, 16);
+    set_claimed_schema_version(&database, 17);
     let before_current =
         FilesystemSnapshot::capture(&data_dir).expect("current fixture should be snapshot-able");
     let current = observation::observe_database(&database);
     assert_eq!(current.status, ObservationStatus::Healthy);
-    assert_eq!(current.schema_version, Some(16));
+    assert_eq!(current.schema_version, Some(17));
     before_current
         .ensure_unchanged(&data_dir)
         .expect("current observation must be read-only");
 
-    set_claimed_schema_version(&database, 17);
+    set_claimed_schema_version(&database, 18);
     let before_newer =
         FilesystemSnapshot::capture(&data_dir).expect("newer fixture should be snapshot-able");
     let newer = observation::observe_database(&database);
     assert_eq!(newer.status, ObservationStatus::Incompatible);
-    assert_eq!(newer.schema_version, Some(17));
+    assert_eq!(newer.schema_version, Some(18));
     assert!(newer.guidance.contains("newer"));
     before_newer
         .ensure_unchanged(&data_dir)
@@ -181,7 +189,7 @@ fn schema_sixteen_upgrade_backs_up_before_changes_and_preserves_existing_data() 
         upgraded
             .schema_version()
             .expect("schema version should read"),
-        16
+        17
     );
     assert_eq!(
         upgraded
@@ -319,7 +327,12 @@ fn downgrade_to_schema_fifteen(database: &Path) {
         .expect("fixture journal mode should be checkpointed");
     connection
         .execute_batch(
-            "DROP TABLE named_mcp_connections;
+            "DROP TRIGGER installed_plugin_lifecycle_insert;
+             DROP TRIGGER execution_release_plugin_pins;
+             DROP TABLE plugin_execution_pins;
+             DROP TABLE plugin_removal_workflows;
+             DROP TABLE plugin_lifecycle;
+             DROP TABLE named_mcp_connections;
              DROP INDEX execution_events_lookup;
              ALTER TABLE secrets DROP COLUMN credential_version;
              DELETE FROM schema_migrations WHERE version > 15;",
@@ -1022,7 +1035,7 @@ fn doctor_filesystem_and_credential_observations_leave_schema_matrix_unchanged()
                     drop(connection);
                     match case {
                         "legacy" => set_claimed_schema_version(&database, 15),
-                        "newer" => set_claimed_schema_version(&database, 17),
+                        "newer" => set_claimed_schema_version(&database, 18),
                         _ => {}
                     }
                 }

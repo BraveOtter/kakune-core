@@ -127,6 +127,65 @@ async fn management_capability_is_negotiated_and_errors_use_sanitized_envelopes(
 }
 
 #[tokio::test]
+async fn observation_surface_requires_a_credential_and_never_mutates_storage() {
+    let (fixture, mut core) = management_core().await;
+    let read = core
+        .store
+        .create_auth_token("observation-reader".into(), vec![AuthScope::Read], None)
+        .expect("read token should be created");
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/observation", core.endpoint);
+
+    let unauthenticated = client
+        .get(&url)
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let response = client
+        .get(&url)
+        .header(AUTHORIZATION, format!("Bearer {}", read.token))
+        .send()
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let report: Value = response.json().await.expect("report should be JSON");
+    assert_eq!(report["dataDirectoryExists"], json!(true));
+    assert!(report["database"]["status"].is_string());
+    assert!(report["storage"]["status"].is_string());
+    assert!(report["configuration"]["status"].is_string());
+    let serialized = report.to_string();
+    assert!(!serialized.contains("credential"), "{serialized}");
+    assert!(!serialized.contains("secret"), "{serialized}");
+
+    // A read-only observation must not create, repair or migrate storage.
+    let before = std::fs::read_dir(core.store.data_dir())
+        .expect("data directory should be readable")
+        .map(|entry| entry.expect("entry should be readable").file_name())
+        .collect::<Vec<_>>();
+    client
+        .get(&url)
+        .header(AUTHORIZATION, format!("Bearer {}", read.token))
+        .send()
+        .await
+        .expect("request should complete")
+        .error_for_status()
+        .expect("observation should succeed");
+    let after = std::fs::read_dir(core.store.data_dir())
+        .expect("data directory should be readable")
+        .map(|entry| entry.expect("entry should be readable").file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        before, after,
+        "the observation must not change the storage directory"
+    );
+    assert!(after.iter().any(|name| name == "kakune.sqlite3"));
+    assert!(fixture.path("core").exists());
+    core.shutdown().await.expect("Core should stop cleanly");
+}
+
+#[tokio::test]
 async fn management_scopes_are_selected_by_operation_not_http_verb_alone() {
     let (_fixture, mut core) = management_core().await;
     let read = core
@@ -212,6 +271,37 @@ async fn management_scopes_are_selected_by_operation_not_http_verb_alone() {
     );
 
     core.shutdown().await.expect("Core should stop cleanly");
+}
+
+#[tokio::test]
+async fn plugin_commit_requires_administrator_scope() {
+    let (_fixture, mut core) = management_core().await;
+    let manage = core
+        .store
+        .create_auth_token("plugin-manager".into(), vec![AuthScope::Manage], None)
+        .unwrap();
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/api/v1/plugin-installations/missing/commit",
+        core.endpoint
+    );
+    let denied = client
+        .post(&url)
+        .header(AUTHORIZATION, format!("Bearer {}", manage.token))
+        .json(&json!({"digest":"not-a-digest"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    let admin = client
+        .post(&url)
+        .header(AUTHORIZATION, format!("Bearer {}", core.token))
+        .json(&json!({"digest":"not-a-digest"}))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(admin.status(), StatusCode::UNAUTHORIZED);
+    core.shutdown().await.unwrap();
 }
 
 #[tokio::test]
