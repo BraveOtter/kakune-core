@@ -2052,6 +2052,11 @@ mod tests {
         };
 
         let outcome = (|| {
+            // The Core establishes the verified directory owner before it
+            // publishes a capability. An elevated Windows token can default a
+            // new directory to Administrators ownership, and the preparation
+            // step is what makes that directory publishable.
+            prepare_capability_directory(&path, &owner)?;
             let capability = create_capability(&path, &owner, &random, &OwnerProtectedFileStorage)?;
             let loaded = OwnerProtectedFileStorage.load(&path, &owner)?;
             let challenge = ControlChallenge {
@@ -2115,7 +2120,12 @@ mod tests {
     fn owner_only_capability_is_published_after_permission_verification() {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
-        let root = std::env::temp_dir().join(format!("kakune-private-{}", Uuid::new_v4()));
+        // The temporary directory can sit behind a symbolic link, for example
+        // `/var` on macOS. The ownership chain check rejects redirected
+        // ancestors, so the fixture resolves the real path before it writes.
+        let temporary = fs::canonicalize(std::env::temp_dir())
+            .expect("temporary directory should resolve to a real path");
+        let root = temporary.join(format!("kakune-private-{}", Uuid::new_v4()));
         let mut builder = fs::DirBuilder::new();
         builder.mode(0o700);
         builder.create(&root).unwrap();

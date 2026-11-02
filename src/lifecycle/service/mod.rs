@@ -2895,7 +2895,12 @@ mod tests {
     }
 
     fn isolated_attempt_path() -> (PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("kakune-attempt-{}", Uuid::new_v4()));
+        // The temporary directory can sit behind a symbolic link, for example
+        // `/var` on macOS. The service-state protection rejects redirected
+        // ancestors, so the fixture resolves the real path before it writes.
+        let temporary = fs::canonicalize(std::env::temp_dir())
+            .expect("temporary directory should resolve to a real path");
+        let root = temporary.join(format!("kakune-attempt-{}", Uuid::new_v4()));
         let path = root
             .join("systemd")
             .join("kakune-core.service")

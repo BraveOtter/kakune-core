@@ -1079,7 +1079,10 @@ mod tests {
         .expect("test CA parses");
         reqwest::Client::builder()
             .add_root_certificate(ca)
-            .timeout(Duration::from_secs(2))
+            // The fixture deadline only guards the test harness. It stays wide
+            // enough that a loaded runner does not turn a local handshake into
+            // a spurious transport failure.
+            .timeout(Duration::from_secs(30))
             .build()
             .expect("bounded test client builds")
     }
@@ -1202,7 +1205,7 @@ mod tests {
         let metadata = serde_json::json!({
             "dist-tags":{"latest":"1.2.3"},
             "versions":{"1.2.3":{"dist":{
-                "tarball":format!("https://localhost:{port}/package.tgz"),
+                "tarball":format!("https://127.0.0.1:{port}/package.tgz"),
                 "integrity":integrity
             }}}
         });
@@ -1239,7 +1242,7 @@ mod tests {
             &staging,
             "fixture-plugin",
             None,
-            &format!("https://localhost:{port}"),
+            &format!("https://127.0.0.1:{port}"),
             &client,
         )
         .await
@@ -1413,7 +1416,7 @@ mod tests {
         let client = test_download_client();
         let error = fetch_bytes_with_client(
             &client,
-            &format!("https://localhost:{port}/oversized"),
+            &format!("https://127.0.0.1:{port}/oversized"),
             8,
             "test npm response",
         )
@@ -1433,7 +1436,7 @@ mod tests {
         let started = Instant::now();
         let error = fetch_bytes_with_client(
             &short_timeout_client,
-            &format!("https://localhost:{port}/slow"),
+            &format!("https://127.0.0.1:{port}/slow"),
             100,
             "test timeout response",
         )

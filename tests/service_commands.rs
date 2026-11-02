@@ -392,13 +392,14 @@ fn persistent_unknown_exit_expires_the_original_grace_and_preserves_registration
         .unwrap()
         .stop_unknown_observations = usize::MAX;
     let before = fixture.manager.metrics().0;
+    let clock_before_stop = fixture.clock.now();
     let error = fixture
         .controller
         .stop(fixture.definition.manager, &fixture.definition.service_id)
         .unwrap_err();
     assert!(matches!(error, LifecycleError::DeadlineExpired { .. }));
     assert_eq!(
-        fixture.clock.now(),
+        fixture.clock.now() - clock_before_stop,
         kakune_core::lifecycle::CORE_GRACE_BUDGET
     );
     assert!(

@@ -24,7 +24,7 @@ async fn tls_serves_authenticated_api_and_rejects_untrusted_certificates() {
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
-        "https://localhost:{}/api/v1/info",
+        "https://127.0.0.1:{}/api/v1/info",
         listener.local_addr().unwrap().port()
     );
     let (stop, stopped) = tokio::sync::oneshot::channel();
