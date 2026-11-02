@@ -32,6 +32,17 @@ jobs:
         if: matrix.os == 'ubuntu-22.04'
         run: cargo package --locked
 
+  linux-sandbox:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Verify enforced filesystem restrictions
+        env:
+          KAKUNE_TEST_REQUIRE_LANDLOCK: "1"
+        run: cargo test --locked --test plugin_sandbox
+
   supply-chain:
     runs-on: ubuntu-22.04
     steps:

@@ -651,6 +651,10 @@ pub struct PluginHostOptions {
     pub max_stderr_bytes: usize,
     pub request_timeout: Duration,
     pub shutdown_timeout: Duration,
+    /// Explicitly trusted experimental Linux filesystem-restriction launcher.
+    /// This does not restrict network access or other same-user processes.
+    #[cfg(target_os = "linux")]
+    pub filesystem_sandbox_launcher: Option<PathBuf>,
 }
 
 impl Default for PluginHostOptions {
@@ -660,6 +664,8 @@ impl Default for PluginHostOptions {
             max_stderr_bytes: DEFAULT_MAX_STDERR_BYTES,
             request_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(5),
+            #[cfg(target_os = "linux")]
+            filesystem_sandbox_launcher: None,
         }
     }
 }
@@ -725,6 +731,22 @@ impl PluginHost {
             ));
         }
 
+        #[cfg(target_os = "linux")]
+        let mut command = if let Some(launcher) = &options.filesystem_sandbox_launcher {
+            if !launcher.is_absolute() || !Path::new(&manifest.runtime.command).is_absolute() {
+                return Err(PluginHostError::InvalidOption(
+                    "sandbox launcher and plugin runtime paths must be absolute".to_owned(),
+                ));
+            }
+            let mut command = Command::new(launcher);
+            command
+                .arg("--host-protocol")
+                .arg(&manifest.runtime.command);
+            command
+        } else {
+            Command::new(&manifest.runtime.command)
+        };
+        #[cfg(not(target_os = "linux"))]
         let mut command = Command::new(&manifest.runtime.command);
         command
             .args(&manifest.runtime.args)
@@ -757,7 +779,7 @@ impl PluginHost {
             .ok_or(PluginHostError::MissingPipe("stderr"))?;
         let captured_stderr = Arc::new(Mutex::new(StderrCapture::default()));
 
-        Ok(Self {
+        let host = Self {
             host_handler: None,
             child,
             stdin,
@@ -772,7 +794,27 @@ impl PluginHost {
             next_request_id: 1,
             options,
             stopped: false,
-        })
+        };
+        #[cfg(target_os = "linux")]
+        let mut host = host;
+        #[cfg(target_os = "linux")]
+        if host.options.filesystem_sandbox_launcher.is_some() {
+            use tokio::io::AsyncReadExt;
+            const READY: &[u8] = b"KAKUNE_SANDBOX_READY_V1\n";
+            let mut response = [0_u8; READY.len()];
+            let result = tokio::time::timeout(
+                host.options.request_timeout,
+                host.stdout.read_exact(&mut response),
+            )
+            .await;
+            if !matches!(result, Ok(Ok(_))) || response != READY {
+                let _ = host.terminate().await;
+                return Err(PluginHostError::Protocol(
+                    "filesystem sandbox could not be established".to_owned(),
+                ));
+            }
+        }
+        Ok(host)
     }
 
     /// Installs the Core services available to this isolated plugin operation.

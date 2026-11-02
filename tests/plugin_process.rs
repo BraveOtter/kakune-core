@@ -248,6 +248,44 @@ fn executes_an_explicitly_registered_plugin_node() {
     fs::remove_dir_all(directory).expect("temporary data removed");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_start_failure_terminalizes_workflow_without_running_plugin() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = temp_directory("sandbox-workflow");
+    let sentinel = directory.join("plugin-started");
+    let executable = directory.join("runtime");
+    fs::write(
+        &executable,
+        format!("#!/bin/sh\nprintf started > '{}'\n", sentinel.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let manifest_path = write_node_manifest(executable.to_str().unwrap());
+    let manifest = PluginManifest::load(&manifest_path).unwrap();
+    let mut registry = PluginRegistry::default();
+    registry
+        .register_manifest_with_options(
+            manifest,
+            PluginHostOptions {
+                filesystem_sandbox_launcher: Some(directory.join("missing-sandbox")),
+                ..PluginHostOptions::default()
+            },
+        )
+        .unwrap();
+    let store = Store::open(directory.join("store")).unwrap();
+    let workflow = WorkflowDocument::parse("apiVersion: kakune/v1\nkind: Workflow\nmetadata: {id: sandbox-test, name: Sandbox test}\ntriggers: [{id: manual, type: kakune.trigger.manual@1}]\nentry: greet\nnodes:\n  - id: greet\n    type: org.example.greet@1\n    inputs:\n      name: { literal: Ada }\n").unwrap();
+    assert!(run_workflow_with_plugins(&store, &workflow, &registry).is_err());
+    let executions = store.list_executions().unwrap();
+    assert_eq!(executions.len(), 1);
+    assert_eq!(executions[0].status, "failed");
+    assert!(!sentinel.exists());
+    drop(store);
+    remove_manifest(&manifest_path);
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 fn executes_an_explicitly_registered_plugin_node_in_a_structured_body() {
     let manifest_path = write_node_manifest(&helper_command());

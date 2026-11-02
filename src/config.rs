@@ -10,6 +10,29 @@ use serde::{Deserialize, Serialize};
 #[serde(default, deny_unknown_fields)]
 pub struct CoreConfig {
     pub api: ApiConfig,
+    pub plugins: PluginConfig,
+}
+
+/// Filesystem isolation applied to plugin processes.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FilesystemSandboxMode {
+    /// Use the companion launcher when this kernel supports it, and report that
+    /// plugin processes are not isolated otherwise.
+    #[default]
+    Auto,
+    /// Require the launcher. Plugin execution fails when the launcher is
+    /// missing or cannot apply its restrictions.
+    Required,
+    /// Never isolate plugin processes.
+    Disabled,
+}
+
+/// Plugin execution settings.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginConfig {
+    pub filesystem_sandbox: FilesystemSandboxMode,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
