@@ -29,6 +29,12 @@ jobs:
         run: cargo test --locked
       - name: Build distributable binary
         run: cargo build --release --locked --bin kakune
+      - name: Build Unix observation helper
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        run: cargo build --release --locked --bin kakune-observation-helper
+      - name: Build experimental Linux plugin launcher
+        if: runner.os == 'Linux'
+        run: cargo build --release --locked --bin kakune-plugin-sandbox
       - name: Package archive
         shell: pwsh
         run: |

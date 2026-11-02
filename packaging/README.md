@@ -1,6 +1,8 @@
 # Core distribution
 
-Release archives contain the `kakune` executable, both project READMEs, the license, examples, and service templates. Verify `SHA256SUMS` before extracting an archive. GitHub release provenance can be verified with `gh attestation verify <asset> --repo BraveOtter/kakune-core`.
+Release archives contain the `kakune` executable, both project READMEs, the license, examples, and service templates. Linux and macOS archives also contain `kakune-observation-helper`; keep it beside `kakune` for local database observation. Verify `SHA256SUMS` before extracting an archive. GitHub release provenance can be verified with `gh attestation verify <asset> --repo BraveOtter/kakune-core`.
+
+Linux archives also contain the experimental `kakune-plugin-sandbox` launcher. It is not enabled by default, is not a complete sandbox, and does not protect against other processes running as the same user. Its filesystem restrictions require a compatible Landlock-enabled kernel; when explicitly requested, it fails rather than launching without them.
 
 Extract the archive to a directory owned by the user or administrator and run `kakune init --data-dir <directory>`. The `packaging/linux/kakune-core.service` and `packaging/macos/dev.kakune.core.plist` files are templates: update their executable and data paths before installing a service.
 
