@@ -181,7 +181,9 @@ pub fn router_with_provider_ca(
         )
         .route("/api/v1/artifacts/{id}", get(get_artifact))
         .route("/api/v1/plugins/{name}/manifest", get(plugin_manifest))
+        .route("/api/v1/plugins/{id}/lifecycle", get(plugin_lifecycle))
         .route("/api/v1/plugins", get(list_plugins))
+        .route("/api/v1/observation", get(core_observation))
         .route("/api/v1/plugins/prepare", post(prepare_plugin))
         .route(
             "/api/v1/plugin-installations/{id}/commit",
@@ -252,6 +254,18 @@ pub fn router_with_provider_ca(
                     "/triggers/{workflow_id}/{trigger_id}",
                     get(management_inspect_trigger),
                 )
+                .route("/plugins", get(management_list_plugins))
+                .route("/plugins/prepare", post(management_prepare_plugin))
+                .route("/plugins/commit", post(management_commit_plugin))
+                .route("/plugins/prepared/{id}", delete(management_discard_plugin))
+                .route(
+                    "/plugins/{id}/update/prepare",
+                    post(management_prepare_plugin_update),
+                )
+                .route("/plugins/{id}/inspect", get(management_inspect_plugin))
+                .route("/plugins/{id}/doctor", get(management_doctor_plugin))
+                .route("/plugins/{id}/test", get(management_test_plugin))
+                .route("/plugins/{id}", delete(management_remove_plugin))
                 .route(
                     "/providers",
                     get(management_list_providers).post(management_create_provider),
@@ -2226,7 +2240,9 @@ fn required_scope(method: &str, path: &str) -> AuthScope {
     if path.starts_with("/api/v1/auth/") {
         return AuthScope::Admin;
     }
-    if path.starts_with("/api/v1/plugins") && method != "GET" {
+    if (path.starts_with("/api/v1/plugins") || path.starts_with("/api/v1/plugin-installations"))
+        && method != "GET"
+    {
         return AuthScope::Admin;
     }
     if path.starts_with("/api/v1/secrets") {
@@ -2248,6 +2264,13 @@ fn required_scope(method: &str, path: &str) -> AuthScope {
 
 fn required_management_scope(method: &str, path: &str) -> AuthScope {
     let route = path.strip_prefix("/api/v1/manage").unwrap_or(path);
+    if route == "/plugins" || route.starts_with("/plugins/") {
+        return if method == "GET" {
+            AuthScope::Read
+        } else {
+            AuthScope::Admin
+        };
+    }
     if route == "/secrets" || route.starts_with("/secrets/") {
         return AuthScope::Manage;
     }
@@ -2718,6 +2741,207 @@ async fn list_plugins(
     }))
 }
 
+/// Publishes the shared read-only observation of this Core installation.
+///
+/// The report never initializes, repairs or migrates storage, and it never
+/// exposes configuration content, credential references or secret values.
+async fn core_observation(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<crate::observation::InstallationObservationReport>, ApiError> {
+    let data_dir = state.store.data_dir();
+    Ok(Json(crate::observation::observe_installation_report(
+        data_dir, None,
+    )))
+}
+
+async fn plugin_lifecycle(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (lifecycle, pins) = state
+        .store
+        .plugin_lifecycle_snapshot(&id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("plugin is not installed"))?;
+    Ok(Json(
+        json!({ "status": lifecycle.status, "failureDetails": lifecycle.failure_details, "activePins": pins }),
+    ))
+}
+
+async fn management_list_plugins(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let plugins = state
+        .store
+        .list_installed_plugins()
+        .map_err(ApiError::internal)?;
+    if plugins.len() > 10_000 {
+        return Err(ApiError::internal("plugin list exceeds its response limit"));
+    }
+    let mut items = Vec::with_capacity(plugins.len());
+    for plugin in plugins {
+        let (lifecycle, pins) = state
+            .store
+            .plugin_lifecycle_snapshot(&plugin.id)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::internal("plugin lifecycle record is missing"))?;
+        items.push(json!({
+            "id": plugin.id,
+            "name": plugin.name,
+            "version": plugin.version,
+            "enabled": plugin.enabled,
+            "digest": plugin.digest,
+            "status": lifecycle.status,
+            "failureDetails": lifecycle.failure_details,
+            "activeExecutions": pins,
+        }));
+    }
+    Ok(Json(json!({"items": items})))
+}
+
+async fn management_prepare_plugin(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PreparePluginRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let source = PluginSource::parse(&request.source).map_err(ApiError::invalid)?;
+    let prepared = plugin_install::prepare(&state.store, source)
+        .await
+        .map_err(ApiError::invalid)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(plugin_review_value(&prepared.record)?),
+    ))
+}
+
+async fn management_prepare_plugin_update(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<PreparePluginUpdateRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let source = request
+        .source
+        .as_deref()
+        .map(PluginSource::parse)
+        .transpose()
+        .map_err(ApiError::invalid)?;
+    let prepared = plugin_install::prepare_update(&state.store, &id, source)
+        .await
+        .map_err(ApiError::invalid)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(plugin_review_value(&prepared.record)?),
+    ))
+}
+
+fn plugin_review_value(
+    record: &crate::PreparedPluginInstallRecord,
+) -> Result<serde_json::Value, ApiError> {
+    let report = crate::plugin_diagnostics::inspect(std::path::Path::new(&record.staged_path))
+        .map_err(ApiError::internal)?;
+    let mut value = serde_json::to_value(record)
+        .map_err(|_| ApiError::internal("plugin review could not be encoded"))?;
+    if let Some(object) = value.as_object_mut() {
+        // A client only needs the opaque prepared ID and reviewed digest; never
+        // disclose the Core host's staging filesystem path.
+        object.remove("stagedPath");
+        object.insert(
+            "review".to_owned(),
+            serde_json::to_value(report)
+                .map_err(|_| ApiError::internal("plugin review could not be encoded"))?,
+        );
+    }
+    Ok(value)
+}
+
+async fn management_commit_plugin(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ManagementPluginCommitRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let installed = plugin_install::commit(&state.store, &request.prepared_id, &request.digest)
+        .map_err(ApiError::invalid)?;
+    refresh_plugin_catalog(&state)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "status":"installed",
+            "plugin":{
+                "id":installed.id,
+                "name":installed.name,
+                "version":installed.version,
+                "enabled":installed.enabled,
+                "digest":installed.digest,
+            }
+        })),
+    ))
+}
+
+async fn management_discard_plugin(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if !plugin_install::discard_prepared_id(&state.store, &id).map_err(ApiError::internal)? {
+        return Err(ApiError::not_found("prepared plugin review was not found"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn management_inspect_plugin(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::plugin_diagnostics::PluginDiagnosticReport>, ApiError> {
+    management_plugin_diagnostics(&state, &id).map(Json)
+}
+
+async fn management_doctor_plugin(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::plugin_diagnostics::PluginDiagnosticReport>, ApiError> {
+    management_plugin_diagnostics(&state, &id).map(Json)
+}
+
+async fn management_test_plugin(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::plugin_diagnostics::PluginDiagnosticReport>, ApiError> {
+    management_plugin_diagnostics(&state, &id).map(Json)
+}
+
+fn management_plugin_diagnostics(
+    state: &AppState,
+    id: &str,
+) -> Result<crate::plugin_diagnostics::PluginDiagnosticReport, ApiError> {
+    let plugin = state
+        .store
+        .list_installed_plugins()
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .find(|plugin| plugin.id == id)
+        .ok_or_else(|| ApiError::not_found(format!("plugin {id} is not installed")))?;
+    let mut report =
+        crate::plugin_diagnostics::inspect(std::path::Path::new(&plugin.manifest_path))
+            .map_err(ApiError::invalid)?;
+    if report.content_digest != plugin.digest {
+        report
+            .checks
+            .push(crate::plugin_diagnostics::DiagnosticCheck {
+                name: "installed-content".to_owned(),
+                status: crate::plugin_diagnostics::CheckStatus::Fail,
+                message: "installed bytes do not match the recorded activation digest".to_owned(),
+            });
+    }
+    Ok(report)
+}
+
+async fn management_remove_plugin(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::plugin_services::PluginRemovalReport>, ApiError> {
+    let report =
+        crate::plugin_services::request_removal(&state.store, &id).map_err(ApiError::invalid)?;
+    refresh_plugin_catalog(&state)?;
+    Ok(Json(report))
+}
+
 async fn prepare_plugin(
     State(state): State<Arc<AppState>>,
     Json(request): Json<PreparePluginRequest>,
@@ -2778,7 +3002,13 @@ async fn delete_plugin(
     state
         .store
         .remove_plugin_install(&id)
-        .map_err(ApiError::internal)?
+        .map_err(|error| {
+            if error == "plugin is in use or has a pending removal; use coordinated finalization" {
+                ApiError::conflict(error)
+            } else {
+                ApiError::internal(error)
+            }
+        })?
         .ok_or_else(|| ApiError::not_found("plugin is not installed"))?;
     refresh_plugin_catalog(&state)?;
     Ok(StatusCode::NO_CONTENT)
@@ -3346,6 +3576,19 @@ struct PreparePluginRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CommitPluginInstallationRequest {
+    digest: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PreparePluginUpdateRequest {
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagementPluginCommitRequest {
+    prepared_id: String,
     digest: String,
 }
 
