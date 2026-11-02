@@ -502,6 +502,27 @@ fn atomic_write(
         ));
     }
 
+    #[cfg(windows)]
+    if !replace {
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".kakune-context-")
+            .suffix(".tmp")
+            .tempfile_in(parent)
+            .map_err(|error| format!("cannot create atomic context temporary file: {error}"))?;
+        temporary
+            .write_all(contents)
+            .and_then(|()| temporary.as_file().sync_all())
+            .map_err(|error| format!("cannot prepare atomic context publication: {error}"))?;
+        temporary.persist_noclobber(path).map_err(|error| {
+            format!(
+                "cannot atomically publish {}: {}",
+                path.display(),
+                error.error
+            )
+        })?;
+        return Ok(());
+    }
+
     let mut temporary = None;
     for _ in 0..8 {
         let candidate = parent.join(format!(".kakune-context-{}.tmp", uuid::Uuid::new_v4()));
@@ -531,7 +552,7 @@ fn atomic_write(
     let temporary =
         temporary.ok_or_else(|| "cannot allocate a unique context temporary file".to_owned())?;
     let publish = if replace {
-        fs::rename(&temporary, path)
+        replace_context_file(&temporary, path)
     } else {
         fs::hard_link(&temporary, path)
     };
@@ -546,6 +567,38 @@ fn atomic_write(
         let _ = fs::remove_file(&temporary);
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_context_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_context_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    replace_with_retry(
+        || fs::rename(source, destination),
+        || {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        },
+    )
+}
+
+#[cfg(windows)]
+fn replace_with_retry(
+    mut rename: impl FnMut() -> std::io::Result<()>,
+    mut pause: impl FnMut(),
+) -> std::io::Result<()> {
+    let mut attempts = 0;
+    loop {
+        match rename() {
+            Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33)) && attempts < 40 => {
+                attempts += 1;
+                pause();
+            }
+            result => return result,
+        }
+    }
 }
 
 fn parent_directory(path: &Path) -> &Path {
@@ -667,6 +720,64 @@ mod tests {
 
     use super::{ConnectionContext, ContextFile, SystemCredentialAccess};
     use crate::initialization::{CredentialAccess, CredentialAccessError, CredentialSecret};
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_first_publication_can_be_replaced_and_never_clobbers_existing_file() {
+        let root = std::env::temp_dir()
+            .join("opencode")
+            .join(format!("context-publication-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..30 {
+            let path = root.join(format!("{index}.json"));
+            super::atomic_write(&path, b"initial", false, false).unwrap();
+            assert!(super::atomic_write(&path, b"forbidden", false, false).is_err());
+            assert_eq!(fs::read(&path).unwrap(), b"initial");
+            super::atomic_write(&path, b"replacement", true, false).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        }
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 30);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacement_retries_transient_sharing_errors_and_preserves_final_failure() {
+        use std::{
+            io,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        let attempts = AtomicUsize::new(0);
+        let pauses = AtomicUsize::new(0);
+        super::replace_with_retry(
+            || {
+                if attempts.fetch_add(1, Ordering::SeqCst) < 3 {
+                    Err(io::Error::from_raw_os_error(5))
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                pauses.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        assert_eq!(pauses.load(Ordering::SeqCst), 3);
+
+        let attempts = AtomicUsize::new(0);
+        let error = super::replace_with_retry(
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::from_raw_os_error(5))
+            },
+            || {},
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(attempts.load(Ordering::SeqCst), 41);
+    }
 
     #[test]
     fn credential_adapter_preserves_existing_reference_resolution() {
