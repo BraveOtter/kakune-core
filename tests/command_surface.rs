@@ -185,11 +185,9 @@ fn cli_help_inventory_matches_requirements_and_compatibility_review() {
             "init",
             "version",
             "daemon",
-            "storage",
             "service",
             "doctor",
             "context",
-            "auth",
             "workflow",
             "execution",
             "trigger",
@@ -197,9 +195,6 @@ fn cli_help_inventory_matches_requirements_and_compatibility_review() {
             "provider",
             "secret",
             "mcp",
-            "run",
-            "executions",
-            "inspect",
         ],
     );
     assert!(
@@ -233,24 +228,19 @@ fn cli_help_inventory_matches_requirements_and_compatibility_review() {
         (&["trigger"][..], &["list", "inspect"][..]),
         (
             &["provider"][..],
-            &[
-                "add", "list", "auth", "test", "models", "upsert", "status", "remove", "login",
-            ][..],
+            &["add", "list", "auth", "test", "models"][..],
         ),
         (
             &["mcp"][..],
-            &["add", "list", "inspect", "auth", "tool", "call"][..],
+            &["add", "list", "inspect", "auth", "tool"][..],
         ),
         (&["mcp", "tool"][..], &["list", "call"][..]),
         (&["secret"][..], &["set", "list", "remove"][..]),
-        (&["auth"][..], &["recover", "pair", "tokens", "revoke"][..]),
-        (
-            &["storage"][..],
-            &["backup", "restore", "retain", "compact", "pin"][..],
-        ),
         (
             &["plugin"][..],
-            &["prepare", "commit", "list", "remove"][..],
+            &[
+                "create", "inspect", "install", "list", "update", "remove", "doctor", "test",
+            ][..],
         ),
     ] {
         let help = assert_help_inventory(&fixture, parent, expected);
@@ -333,67 +323,6 @@ fn cli_help_inventory_matches_requirements_and_compatibility_review() {
             "both documented version forms must remain equivalent"
         );
     }
-
-    let review = include_str!("../specs/003-complete-command-surface/command-review.md");
-    let expected_extras = [
-        "run",
-        "executions",
-        "inspect",
-        "provider upsert",
-        "provider login",
-        "provider status",
-        "provider remove",
-        "mcp call",
-        "auth recover",
-        "auth pair",
-        "auth tokens",
-        "auth revoke",
-        "storage backup",
-        "storage restore",
-        "storage retain",
-        "storage compact",
-        "storage pin",
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    let mut in_extra_ledger = false;
-    let mut ledger_extras = BTreeSet::new();
-    for line in review.lines() {
-        if line.starts_with("| Extra / disposition |") {
-            in_extra_ledger = true;
-            continue;
-        }
-        if in_extra_ledger && line.starts_with("| ---") {
-            continue;
-        }
-        if !in_extra_ledger || !line.starts_with("| `") {
-            continue;
-        }
-        let entry = line
-            .split('|')
-            .nth(1)
-            .and_then(|cell| cell.split('`').nth(1))
-            .expect("each extra ledger row should name its invocation");
-        let status_cell = line.split('|').nth(1).unwrap_or_default();
-        assert!(
-            status_cell.contains("candidate") || status_cell.contains("retain"),
-            "every extra needs a retain or candidate disposition: {line}"
-        );
-        assert!(
-            !status_cell.to_ascii_lowercase().contains("deprecat")
-                && !status_cell.to_ascii_lowercase().contains("removed"),
-            "no extra may be newly deprecated or removed: {line}"
-        );
-        assert!(
-            line.contains('→'),
-            "each extra needs a migration example: {line}"
-        );
-        ledger_extras.insert(entry);
-    }
-    assert_eq!(ledger_extras, expected_extras);
-    assert!(review.contains("Spec 001 owns init/version"));
-    assert!(review.contains("Spec 002 owns daemon lifecycle"));
-    assert!(review.contains("Plugin behavior is preserved and not reimplemented"));
 }
 
 fn assert_human_output(output: &Output, expected: &str) {
@@ -471,7 +400,7 @@ async fn canonical_provider_mcp_and_secret_commands_support_human_and_json_outpu
         auth: ProviderAuth::ApiKeySecret {
             secret_ref: "provider-key".into(),
         },
-        config: serde_json::json!({}),
+        config: serde_json::json!({"baseUrl": "http://invalid.test"}),
     };
     let human_provider_file = fixture.path("human provider.json");
     fs::write(
@@ -557,7 +486,8 @@ async fn canonical_provider_mcp_and_secret_commands_support_human_and_json_outpu
         &env,
     )
     .unwrap();
-    assert_human_output(&human_test, "Connectivity");
+    assert!(!human_test.status.success());
+    assert!(String::from_utf8_lossy(&human_test.stdout).contains("Connectivity"));
     assert!(!String::from_utf8_lossy(&human_test.stdout).contains("provider-canary"));
     let json_test = run(
         &fixture,
@@ -572,10 +502,8 @@ async fn canonical_provider_mcp_and_secret_commands_support_human_and_json_outpu
         &env,
     )
     .unwrap();
-    assert_eq!(
-        assert_json_output(&json_test)["connectivity"]["status"],
-        "unknown"
-    );
+    assert_eq!(json(&json_test.stdout)["connectivity"]["status"], "failed");
+    assert!(!json_test.status.success());
 
     for as_json in [false, true] {
         let mut args = vec![
@@ -914,7 +842,7 @@ async fn canonical_provider_mcp_and_secret_commands_support_human_and_json_outpu
 }
 
 #[test]
-fn cli_help_explains_canonical_routing_legacy_differences_and_secret_inputs() {
+fn cli_help_explains_canonical_routing_and_secret_inputs() {
     let fixture = ManagementFixture::new().expect("isolated fixture should be created");
     let (root_help, _) = help_commands(&fixture, &[]);
     assert!(root_help.contains("no implicit fallback"));
@@ -945,10 +873,9 @@ fn cli_help_explains_canonical_routing_legacy_differences_and_secret_inputs() {
         "create-only",
         "MiniMax",
         "unsupported",
-        "upsert",
         "--cursor",
         "human-readable by default",
-        "any canonical provider command",
+        "any provider command",
     ] {
         assert!(
             provider_help.contains(detail),
@@ -961,10 +888,9 @@ fn cli_help_explains_canonical_routing_legacy_differences_and_secret_inputs() {
         "selected Core",
         "--input",
         "--secret",
-        "mcp call <file>",
         "stdio and HTTP",
         "human-readable by default",
-        "any canonical named MCP command",
+        "any named MCP command",
     ] {
         assert!(
             mcp_help.contains(detail),
@@ -987,29 +913,14 @@ fn cli_help_explains_canonical_routing_legacy_differences_and_secret_inputs() {
         );
     }
 
-    let (legacy_run_help, _) = help_commands(&fixture, &["run"]);
-    for detail in ["Legacy extra", "workflow run", "registers/updates", "TSV"] {
-        assert!(
-            legacy_run_help.contains(detail),
-            "legacy run help omitted {detail}:\n{legacy_run_help}"
-        );
-    }
-
-    let (legacy_executions_help, _) = help_commands(&fixture, &["executions"]);
-    assert!(legacy_executions_help.contains("defaults to the local Store"));
-    assert!(legacy_executions_help.contains("execution list"));
     assert!(
         !root_help.to_ascii_lowercase().contains("deprecated")
             && !context_help.to_ascii_lowercase().contains("deprecated")
             && !workflow_help.to_ascii_lowercase().contains("deprecated")
             && !provider_help.to_ascii_lowercase().contains("deprecated")
             && !mcp_help.to_ascii_lowercase().contains("deprecated")
-            && !secret_help.to_ascii_lowercase().contains("deprecated")
-            && !legacy_run_help.to_ascii_lowercase().contains("deprecated")
-            && !legacy_executions_help
-                .to_ascii_lowercase()
-                .contains("deprecated"),
-        "help must preserve extras without newly deprecating them"
+            && !secret_help.to_ascii_lowercase().contains("deprecated"),
+        "canonical help must not mark commands as deprecated"
     );
 }
 
@@ -1285,7 +1196,7 @@ async fn provider_and_mcp_auth_cli_use_secret_references_and_reject_unsafe_input
             auth: ProviderAuth::ApiKeySecret {
                 secret_ref: "provider-key".into(),
             },
-            config: serde_json::json!({}),
+            config: serde_json::json!({"baseUrl": "http://invalid.test"}),
         })
         .unwrap();
     store
@@ -1347,10 +1258,10 @@ async fn provider_and_mcp_auth_cli_use_secret_references_and_reject_unsafe_input
         &[("KAKUNE_TOKEN", &core.token)],
     )
     .unwrap();
-    assert_eq!(provider_test.status.code(), Some(0));
+    assert!(!provider_test.status.success());
     let report = json(&provider_test.stdout);
     assert_eq!(report["authentication"]["status"], "unknown");
-    assert_eq!(report["connectivity"]["status"], "unknown");
+    assert_eq!(report["connectivity"]["status"], "failed");
     assert_eq!(report["capabilities"][0]["status"], "unsupported");
     assert!(
         !provider_test

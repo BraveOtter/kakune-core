@@ -159,10 +159,10 @@ Follow `.specify/memory/constitution.md`, the sole authoritative and ratified pr
 
 ## Local execution
 
-`run` calls the Core API by default, even with `--data-dir`. For direct local execution, use `--standalone` and an isolated data directory to avoid touching normal user data:
+`workflow run <workflow>` calls the selected Core by default; `--data-dir` does not change that routing. For direct local execution, pass `--standalone` and an isolated data directory so normal user data is not touched:
 
 ```text
-cargo run -- --standalone run examples/write-note.kakune.yaml --data-dir <isolated-directory>
+cargo run -- --standalone workflow run --file examples/write-note.kakune.yaml --data-dir <isolated-directory>
 ```
 
 ## After completing any task

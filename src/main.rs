@@ -14,16 +14,15 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(windows)]
 mod windows_service_host;
 use kakune_core::{
-    AuthPairingState, AuthScope, ConnectionContext, ContextFile, CoreConfig, PluginRegistry,
-    ProviderAuth, ProviderProfile, ProviderProfileDiagnostic, ProviderProfileStatus,
-    ProviderProfileUpsert, ProviderType, RetentionPolicy, Store, analyze_workflow_with_plugins,
-    api,
+    ConnectionContext, ContextFile, CoreConfig, PluginRegistry, ProviderAuth, ProviderProfile,
+    ProviderProfileStatus, ProviderProfileUpsert, ProviderType, Store,
+    analyze_workflow_with_plugins,
     client_config::ContextRepository,
     client_config::SystemCredentialAccess,
     default_contexts_path, default_data_dir,
     initialization::{
-        ComponentState, CredentialAccess, CredentialAccessError, InitializationCorrection,
-        InitializationError, InitializationPaths, InitializationReport, initialize,
+        ComponentState, CredentialAccess, CredentialAccessError, InitializationError,
+        InitializationPaths, InitializationReport, initialize,
     },
     lifecycle::{
         Deadline, SystemMonotonicClock,
@@ -34,9 +33,7 @@ use kakune_core::{
             ServiceOperationResult,
         },
     },
-    load_installed_plugin_registry,
-    plugin_install::{self, PluginSource},
-    run_workflow_with_plugins,
+    plugin_install::PluginSource,
 };
 
 #[derive(Debug, Parser)]
@@ -72,7 +69,7 @@ struct Cli {
 enum Command {
     /// Safely prepares or checks the selected local installation.
     #[command(
-        long_about = "Local-only: does not accept --context and never starts the Core or contacts remote endpoints.\n--standalone and --ca are compatibility no-ops.\nSafe to repeat: preserves existing data, configuration, credential history, and custom connection metadata; does not rotate access.\nLost access requires explicit `kakune auth recover`."
+        long_about = "Local-only: does not accept --context and never starts the Core or contacts remote endpoints.\n--standalone and --ca are compatibility no-ops.\nSafe to repeat: preserves existing data, configuration, credential history, and custom connection metadata; does not rotate access. Repeating initialization cannot recover lost client access."
     )]
     Init {
         #[arg(long)]
@@ -90,14 +87,6 @@ enum Command {
         long_about = "Runs the Core in the foreground or manages one current-user background daemon. `daemon stop` never controls a foreground Core or the machine-wide system service; use `service` for OS-managed system scope. Status is read-only and does not load configuration or credentials. Startup readiness and Core graceful shutdown each have a 30-second application-controlled budget; ownership-lock acquisition is bounded to 10 seconds. A stop timeout is failure with retained ownership, never a forced-stop success. Performance targets are measured, not per-call deadlines."
     )]
     Daemon(DaemonArgs),
-    /// Backs up, restores, retains, and compacts Core data.
-    #[command(
-        long_about = "Local-only storage maintenance; selecting a remote context does not redirect these operations. The legacy `backup`, `restore`, `retain`, `compact`, and `pin` commands remain distinct from workflow import/export and execution observation."
-    )]
-    Storage {
-        #[command(subcommand)]
-        command: StorageCommand,
-    },
     /// Installs and operates the machine-wide native service.
     #[command(
         long_about = "Controls the local machine-wide Kakune service through Windows SCM, Linux systemd, or macOS launchd. These commands are separate from the current-user daemon commands and do not operate through remote contexts. Installation registers automatic boot but leaves the service stopped; start succeeds only after the Core is observed ready; stop confirms Core exit before uninstall removes only the registration. Data and credentials are retained.\n\nApplication-controlled phase budgets are 10 seconds for lock acquisition, status, preflight/reconciliation, helpers, and stop dispatch; 30 seconds for readiness, Core shutdown grace, install, and removal. Accumulated application-wait ceilings are 50/50/60/90 seconds for install/start/stop/uninstall. These are not wall-clock guarantees for platform calls: a timed-out native client may already have submitted work, so inspect the service journal and native manager before retrying. Two- and ten-second performance goals are measured targets, not enforced limits.\n\nMachine journal roots: Windows ProgramData\\Kakune\\lifecycle\\services; Linux /var/lib/kakune/lifecycle/services; macOS /Library/Application Support/Kakune/lifecycle/services. macOS support remains theoretical and unverified. Native service-manager acceptance has not been completed on every platform. Local daemon control proves an owner-scoped capability and checks verified ownership; loopback does not establish the TCP peer's OS account."
@@ -126,14 +115,6 @@ enum Command {
         #[command(subcommand)]
         command: ContextCommand,
     },
-    /// Recovers local API access and manages local authentication.
-    #[command(
-        long_about = "Local Core API access operations: recover, pair, list Core token metadata, and revoke a Core token. These commands remain local even when a Core context is selected; they are distinct from `provider auth`, `mcp auth`, and integration `secret` operations."
-    )]
-    Auth {
-        #[command(subcommand)]
-        command: AuthCommand,
-    },
     /// Authors workflow files and manages stored workflows through a selected Core.
     #[command(
         long_about = "Workflow create and `validate|plan --file` are local. Stored workflow import/export/list/run/enable/disable use the selected Core by default; an explicit `--context` selects another Core and never falls back. Use `--json` for machine-readable outcomes and `--limit`/`--cursor` for one-page lists. File destinations require `--output` where shown; existing files require explicit `--replace`. Invalid arguments exit 2; validation, authorization, and operation failures exit 1. `--data-dir` does not imply standalone execution."
@@ -158,14 +139,17 @@ enum Command {
         #[command(subcommand)]
         command: TriggerCommand,
     },
-    /// Installs, lists, or removes explicitly trusted local process plugins.
+    /// Creates and manages Kakune process plugins through the selected Core.
+    #[command(
+        long_about = "Plugin authoring (`plugin create <name>`) and inspection of a local package path run locally. A name `my-plugin` creates `./my-plugin`, identity `local.my-plugin`, and node type `local.my-plugin.hello@1`; the destination is never overwritten. Installed-plugin operations use the selected Core and require administrator authorization for mutations. Install/update reviews the exact package digest and requested capabilities, then requires typing that digest or passing `--approve-digest`. Local package paths are only sent to a loopback Core; remote Cores require `git:` or `npm:` sources. Inspect, doctor, and test never execute package code; runtime handshake/conformance remains unverified."
+    )]
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
     },
     /// Manages supported provider profiles and authentication.
     #[command(
-        long_about = "Canonical `add`, `list`, `auth`, `test`, and `models` use the selected Core. Output is human-readable by default; pass `--json` to any canonical provider command for machine-readable output. Add is create-only; it does not replace a profile. MiniMax accepts hidden terminal input or explicit `auth --stdin`; Codex uses its supported browser flow. Model discovery is unsupported by the current providers and is reported as such, separately from configured/static model information. Lists support `--limit`/`--cursor`. The legacy `upsert`, `status`, `remove`, and `login` commands remain separate with their existing routing, output, and side effects; see README migration guidance."
+        long_about = "`add`, `list`, `auth`, `test`, and `models` use the selected Core. Output is human-readable by default; pass `--json` to any provider command for machine-readable output. Add is create-only; it does not replace a profile. MiniMax accepts hidden terminal input or explicit `auth --stdin`; Codex uses its supported browser flow. Model discovery is unsupported by the current providers and is reported as such, separately from configured/static model information. Lists support `--limit`/`--cursor`."
     )]
     Provider {
         #[command(subcommand)]
@@ -181,37 +165,11 @@ enum Command {
     },
     /// Manages named MCP connections and invokes tools without an AI workflow.
     #[command(
-        long_about = "Canonical named `add`, `list`, `inspect`, `auth`, and `tool list|call` operations use the selected Core. Output is human-readable by default; pass `--json` to any canonical named MCP command for machine-readable output. Tool calls take strict JSON from `--input`, validate the discovered schema before invoking one named tool, and return bounded results. `mcp auth --secret` binds an existing secret reference; it does not accept a value or stdin. The legacy one-shot `mcp call <file>` remains distinct and retains its file-driven routing and response contract. Current transports are the existing stdio and HTTP transports; unsupported authentication is reported explicitly."
+        long_about = "Named `add`, `list`, `inspect`, `auth`, and `tool list|call` operations use the selected Core. Output is human-readable by default; pass `--json` to any named MCP command for machine-readable output. Tool calls take strict JSON from `--input`, validate the discovered schema before invoking one named tool, and return bounded results. `mcp auth --secret` binds an existing secret reference; it does not accept a value or stdin. Current transports are the existing stdio and HTTP transports; unsupported authentication is reported explicitly."
     )]
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
-    },
-    /// Runs a workflow YAML file once and prints its execution record.
-    #[command(
-        long_about = "Legacy extra; retained separately from `workflow run`. This file-driven entry point keeps its legacy TSV local-standalone output and JSON selected-Core response. Legacy execution registers/updates the definition as enabled before submitting it; canonical import creates disabled and canonical manual run does not change eligibility. `--data-dir` alone is not standalone; pass global `--standalone` for direct local execution. See README for an explicit migration example and side-effect differences."
-    )]
-    Run {
-        workflow: PathBuf,
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-    },
-    /// Lists persisted execution summaries.
-    #[command(
-        long_about = "Legacy extra; retained separately from `execution list`. It defaults to the local Store and prints its four-column TSV; explicit context uses the legacy JSON response. Canonical `execution list` targets the selected Core and has bounded pagination and typed output. `--data-dir` on this legacy command continues to select the local installation when no remote context is requested."
-    )]
-    Executions {
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-    },
-    /// Inspects a persisted execution and its node runs.
-    #[command(
-        long_about = "Legacy extra; retained separately from `execution inspect`. It defaults to local storage and prints the legacy TSV summary/node rows; explicit context returns the legacy JSON shape. Canonical inspection targets the selected Core and exposes bounded details and availability states. Migration changes both the default target and output schema."
-    )]
-    Inspect {
-        execution_id: String,
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
     },
 }
 
@@ -226,7 +184,6 @@ fn dispatch_category(command: &Command) -> DispatchCategory {
     match command {
         Command::Init { .. }
         | Command::Daemon(_)
-        | Command::Storage { .. }
         | Command::Service { .. }
         | Command::Doctor { .. }
         | Command::Context { .. } => DispatchCategory::CanonicalLocal,
@@ -238,39 +195,70 @@ fn dispatch_category(command: &Command) -> DispatchCategory {
             _ => DispatchCategory::CanonicalCore,
         },
         Command::Execution { .. } | Command::Trigger { .. } => DispatchCategory::CanonicalCore,
-        Command::Provider {
-            command:
-                ProviderCommand::Add { .. }
-                | ProviderCommand::List { .. }
-                | ProviderCommand::Auth { .. }
-                | ProviderCommand::Test { .. }
-                | ProviderCommand::Models { .. },
-        }
-        | Command::Mcp {
-            command:
-                McpCommand::Add { .. }
-                | McpCommand::List { .. }
-                | McpCommand::Inspect { .. }
-                | McpCommand::Auth { .. }
-                | McpCommand::Tool { .. },
-        } => DispatchCategory::CanonicalCore,
-        Command::Provider { .. } | Command::Mcp { .. } => DispatchCategory::Legacy,
+        Command::Provider { .. } | Command::Mcp { .. } => DispatchCategory::CanonicalCore,
         Command::Secret { .. } => DispatchCategory::CanonicalCore,
+        Command::Plugin { command } => match command {
+            PluginCommand::Create { .. } => DispatchCategory::CanonicalLocal,
+            PluginCommand::Inspect { plugin, .. }
+            | PluginCommand::Doctor { plugin, .. }
+            | PluginCommand::Test { plugin, .. }
+                if Path::new(plugin).exists() =>
+            {
+                DispatchCategory::CanonicalLocal
+            }
+            PluginCommand::List {
+                data_dir: Some(_), ..
+            } => DispatchCategory::CanonicalLocal,
+            _ => DispatchCategory::CanonicalCore,
+        },
         _ => DispatchCategory::Legacy,
     }
 }
 
 fn validate_dispatch_arguments(cli: &Cli) -> Result<(), String> {
-    if cli.context.is_some() && dispatch_category(&cli.command) == DispatchCategory::CanonicalLocal
+    if cli.standalone
+        && matches!(
+            &cli.command,
+            Command::Plugin {
+                command: PluginCommand::Install { .. }
+                    | PluginCommand::List { .. }
+                    | PluginCommand::Update { .. }
+                    | PluginCommand::Remove { .. }
+                    | PluginCommand::Inspect { .. }
+                    | PluginCommand::Doctor { .. }
+                    | PluginCommand::Test { .. }
+            }
+        )
+        && dispatch_category(&cli.command) == DispatchCategory::CanonicalCore
     {
+        return Err(
+            "installed-plugin operations require the selected Core; omit --standalone".to_owned(),
+        );
+    }
+    let plugin_list_has_local_data_dir = matches!(
+        &cli.command,
+        Command::Plugin {
+            command: PluginCommand::List {
+                data_dir: Some(_),
+                ..
+            }
+        }
+    );
+    let context_targets_local_command = cli.context.is_some()
+        && (dispatch_category(&cli.command) == DispatchCategory::CanonicalLocal
+            || (cli.standalone
+                && matches!(
+                    &cli.command,
+                    Command::Workflow {
+                        command: WorkflowCommand::Run { .. }
+                    }
+                )));
+    if context_targets_local_command && !plugin_list_has_local_data_dir {
         let message = match &cli.command {
             Command::Init { .. } => "init is local-only and does not accept --context",
             Command::Daemon(_) => "daemon lifecycle commands are local and do not accept --context",
             Command::Service { .. } => {
                 "service lifecycle commands are local and do not accept --context"
-            }
-            Command::Storage { .. } => {
-                "this command operates on the local installation; omit --context"
             }
             _ => "local-only commands do not accept --context",
         };
@@ -303,9 +291,6 @@ fn validate_dispatch_arguments(cli: &Cli) -> Result<(), String> {
                 }
                 if file.is_some() && !cli.standalone {
                     return Err("local workflow files require --standalone for run".to_owned());
-                }
-                if file.is_none() && cli.standalone {
-                    return Err("--standalone requires workflow run --file".to_owned());
                 }
                 if timeout_seconds.is_some_and(|seconds| !(1..=3_600).contains(&seconds)) {
                     return Err("--timeout-seconds must be from 1 to 3,600".to_owned());
@@ -417,45 +402,6 @@ enum DaemonAction {
 }
 
 #[derive(Debug, Subcommand)]
-enum StorageCommand {
-    /// Creates a consistent .tar.gz backup without machine-bound secrets.
-    Backup {
-        destination: PathBuf,
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-    },
-    /// Restores a backup into an empty, different data directory.
-    Restore {
-        source: PathBuf,
-        destination: PathBuf,
-    },
-    /// Applies retention and enforces the artifact disk limit.
-    Retain {
-        #[arg(long, default_value_t = 90)]
-        execution_days: i64,
-        #[arg(long, default_value_t = 90)]
-        event_days: i64,
-        #[arg(long, default_value_t = 5 * 1024 * 1024 * 1024)]
-        artifact_limit_bytes: u64,
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-    },
-    /// Checkpoints WAL and compacts the SQLite database.
-    Compact {
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-    },
-    /// Pins or unpins an execution so retention will preserve it.
-    Pin {
-        execution_id: String,
-        #[arg(long)]
-        value: bool,
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 enum ServiceCommand {
     /// Registers the automatic-boot service without starting it.
     #[command(
@@ -545,68 +491,57 @@ enum ContextCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum AuthCommand {
-    /// Explicitly recovers lost local access by replacing active API tokens.
-    Recover {
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
-    /// Starts a temporary QR pairing invitation and waits for local approval.
-    Pair {
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Reachable HTTPS endpoint for a remote Core; defaults to the local listener.
-        #[arg(long)]
-        endpoint: Option<String>,
-        /// Allow the paired device to administer tokens and plugins.
-        #[arg(long)]
-        admin: bool,
-        /// Invitation lifetime, from 30 to 600 seconds.
-        #[arg(long, default_value_t = 300)]
-        ttl_seconds: u64,
-    },
-    /// Lists device and API credentials without exposing token values.
-    Tokens {
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-    },
-    /// Revokes an API credential by its ID.
-    Revoke {
-        id: String,
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 enum PluginCommand {
-    /// Copies/downloads and statically inspects a plugin without executing it.
-    Prepare {
-        /// A local path, npm:<package>[@version], or git:<url>[#ref].
+    /// Creates a local SDK-compatible starter directory from a simple name.
+    Create { name: String },
+    /// Statically inspects a local package path or an installed plugin identity.
+    Inspect {
+        plugin: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Installs a supported local, Git, or npm source after exact-digest approval.
+    Install {
         source: String,
         #[arg(long)]
-        data_dir: Option<PathBuf>,
-    },
-    /// Activates exactly the staged content previously inspected by prepare.
-    Commit {
-        prepared_id: String,
+        approve_digest: Option<String>,
         #[arg(long)]
-        digest: String,
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
+        json: bool,
     },
+    /// Lists installed plugins and their lifecycle state.
     List {
         #[arg(long)]
         data_dir: Option<PathBuf>,
-    },
-    Remove {
-        id: String,
         #[arg(long)]
-        data_dir: Option<PathBuf>,
+        json: bool,
+    },
+    /// Updates an installed plugin from its saved or explicitly supplied source.
+    Update {
+        plugin: String,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        approve_digest: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Disables dependents and removes an installed plugin when no execution uses it.
+    Remove {
+        plugin: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reports static installation, compatibility, and dependency findings.
+    Doctor {
+        plugin: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Runs non-executing compatibility checks for a package or installation.
+    Test {
+        plugin: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -654,30 +589,6 @@ enum ProviderCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Creates or updates a profile from a non-secret ProviderProfileUpsert JSON file.
-    Upsert {
-        json_file: PathBuf,
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-    },
-    /// Shows the last persisted, non-secret diagnostic status for a profile.
-    Status {
-        id: String,
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-    },
-    /// Removes a profile without removing its referenced secret.
-    Remove {
-        id: String,
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-    },
-    /// Opens a browser to authorize ChatGPT Plus/Pro for a Codex profile.
-    Login {
-        id: String,
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -721,12 +632,6 @@ enum McpCommand {
     Tool {
         #[command(subcommand)]
         command: McpToolCommand,
-    },
-    /// Calls one MCP tool from a JSON configuration file using store secret references.
-    Call {
-        json_file: PathBuf,
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
     },
 }
 
@@ -958,6 +863,19 @@ enum TriggerCommand {
     },
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cli_observation_executor()
+-> Result<kakune_core::observation::IsolatedDatabaseObservationExecutor, String> {
+    let executable =
+        std::env::current_exe().map_err(|_| "cannot locate the observation helper".to_owned())?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| "cannot locate the observation helper".to_owned())?;
+    kakune_core::observation::IsolatedDatabaseObservationExecutor::new(
+        directory.join("kakune-observation-helper"),
+    )
+}
+
 fn main() -> ExitCode {
     let args = std::env::args_os().collect::<Vec<_>>();
     #[cfg(windows)]
@@ -1156,10 +1074,7 @@ async fn execute_with_credentials(
     if cli.context.is_some() && matches!(&cli.command, Command::Service { .. }) {
         return Err("service lifecycle commands are local and do not accept --context".to_string());
     }
-    if !cli.standalone
-        && !matches!(&cli.command, Command::Auth { .. })
-        && (cli.context.is_some() || matches!(&cli.command, Command::Run { .. }))
-    {
+    if !cli.standalone && cli.context.is_some() {
         return execute_remote(&cli).await;
     }
     if !cli.standalone && dispatch_category(&cli.command) == DispatchCategory::CanonicalCore {
@@ -1177,7 +1092,6 @@ async fn execute_with_credentials(
         Command::Daemon(options) => execute_daemon(options, context_file)
             .await
             .map_err(|error| redact_lifecycle_diagnostic(&error))?,
-        Command::Storage { command } => execute_storage(command)?,
         Command::Service { command } => execute_service(command).await?,
         Command::Doctor {
             data_dir,
@@ -1198,137 +1112,58 @@ async fn execute_with_credentials(
                 return Err(DOCTOR_REPORT_FAILURE.to_owned());
             }
         }
-        Command::Context { command } => execute_context(command)?,
-        Command::Auth { command } => execute_auth(command, context_file)?,
+        Command::Context { command } => execute_context(command, context_file)?,
         Command::Workflow { command } => execute_workflow_local(command, standalone)?,
         Command::Execution { .. } | Command::Trigger { .. } => {
             return Err("execution and trigger commands require the selected Core".to_owned());
         }
         Command::Plugin { command } => match command {
-            PluginCommand::Prepare { source, data_dir } => {
-                let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-                let prepared =
-                    plugin_install::prepare(&store, PluginSource::parse(&source)?).await?;
+            PluginCommand::Create { name } => {
+                let parent = std::env::current_dir()
+                    .map_err(|error| format!("cannot resolve current directory: {error}"))?;
+                let created = kakune_core::plugin_scaffold::create(&name, &parent)?;
                 println!(
-                    "{}",
-                    serde_json::to_string_pretty(&prepared.record)
-                        .map_err(|error| error.to_string())?
+                    "Created plugin scaffold at {}",
+                    created.destination.display()
                 );
+                println!("Identity: {}", created.identity);
+                println!("Node type: {}", created.node_type);
             }
-            PluginCommand::Commit {
-                prepared_id,
-                digest,
-                data_dir,
+            PluginCommand::Inspect { plugin, json }
+            | PluginCommand::Doctor { plugin, json }
+            | PluginCommand::Test { plugin, json }
+                if Path::new(&plugin).exists() =>
+            {
+                let report = kakune_core::plugin_diagnostics::inspect(Path::new(&plugin))?;
+                print_plugin_report(&report, json)?;
+                if report.has_failures() {
+                    return Err("plugin static diagnostics reported failed checks".to_owned());
+                }
+            }
+            PluginCommand::List {
+                data_dir: Some(data_dir),
+                json,
             } => {
-                let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-                let installed = plugin_install::commit(&store, &prepared_id, &digest)?;
-                println!(
-                    "Installed {} {} ({})",
-                    installed.id, installed.version, installed.digest
-                );
+                let items = kakune_core::observation::observe_plugin_catalog(&data_dir)?;
+                let page = serde_json::json!({ "items": items });
+                print_management_value(&page, json, render_plugin_list)?;
             }
-            PluginCommand::List { data_dir } => {
-                let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-                for plugin in store.list_installed_plugins()? {
-                    println!("{}\t{}\t{}", plugin.id, plugin.version, plugin.name);
-                }
-            }
-            PluginCommand::Remove { id, data_dir } => {
-                let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-                let plugin = store
-                    .remove_plugin_install(&id)?
-                    .ok_or_else(|| format!("plugin {id} is not installed"))?;
-                let manifest = PathBuf::from(plugin.manifest_path);
-                let root = store.data_dir().join("plugins");
-                let directory = manifest
-                    .parent()
-                    .ok_or_else(|| "installed plugin manifest has no parent".to_string())?;
-                if !directory.starts_with(&root) {
-                    return Err("installed plugin path is outside the plugin directory".to_string());
-                }
-                fs::remove_dir_all(directory)
-                    .map_err(|error| format!("cannot remove installed plugin: {error}"))?;
-                println!("Removed {id}");
+            PluginCommand::Inspect { .. }
+            | PluginCommand::Install { .. }
+            | PluginCommand::List { .. }
+            | PluginCommand::Update { .. }
+            | PluginCommand::Remove { .. }
+            | PluginCommand::Doctor { .. }
+            | PluginCommand::Test { .. } => {
+                return Err("installed-plugin operations require the selected Core".to_owned());
             }
         },
         Command::Provider { command } => execute_provider(command).await?,
-        Command::Mcp { command } => match command {
-            McpCommand::Call {
-                json_file,
-                data_dir,
-            } => {
-                let source = fs::read_to_string(&json_file)
-                    .map_err(|_| "cannot read MCP call JSON file".to_string())?;
-                let request: api::McpCallRequest = serde_json::from_str(&source)
-                    .map_err(|_| "invalid MCP call JSON".to_string())?;
-                let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-                let response = api::call_mcp(&store, request)
-                    .await
-                    .map_err(|_| "MCP call could not be completed".to_string())?;
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&response)
-                        .map_err(|_| "cannot encode MCP call response".to_string())?
-                );
-            }
-            _ => return Err("named MCP commands require the selected Core".to_owned()),
-        },
+        Command::Mcp { .. } => {
+            return Err("named MCP commands require the selected Core".to_owned());
+        }
         Command::Secret { .. } => {
             return Err("secret commands require the selected Core".to_owned());
-        }
-        Command::Run { workflow, data_dir } => {
-            let source = std::fs::read_to_string(&workflow)
-                .map_err(|error| format!("cannot read {}: {error}", workflow.display()))?;
-            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-            let plugins = load_installed_plugin_registry(&store)?;
-            let analysis = analyze_workflow_with_plugins(&source, &plugins);
-            if !analysis.is_valid() {
-                return Err(analysis
-                    .diagnostics
-                    .into_iter()
-                    .map(|diagnostic| diagnostic.message)
-                    .collect::<Vec<_>>()
-                    .join("; "));
-            }
-            let document = analysis
-                .workflow
-                .expect("a diagnostic-free analysis has a workflow");
-            store.upsert_workflow(&document, &source, "enabled")?;
-            let execution = run_workflow_with_plugins(&store, &document, &plugins)?;
-            println!(
-                "{}\t{}\t{}",
-                execution.id, execution.workflow_name, execution.status
-            );
-        }
-        Command::Executions { data_dir } => {
-            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-            for execution in store.list_executions()? {
-                println!(
-                    "{}\t{}\t{}\t{}",
-                    execution.id, execution.workflow_name, execution.status, execution.created_at
-                );
-            }
-        }
-        Command::Inspect {
-            execution_id,
-            data_dir,
-        } => {
-            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-            let execution = store
-                .get_execution(&execution_id)?
-                .ok_or_else(|| format!("execution {execution_id} was not found"))?;
-            println!(
-                "{}\t{}\t{}",
-                execution.id, execution.workflow_name, execution.status
-            );
-            for node in store.list_node_runs(&execution_id)? {
-                println!(
-                    "{}\t{}\t{}",
-                    node.node_id,
-                    node.status,
-                    node.message.unwrap_or_default()
-                );
-            }
         }
     }
     Ok(())
@@ -1430,12 +1265,16 @@ fn execute_workflow_local(command: WorkflowCommand, standalone: bool) -> Result<
             Ok(())
         }
         WorkflowCommand::Run {
-            file: Some(file),
+            workflow,
+            file,
             timeout_seconds,
             data_dir,
             json,
             ..
         } if standalone => {
+            let file = file
+                .or_else(|| workflow.map(PathBuf::from))
+                .ok_or_else(|| "standalone workflow run requires a workflow path".to_owned())?;
             let source = read_workflow_source(&file)?;
             let analysis = analyze_workflow_with_plugins(&source, &PluginRegistry::default());
             if !analysis.is_valid() {
@@ -1782,7 +1621,7 @@ fn run_initialization_with(
 
 fn render_init_error(error: InitializationError) -> String {
     let report = &error.report;
-    let mut message = format!(
+    format!(
         "initialization incomplete: {} for {}; {}\nData directory: {} ({})\nConfiguration: {} ({})\nStorage: {}\nInstallation identity: {}\nClient access: {}\nConnection file: {} ({})",
         error.category,
         error.resource,
@@ -1796,16 +1635,7 @@ fn render_init_error(error: InitializationError) -> String {
         component_state_name(report.client_access),
         report.paths.context_file.display(),
         component_state_name(report.local_context),
-    );
-    if error.correction == InitializationCorrection::RunExplicitAuthRecovery {
-        message.push_str(&format!(
-            "\nRun explicit recovery for these local paths: kakune --context-file \"{}\" auth recover --data-dir \"{}\" --config \"{}\"",
-            report.paths.context_file.display(),
-            report.paths.data_dir.display(),
-            report.paths.config_file.display(),
-        ));
-    }
-    message
+    )
 }
 
 fn render_init_report(report: &InitializationReport) -> String {
@@ -2259,57 +2089,42 @@ async fn serve_system_service_with_host(
     serve_core(options, false, true, shutdown, state_reporter).await
 }
 
-fn execute_storage(command: StorageCommand) -> Result<(), String> {
-    match command {
-        StorageCommand::Backup {
-            destination,
-            data_dir,
-        } => {
-            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-            print_json(&store.backup_to(&destination)?)?;
-        }
-        StorageCommand::Restore {
-            source,
-            destination,
-        } => print_json(&Store::restore_backup(&source, &destination)?)?,
-        StorageCommand::Retain {
-            execution_days,
-            event_days,
-            artifact_limit_bytes,
-            data_dir,
-        } => {
-            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-            print_json(&store.apply_retention(&RetentionPolicy {
-                execution_days,
-                event_days,
-                artifact_limit_bytes,
-            })?)?;
-        }
-        StorageCommand::Compact { data_dir } => {
-            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-            store.compact()?;
-            println!("SQLite compacted");
-        }
-        StorageCommand::Pin {
-            execution_id,
-            value,
-            data_dir,
-        } => {
-            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-            if !store.set_execution_pinned(&execution_id, value)? {
-                return Err(format!("execution {execution_id} was not found"));
-            }
-            println!("execution {execution_id} pinned={value}");
-        }
-    }
-    Ok(())
-}
-
 fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
     println!(
         "{}",
         serde_json::to_string_pretty(value).map_err(|error| error.to_string())?
     );
+    Ok(())
+}
+
+fn print_plugin_report(
+    report: &kakune_core::plugin_diagnostics::PluginDiagnosticReport,
+    json: bool,
+) -> Result<(), String> {
+    if json {
+        return print_json(report);
+    }
+    println!("Plugin: {} ({})", report.name, report.identity);
+    println!("Version: {}", report.version);
+    println!("Content digest: {}", report.content_digest);
+    println!("Declared nodes: {}", report.declared_nodes.join(", "));
+    println!("Declared triggers: {}", report.declared_triggers.join(", "));
+    println!(
+        "Declared providers: {}",
+        report.declared_providers.join(", ")
+    );
+    println!("Declared services: {}", report.declared_services.join(", "));
+    println!("Runtime support: {}", report.runtime_support.join(", "));
+    println!("Runtime conformance: {}", report.runtime_conformance);
+    println!("Manifest:");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report.manifest).map_err(|error| error.to_string())?
+    );
+    println!("Checks:");
+    for check in &report.checks {
+        println!("  {:?}: {} — {}", check.status, check.name, check.message);
+    }
     Ok(())
 }
 
@@ -2326,70 +2141,6 @@ async fn execute_provider(command: ProviderCommand) -> Result<(), String> {
         | ProviderCommand::Test { .. }
         | ProviderCommand::Models { .. } => {
             return Err("provider administration commands require the selected Core".to_owned());
-        }
-        ProviderCommand::Upsert {
-            json_file,
-            data_dir,
-        } => {
-            let source = fs::read_to_string(&json_file)
-                .map_err(|error| format!("cannot read {}: {error}", json_file.display()))?;
-            let profile: ProviderProfileUpsert = serde_json::from_str(&source)
-                .map_err(|error| format!("invalid provider profile JSON: {error}"))?;
-            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-            let profile = store.upsert_provider_profile(profile)?;
-            print_provider_summary(&profile);
-        }
-        ProviderCommand::Status { id, data_dir } => {
-            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-            let profile = store
-                .get_provider_profile(&id)?
-                .ok_or_else(|| format!("provider profile {id} was not found"))?;
-            println!(
-                "{}\t{}\t{}",
-                profile.id,
-                provider_status_name(&profile.diagnostic.status),
-                profile.diagnostic.checked_at.as_deref().unwrap_or("never")
-            );
-        }
-        ProviderCommand::Remove { id, data_dir } => {
-            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-            store
-                .delete_provider_profile(&id)?
-                .ok_or_else(|| format!("provider profile {id} was not found"))?;
-            println!("Removed {id}");
-        }
-        ProviderCommand::Login { id, data_dir } => {
-            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-            let profile = store
-                .get_provider_profile(&id)?
-                .ok_or_else(|| format!("provider profile {id} was not found"))?;
-            let secret_ref = match (&profile.provider_type, &profile.auth) {
-                (ProviderType::Codex, ProviderAuth::OAuthSecret { secret_ref }) => secret_ref,
-                _ => {
-                    return Err(
-                        "provider login requires a Codex profile using oauthSecret".to_string()
-                    );
-                }
-            };
-            let mut tokens = kakune_core::codex::login_with_browser()
-                .await
-                .map_err(|error| error.to_string())?;
-            let encoded = tokens.to_secret().map_err(|error| error.to_string());
-            tokens.zeroize_secrets();
-            let mut encoded = Zeroizing::new(encoded?);
-            let saved = store.set_secret(secret_ref, encoded.as_str());
-            encoded.zeroize();
-            saved?;
-            store.diagnose_provider_profile(
-                &profile.id,
-                ProviderProfileDiagnostic {
-                    status: ProviderProfileStatus::Available,
-                    checked_at: None,
-                    message: Some("ChatGPT OAuth login completed".to_string()),
-                    details: Some(serde_json::json!({"check":"chatgptOAuth","available":true})),
-                },
-            )?;
-            println!("ChatGPT OAuth login completed for profile {}", profile.id);
         }
     }
     Ok(())
@@ -2910,9 +2661,18 @@ fn collect_doctor_report(
     );
 
     let database = if doctor_remaining(started) >= Duration::from_secs(5) {
-        Some(kakune_core::observation::observe_database(
-            data_dir.join("kakune.sqlite3"),
-        ))
+        let path = data_dir.join("kakune.sqlite3");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let observed = {
+            use kakune_core::observation::DatabaseObservationExecutor;
+            match cli_observation_executor() {
+                Ok(executor) => executor.observe_database(&path),
+                Err(_) => kakune_core::observation::observe_database(&path),
+            }
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let observed = kakune_core::observation::observe_database(&path);
+        Some(observed)
     } else {
         None
     };
@@ -3267,7 +3027,10 @@ fn render_doctor_report(report: &kakune_core::observation::DoctorReport) {
     println!("exitCode\t{}", report.exit_code);
 }
 
-fn execute_context(command: ContextCommand) -> Result<(), String> {
+fn execute_context(
+    command: ContextCommand,
+    global_context_file: Option<PathBuf>,
+) -> Result<(), String> {
     match command {
         ContextCommand::Add {
             name,
@@ -3278,7 +3041,7 @@ fn execute_context(command: ContextCommand) -> Result<(), String> {
             credential_ref,
             contexts_file,
         } => {
-            let path = contexts_path(contexts_file);
+            let path = contexts_path(contexts_file.or(global_context_file));
             ContextRepository::new(path).add(ConnectionContext {
                 id: name.clone(),
                 name: display_name.unwrap_or(name.clone()),
@@ -3290,7 +3053,8 @@ fn execute_context(command: ContextCommand) -> Result<(), String> {
             println!("Added context {name}; select it with `context use {name}`.");
         }
         ContextCommand::List { contexts_file } => {
-            let contexts = ContextFile::load(&contexts_path(contexts_file))?;
+            let contexts =
+                ContextFile::load(&contexts_path(contexts_file.or(global_context_file)))?;
             for context in contexts.contexts {
                 let marker = if contexts.active_context_id.as_deref() == Some(&context.id) {
                     "*"
@@ -3304,11 +3068,13 @@ fn execute_context(command: ContextCommand) -> Result<(), String> {
             }
         }
         ContextCommand::Use { id, contexts_file } => {
-            ContextRepository::new(contexts_path(contexts_file)).use_context(&id)?;
+            ContextRepository::new(contexts_path(contexts_file.or(global_context_file)))
+                .use_context(&id)?;
             println!("Selected context {id}.");
         }
         ContextCommand::Inspect { id, contexts_file } => {
-            let contexts = ContextFile::load(&contexts_path(contexts_file))?;
+            let contexts =
+                ContextFile::load(&contexts_path(contexts_file.or(global_context_file)))?;
             let context = contexts
                 .contexts
                 .iter()
@@ -3317,14 +3083,16 @@ fn execute_context(command: ContextCommand) -> Result<(), String> {
             print_json(context)?;
         }
         ContextCommand::Remove { id, contexts_file } => {
-            ContextRepository::new(contexts_path(contexts_file)).remove(&id)?;
+            ContextRepository::new(contexts_path(contexts_file.or(global_context_file)))
+                .remove(&id)?;
             println!("Removed context {id}.");
         }
         ContextCommand::Import {
             source,
             contexts_file,
         } => {
-            ContextRepository::new(contexts_path(contexts_file)).import(&source)?;
+            ContextRepository::new(contexts_path(contexts_file.or(global_context_file)))
+                .import(&source)?;
             println!("Imported contexts from {}.", source.display());
         }
         ContextCommand::Export {
@@ -3333,78 +3101,18 @@ fn execute_context(command: ContextCommand) -> Result<(), String> {
             replace,
             contexts_file,
         } => {
-            ContextRepository::new(contexts_path(contexts_file)).export(&name, &output, replace)?;
+            ContextRepository::new(contexts_path(contexts_file.or(global_context_file)))
+                .export(&name, &output, replace)?;
             println!("Exported context {name} to {}.", output.display());
         }
     }
     Ok(())
 }
 
-fn execute_auth(command: AuthCommand, context_file: Option<PathBuf>) -> Result<(), String> {
-    match command {
-        AuthCommand::Recover { data_dir, config } => {
-            let data_dir = data_dir.unwrap_or_else(default_data_dir);
-            let loaded = CoreConfig::load_or_create(&data_dir, config)?;
-            let listen = loaded.config.listen_addr()?;
-            let store = Store::open(data_dir.clone())?;
-            let contexts_file =
-                context_file.unwrap_or_else(|| default_contexts_path(data_dir.clone()));
-            recover_local_auth(&store, &contexts_file, &loaded.config.api, listen)?;
-        }
-        AuthCommand::Pair {
-            data_dir,
-            config,
-            endpoint,
-            admin,
-            ttl_seconds,
-        } => {
-            pair_local_gui(data_dir, config, endpoint, admin, ttl_seconds)?;
-        }
-        AuthCommand::Tokens { data_dir } => {
-            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-            for token in store.list_auth_tokens()? {
-                let status = if token.revoked_at.is_some() {
-                    "revoked"
-                } else {
-                    "active"
-                };
-                println!(
-                    "{}\t{}\t{}\t{}\t{}",
-                    token.id,
-                    token.name,
-                    auth_scope_names(&token.scopes),
-                    status,
-                    token.expires_at.as_deref().unwrap_or("never")
-                );
-            }
-        }
-        AuthCommand::Revoke { id, data_dir } => {
-            let store = Store::open(data_dir.unwrap_or_else(default_data_dir))?;
-            if !store.revoke_auth_token(&id)? {
-                return Err(format!("active token {id} was not found"));
-            }
-            println!("Revoked token {id}.");
-        }
-    }
-    Ok(())
-}
-
-fn auth_scope_names(scopes: &[AuthScope]) -> String {
-    scopes
-        .iter()
-        .map(|scope| match scope {
-            AuthScope::Read => "read",
-            AuthScope::Run => "run",
-            AuthScope::Manage => "manage",
-            AuthScope::Admin => "admin",
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 const CLI_KEYRING_SERVICE: &str = "dev.kakune.cli";
 const DOCTOR_REPORT_FAILURE: &str = "\0doctor-report-exit-1";
 
+#[cfg(test)]
 fn local_credential_ref(core_id: &str) -> String {
     format!("keychain:kakune/core/{core_id}")
 }
@@ -3447,209 +3155,6 @@ fn configure_local_connection_with_credentials(
     })
 }
 
-struct LocalAuthRecoveryOutcome {
-    endpoint: String,
-    fallback_token: Option<String>,
-    revoked_count: u64,
-}
-
-fn recover_local_auth(
-    store: &Store,
-    contexts_file: &Path,
-    api_config: &kakune_core::config::ApiConfig,
-    listen: SocketAddr,
-) -> Result<(), String> {
-    let outcome = recover_local_auth_with_credential_writer(
-        store,
-        contexts_file,
-        api_config,
-        listen,
-        |reference, token| match cli_credential_entry(reference) {
-            Ok(entry) => match entry.set_password(token) {
-                Ok(()) => true,
-                Err(error) => {
-                    eprintln!("Kakune could not save the recovered credential securely: {error}");
-                    false
-                }
-            },
-            Err(error) => {
-                eprintln!("Kakune could not save the recovered credential securely: {error}");
-                false
-            }
-        },
-    )?;
-
-    println!(
-        "Local API access recovered; revoked {} previous active token(s).",
-        outcome.revoked_count
-    );
-    println!("Local CLI connection configured for {}.", outcome.endpoint);
-    if let Some(token) = outcome.fallback_token {
-        println!("Recovery token (OS credential manager unavailable; set KAKUNE_TOKEN): {token}");
-    }
-    Ok(())
-}
-
-fn recover_local_auth_with_credential_writer(
-    store: &Store,
-    contexts_file: &Path,
-    api_config: &kakune_core::config::ApiConfig,
-    listen: SocketAddr,
-    write_secure: impl FnOnce(&str, &str) -> bool,
-) -> Result<LocalAuthRecoveryOutcome, String> {
-    let created = store.create_auth_token(
-        "Local recovery".to_string(),
-        vec![kakune_core::AuthScope::Admin],
-        None,
-    )?;
-    let core_id = store.core_id()?;
-    let reference = local_credential_ref(&core_id);
-    let credential_available = write_secure(&reference, &created.token);
-    save_local_context(
-        contexts_file,
-        &core_id,
-        &local_endpoint(api_config, listen),
-        credential_available.then_some(reference),
-    )?;
-    let revoked = store.revoke_other_auth_tokens(&created.record.id)?;
-    Ok(LocalAuthRecoveryOutcome {
-        endpoint: local_endpoint(api_config, listen),
-        fallback_token: (!credential_available).then_some(created.token),
-        revoked_count: revoked,
-    })
-}
-
-fn pair_local_gui(
-    data_dir: Option<PathBuf>,
-    config: Option<PathBuf>,
-    endpoint: Option<String>,
-    admin: bool,
-    ttl_seconds: u64,
-) -> Result<(), String> {
-    if !(30..=600).contains(&ttl_seconds) {
-        return Err("pairing invitation lifetime must be 30-600 seconds".to_string());
-    }
-    let data_dir = data_dir.unwrap_or_else(default_data_dir);
-    let loaded = CoreConfig::load_or_create(&data_dir, config)?;
-    let listen = loaded.config.listen_addr()?;
-    let endpoint = validate_pairing_endpoint(
-        &endpoint.unwrap_or_else(|| local_endpoint(&loaded.config.api, listen)),
-    )?;
-    let store = Store::open(data_dir)?;
-    let core_id = store.core_id()?;
-    let ttl_seconds = i64::try_from(ttl_seconds)
-        .map_err(|_| "pairing invitation lifetime is out of range".to_string())?;
-    let expires_at = (time::OffsetDateTime::now_utc() + time::Duration::seconds(ttl_seconds))
-        .format(&time::format_description::well_known::Rfc3339)
-        .map_err(|error| format!("cannot format pairing expiration: {error}"))?;
-    let code = format!("kakune_pair_{}", uuid::Uuid::new_v4().simple());
-    let scopes = if admin {
-        vec![AuthScope::Admin]
-    } else {
-        vec![AuthScope::Read, AuthScope::Run, AuthScope::Manage]
-    };
-    let payload = serde_json::to_vec(&serde_json::json!({
-        "format": "kakune-pairing/v1",
-        "endpoint": endpoint,
-        "coreId": core_id,
-        "pairingCode": code,
-        "expiresAt": expires_at,
-        "scopes": auth_scope_names(&scopes).split(',').collect::<Vec<_>>(),
-    }))
-    .map_err(|error| format!("cannot encode pairing QR payload: {error}"))?;
-    let qr = qrcode::QrCode::new(&payload)
-        .map_err(|error| format!("cannot create pairing QR code: {error}"))?;
-    let invitation = store.create_auth_pairing_code(&code, scopes.clone(), expires_at.clone())?;
-
-    println!("Scan this QR code in Kakune GUI to request a connection:");
-    println!(
-        "{}",
-        qr.render::<qrcode::render::unicode::Dense1x2>().build()
-    );
-    println!("Core: {endpoint}");
-    println!("Permissions: {}", auth_scope_names(&scopes));
-    println!("Expires: {expires_at}");
-    println!("Waiting for a device request. Confirm it here before access is granted.");
-
-    loop {
-        let status = store
-            .get_auth_pairing_status(&invitation.id)?
-            .ok_or_else(|| "pairing invitation disappeared from the Core store".to_string())?;
-        match status.state {
-            AuthPairingState::AwaitingClaim | AuthPairingState::Approved => {}
-            AuthPairingState::AwaitingApproval => {
-                let device = status
-                    .requested_device
-                    .as_deref()
-                    .unwrap_or("unnamed device");
-                print!(
-                    "Allow {device:?} to connect with [{}] permissions? [y/N] ",
-                    auth_scope_names(&scopes)
-                );
-                io::stdout()
-                    .flush()
-                    .map_err(|error| format!("cannot flush pairing prompt: {error}"))?;
-                let mut answer = String::new();
-                io::stdin()
-                    .read_line(&mut answer)
-                    .map_err(|error| format!("cannot read pairing approval: {error}"))?;
-                let approved = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
-                if !store.decide_auth_pairing(&invitation.id, approved)? {
-                    println!(
-                        "Pairing request could not be confirmed; the invitation may have expired."
-                    );
-                    return Ok(());
-                }
-                if !approved {
-                    println!("Pairing request rejected.");
-                    return Ok(());
-                }
-                println!("Approved. Waiting for the GUI to finish connecting...");
-            }
-            AuthPairingState::Rejected => {
-                println!("Pairing request rejected.");
-                return Ok(());
-            }
-            AuthPairingState::Consumed => {
-                println!(
-                    "GUI connected successfully. Manage or revoke its token with `kakune auth tokens`."
-                );
-                return Ok(());
-            }
-            AuthPairingState::Expired => {
-                println!("Pairing QR code expired without completing a connection.");
-                return Ok(());
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    }
-}
-
-fn validate_pairing_endpoint(endpoint: &str) -> Result<String, String> {
-    let url = reqwest::Url::parse(endpoint).map_err(|_| "invalid pairing endpoint URL")?;
-    if !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err("pairing endpoint must not contain credentials, a query, or a fragment".into());
-    }
-    let local = url.host_str().is_some_and(|host| {
-        host == "localhost"
-            || host
-                .trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
-    if url.scheme() != "https" && !(url.scheme() == "http" && local) {
-        return Err("pairing with a non-loopback Core requires an HTTPS endpoint".to_string());
-    }
-    if url.host_str().is_none() {
-        return Err("pairing endpoint must include a host".to_string());
-    }
-    Ok(url.as_str().trim_end_matches('/').to_string())
-}
-
 fn save_local_context(
     contexts_file: &Path,
     core_id: &str,
@@ -3680,6 +3185,7 @@ fn save_local_context(
     contexts.save(contexts_file)
 }
 
+#[cfg(test)]
 fn local_endpoint(api_config: &kakune_core::config::ApiConfig, listen: SocketAddr) -> String {
     let listen = if listen.ip().is_unspecified() {
         let loopback = if listen.is_ipv4() { "127.0.0.1" } else { "::1" };
@@ -3703,23 +3209,9 @@ fn contexts_path(explicit: Option<PathBuf>) -> PathBuf {
 }
 
 fn cli_contexts_path(cli: &Cli) -> PathBuf {
-    cli.context_file.clone().unwrap_or_else(|| {
-        let data_dir = match &cli.command {
-            Command::Run {
-                data_dir: Some(data_dir),
-                ..
-            } => data_dir.clone(),
-            Command::Workflow {
-                command:
-                    WorkflowCommand::Run {
-                        data_dir: Some(data_dir),
-                        ..
-                    },
-            } => data_dir.clone(),
-            _ => default_data_dir(),
-        };
-        default_contexts_path(data_dir)
-    })
+    cli.context_file
+        .clone()
+        .unwrap_or_else(|| default_contexts_path(default_data_dir()))
 }
 
 async fn shutdown_signal() {
@@ -3777,38 +3269,31 @@ fn notify_linux_stopping() -> Result<(), String> {
 }
 
 async fn execute_remote(cli: &Cli) -> Result<(), String> {
-    use reqwest::Method;
-    use serde_json::json;
     let contexts = ContextFile::load(&cli_contexts_path(cli))?;
-    let selected = cli.context.as_ref().or(contexts.active_context_id.as_ref());
-    let local = ConnectionContext {
-        id: "local".into(),
-        name: "Local".into(),
-        endpoint: std::env::var("KAKUNE_ENDPOINT")
-            .unwrap_or_else(|_| "http://127.0.0.1:8787".into()),
-        expected_core_id: None,
-        color: None,
-        credential_ref: None,
-    };
-    let context = if dispatch_category(&cli.command) == DispatchCategory::CanonicalCore {
-        selected_management_context(&contexts, cli.context.as_deref())?
-    } else if let Some(id) = selected {
-        contexts
-            .contexts
-            .iter()
-            .find(|context| &context.id == id)
-            .ok_or_else(|| format!("context {id} was not found"))?
-    } else {
-        &local
-    };
+    let context = selected_management_context(&contexts, cli.context.as_deref())?;
+    if let Command::Plugin { command } = &cli.command {
+        let source = match command {
+            PluginCommand::Install { source, .. } => Some(source.as_str()),
+            PluginCommand::Update {
+                source: Some(source),
+                ..
+            } => Some(source.as_str()),
+            _ => None,
+        };
+        if source.is_some_and(|source| {
+            matches!(PluginSource::parse(source), Ok(PluginSource::Local(_)))
+                && !is_loopback_core_endpoint(&context.endpoint)
+        }) {
+            return Err("local plugin paths cannot be sent to a remote Core; use a git: or npm: source, or run Kakune on the Core host".to_owned());
+        }
+    }
     let token = match &context.credential_ref {
         Some(reference) if reference.starts_with("env:") => std::env::var(&reference[4..])
             .map_err(|_| "context token environment variable is missing".to_string())?,
         Some(reference) => cli_credential_entry(reference)?
             .get_password()
             .map_err(|_| {
-                "context credential is unavailable; run `kakune auth recover` on the Core machine"
-                    .to_string()
+                "context credential is unavailable; restore access through an authorized administrative channel on the Core machine".to_string()
             })?,
         None => std::env::var("KAKUNE_TOKEN").map_err(|_| {
             "set KAKUNE_TOKEN or configure a context credential reference".to_string()
@@ -3820,166 +3305,22 @@ async fn execute_remote(cli: &Cli) -> Result<(), String> {
         .map(fs::read)
         .transpose()
         .map_err(|error| error.to_string())?;
-    if dispatch_category(&cli.command) == DispatchCategory::CanonicalCore {
-        let client =
-            kakune_core::remote::ManagementClient::connect(context, token, ca.as_deref()).await?;
-        return execute_management_command(&client, &cli.command).await;
-    }
-    let client = kakune_core::remote::RemoteClient::connect(context, token, ca.as_deref()).await?;
-    let read = |path: &Path| fs::read_to_string(path).map_err(|error| error.to_string());
-    let value = match &cli.command {
-        Command::Run { workflow, .. } => {
-            let record = client.save_workflow(&read(workflow)?).await?;
-            let id = record["id"]
-                .as_str()
-                .ok_or("Core did not return a workflow ID")?;
-            client
-                .request(
-                    Method::POST,
-                    &["executions"],
-                    Some(json!({"workflowId":id})),
-                    None,
-                )
-                .await?
-        }
-        Command::Executions { .. } => {
-            client
-                .request(Method::GET, &["executions"], None, None)
-                .await?
-        }
-        Command::Inspect { execution_id, .. } => {
-            client
-                .request(Method::GET, &["executions", execution_id], None, None)
-                .await?
-        }
-        Command::Workflow { .. } => {
-            return Err("workflow commands require the canonical management API".to_owned());
-        }
-        Command::Plugin { command } => match command {
-            PluginCommand::Prepare { source, .. } => {
-                client
-                    .request(
-                        Method::POST,
-                        &["plugins", "prepare"],
-                        Some(json!({"source":source})),
-                        None,
-                    )
-                    .await?
-            }
-            PluginCommand::Commit {
-                prepared_id,
-                digest,
-                ..
-            } => {
-                client
-                    .request(
-                        Method::POST,
-                        &["plugin-installations", prepared_id, "commit"],
-                        Some(json!({"digest":digest})),
-                        None,
-                    )
-                    .await?
-            }
-            PluginCommand::List { .. } => {
-                client
-                    .request(Method::GET, &["plugins"], None, None)
-                    .await?
-            }
-            PluginCommand::Remove { id, .. } => {
-                client
-                    .request(Method::DELETE, &["plugins", id], None, None)
-                    .await?
-            }
-        },
-        Command::Provider { command } => match command {
-            ProviderCommand::List { .. } => {
-                client
-                    .request(Method::GET, &["providers"], None, None)
-                    .await?
-            }
-            ProviderCommand::Upsert { json_file, .. } => {
-                client
-                    .request(
-                        Method::POST,
-                        &["providers"],
-                        Some(
-                            serde_json::from_str(&read(json_file)?)
-                                .map_err(|error| error.to_string())?,
-                        ),
-                        None,
-                    )
-                    .await?
-            }
-            ProviderCommand::Status { id, .. } => {
-                client
-                    .request(Method::GET, &["providers", id], None, None)
-                    .await?
-            }
-            ProviderCommand::Remove { id, .. } => {
-                client
-                    .request(Method::DELETE, &["providers", id], None, None)
-                    .await?
-            }
-            ProviderCommand::Login { id, .. } => {
-                let profile: ProviderProfile = serde_json::from_value(
-                    client
-                        .request(Method::GET, &["providers", id], None, None)
-                        .await?,
-                )
-                .map_err(|error| error.to_string())?;
-                let secret_ref = match (&profile.provider_type, &profile.auth) {
-                    (ProviderType::Codex, ProviderAuth::OAuthSecret { secret_ref }) => secret_ref,
-                    _ => {
-                        return Err(
-                            "provider login requires a Codex profile using oauthSecret".to_string()
-                        );
-                    }
-                };
-                let tokens = kakune_core::codex::login_with_browser()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                client.request(Method::POST, &["secrets"], Some(serde_json::json!({
-                        "name":secret_ref, "value":tokens.to_secret().map_err(|error| error.to_string())?
-                    })), None).await?;
-                client
-                    .request(Method::POST, &["providers", id, "diagnose"], None, None)
-                    .await?
-            }
-            ProviderCommand::Add { .. }
-            | ProviderCommand::Auth { .. }
-            | ProviderCommand::Test { .. }
-            | ProviderCommand::Models { .. } => {
-                return Err(
-                    "provider administration commands require the canonical management API"
-                        .to_owned(),
-                );
-            }
-        },
-        Command::Mcp {
-            command: McpCommand::Call { json_file, .. },
-        } => {
-            client
-                .request(
-                    Method::POST,
-                    &["mcp", "call"],
-                    Some(
-                        serde_json::from_str(&read(json_file)?)
-                            .map_err(|error| error.to_string())?,
-                    ),
-                    None,
-                )
-                .await?
-        }
-        Command::Mcp { .. } | Command::Secret { .. } => {
-            return Err("integration commands require the canonical management API".to_owned());
-        }
-        _ => {
-            return Err(
-                "this command operates on the local installation; omit --context".to_string(),
-            );
-        }
-    };
-    print_json(&value)
+    let client =
+        kakune_core::remote::ManagementClient::connect(context, token, ca.as_deref()).await?;
+    execute_management_command(&client, &cli.command).await
+}
+
+fn is_loopback_core_endpoint(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
 }
 
 async fn execute_management_command(
@@ -3990,10 +3331,231 @@ async fn execute_management_command(
         Command::Workflow { .. } => execute_management_workflow(client, command).await,
         Command::Execution { command } => execute_management_execution(client, command).await,
         Command::Trigger { command } => execute_management_trigger(client, command).await,
+        Command::Plugin { command } => execute_management_plugin(client, command).await,
         Command::Provider { command } => execute_management_provider(client, command).await,
         Command::Mcp { command } => execute_management_mcp(client, command).await,
         Command::Secret { command } => execute_management_secret(client, command).await,
         _ => Err("this command has no canonical Core management operation".to_owned()),
+    }
+}
+
+async fn execute_management_plugin(
+    client: &kakune_core::remote::ManagementClient,
+    command: &PluginCommand,
+) -> Result<(), String> {
+    use reqwest::Method;
+    match command {
+        PluginCommand::Create { .. } => Err("plugin create is local-only".to_owned()),
+        PluginCommand::Inspect { plugin, json } => {
+            let report = client
+                .request(Method::GET, &["plugins", plugin, "inspect"], None, None)
+                .await?;
+            print_management_value(&report, *json, render_plugin_report_value)
+        }
+        PluginCommand::Install {
+            source,
+            approve_digest,
+            json,
+        } => {
+            if approve_digest.is_none() && !io::stdin().is_terminal() {
+                return Err("noninteractive plugin installation requires --approve-digest <reviewed-sha256>".to_owned());
+            }
+            let prepared = client
+                .request(
+                    Method::POST,
+                    &["plugins", "prepare"],
+                    Some(serde_json::json!({"source":source})),
+                    None,
+                )
+                .await?;
+            print_plugin_review(&prepared, *json)?;
+            let digest = match approve_plugin_digest(&prepared, approve_digest.as_deref()) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    discard_plugin_review(client, &prepared).await;
+                    return Err(error);
+                }
+            };
+            let prepared_id = prepared
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("Core did not return a prepared plugin ID")?;
+            let result = client
+                .request(
+                    Method::POST,
+                    &["plugins", "commit"],
+                    Some(serde_json::json!({"preparedId":prepared_id,"digest":digest})),
+                    None,
+                )
+                .await?;
+            print_management_value(&result, *json, render_plugin_install_result)
+        }
+        PluginCommand::List { json, .. } => {
+            let page = client
+                .request(Method::GET, &["plugins"], None, None)
+                .await?;
+            print_management_value(&page, *json, render_plugin_list)
+        }
+        PluginCommand::Update {
+            plugin,
+            source,
+            approve_digest,
+            json,
+        } => {
+            if approve_digest.is_none() && !io::stdin().is_terminal() {
+                return Err(
+                    "noninteractive plugin update requires --approve-digest <reviewed-sha256>"
+                        .to_owned(),
+                );
+            }
+            let prepared = client
+                .request(
+                    Method::POST,
+                    &["plugins", plugin, "update", "prepare"],
+                    Some(serde_json::json!({"source":source})),
+                    None,
+                )
+                .await?;
+            if prepared.get("pluginId").and_then(serde_json::Value::as_str) != Some(plugin) {
+                discard_plugin_review(client, &prepared).await;
+                return Err(
+                    "update source did not resolve to the requested plugin identity".to_owned(),
+                );
+            }
+            print_plugin_review(&prepared, *json)?;
+            let digest = match approve_plugin_digest(&prepared, approve_digest.as_deref()) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    discard_plugin_review(client, &prepared).await;
+                    return Err(error);
+                }
+            };
+            let prepared_id = prepared
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("Core did not return a prepared plugin ID")?;
+            let result = client
+                .request(
+                    Method::POST,
+                    &["plugins", "commit"],
+                    Some(serde_json::json!({"preparedId":prepared_id,"digest":digest})),
+                    None,
+                )
+                .await?;
+            print_management_value(&result, *json, render_plugin_install_result)
+        }
+        PluginCommand::Remove { plugin, json } => {
+            let report = client
+                .request(reqwest::Method::DELETE, &["plugins", plugin], None, None)
+                .await?;
+            print_management_value(&report, *json, render_plugin_removal)
+        }
+        PluginCommand::Doctor { plugin, json } => {
+            let report = client
+                .request(Method::GET, &["plugins", plugin, "doctor"], None, None)
+                .await?;
+            print_management_value(&report, *json, render_plugin_report_value)?;
+            if plugin_report_has_failures(&report) {
+                return Err("plugin doctor reported failed checks".to_owned());
+            }
+            Ok(())
+        }
+        PluginCommand::Test { plugin, json } => {
+            let report = client
+                .request(Method::GET, &["plugins", plugin, "test"], None, None)
+                .await?;
+            print_management_value(&report, *json, render_plugin_report_value)?;
+            if plugin_report_has_failures(&report) {
+                return Err("plugin compatibility test reported failed checks".to_owned());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_plugin_review(review: &serde_json::Value, json: bool) -> Result<(), String> {
+    if json {
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(review).map_err(|error| error.to_string())?
+        );
+        return Ok(());
+    }
+    println!("Plugin install review");
+    println!(
+        "Identity: {} ({})",
+        review["pluginName"].as_str().unwrap_or("unknown"),
+        review["pluginId"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "Version: {}",
+        review["version"].as_str().unwrap_or("unknown")
+    );
+    println!(
+        "Content digest: {}",
+        review["digest"].as_str().unwrap_or("unknown")
+    );
+    println!("Content manifest:");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&review["review"]["manifest"])
+            .map_err(|error| error.to_string())?
+    );
+    println!("Requested capabilities:");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&review["policy"]).map_err(|error| error.to_string())?
+    );
+    println!("Review checks:");
+    if let Some(checks) = review["review"]["checks"].as_array() {
+        for check in checks {
+            println!(
+                "  {}: {}",
+                check["status"].as_str().unwrap_or("unknown"),
+                check["message"].as_str().unwrap_or("no detail")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn approve_plugin_digest(
+    review: &serde_json::Value,
+    supplied: Option<&str>,
+) -> Result<String, String> {
+    let digest = review
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Core did not return the reviewed package digest")?;
+    if let Some(supplied) = supplied {
+        if supplied != digest {
+            return Err("--approve-digest does not match the reviewed package".to_owned());
+        }
+        return Ok(digest.to_owned());
+    }
+    eprint!("Type the reviewed digest to approve activation: ");
+    io::stderr()
+        .flush()
+        .map_err(|_| "cannot display plugin approval prompt".to_owned())?;
+    let mut entered = String::new();
+    io::stdin()
+        .read_line(&mut entered)
+        .map_err(|_| "cannot read plugin approval".to_owned())?;
+    if entered.trim() != digest {
+        return Err("plugin activation was not approved for the reviewed digest".to_owned());
+    }
+    Ok(digest.to_owned())
+}
+
+async fn discard_plugin_review(
+    client: &kakune_core::remote::ManagementClient,
+    review: &serde_json::Value,
+) {
+    use reqwest::Method;
+    if let Some(id) = review.get("id").and_then(serde_json::Value::as_str) {
+        let _ = client
+            .request(Method::DELETE, &["plugins", "prepared", id], None, None)
+            .await;
     }
 }
 
@@ -4118,7 +3680,16 @@ async fn execute_management_provider(
             let report = client
                 .request(Method::POST, &["providers", id, "test"], None, None)
                 .await?;
-            print_management_value(&report, *json, render_provider_test)
+            print_management_value(&report, *json, render_provider_test)?;
+            if ["/connectivity/status", "/authentication/status"]
+                .into_iter()
+                .any(|path| {
+                    report.pointer(path).and_then(serde_json::Value::as_str) != Some("passed")
+                })
+            {
+                return Err("provider test did not verify connectivity and authentication; see diagnostic report".to_owned());
+            }
+            Ok(())
         }
         ProviderCommand::Models { id, json } => {
             let response = client
@@ -4133,12 +3704,6 @@ async fn execute_management_provider(
                 return Err("live provider model discovery is unsupported; configured models are shown above".to_owned());
             }
             Ok(())
-        }
-        ProviderCommand::Upsert { .. }
-        | ProviderCommand::Status { .. }
-        | ProviderCommand::Remove { .. }
-        | ProviderCommand::Login { .. } => {
-            Err("legacy provider commands retain their legacy routing".to_owned())
         }
     }
 }
@@ -4273,7 +3838,6 @@ async fn execute_management_mcp(
                 print_management_value(&result, *json, render_mcp_tool_result)
             }
         },
-        McpCommand::Call { .. } => Err("legacy mcp call retains its legacy routing".to_owned()),
     }
 }
 
@@ -4341,6 +3905,113 @@ fn print_management_value(
     } else {
         render_human(value)
     }
+}
+
+fn render_plugin_report_value(report: &serde_json::Value) -> Result<(), String> {
+    println!(
+        "Plugin: {} ({})",
+        json_string(report, "name", "unknown"),
+        json_string(report, "identity", "unknown")
+    );
+    println!("Version: {}", json_string(report, "version", "unknown"));
+    println!(
+        "Content digest: {}",
+        json_string(report, "contentDigest", "unknown")
+    );
+    println!(
+        "Runtime conformance: {}",
+        json_string(report, "runtimeConformance", "unverified")
+    );
+    println!("Manifest:");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report["manifest"]).map_err(|error| error.to_string())?
+    );
+    println!("Checks:");
+    if let Some(checks) = report["checks"].as_array() {
+        for check in checks {
+            println!(
+                "  {}: {} — {}",
+                json_string(check, "status", "unknown"),
+                json_string(check, "name", "check"),
+                json_string(check, "message", "no detail")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn plugin_report_has_failures(report: &serde_json::Value) -> bool {
+    report["checks"]
+        .as_array()
+        .is_some_and(|checks| checks.iter().any(|check| check["status"] == "fail"))
+}
+
+fn render_plugin_install_result(result: &serde_json::Value) -> Result<(), String> {
+    let plugin = &result["plugin"];
+    println!(
+        "Installed {} {} ({})",
+        json_string(plugin, "id", "unknown"),
+        json_string(plugin, "version", "unknown"),
+        json_string(plugin, "digest", "unknown")
+    );
+    Ok(())
+}
+
+fn render_plugin_list(page: &serde_json::Value) -> Result<(), String> {
+    let items = page["items"]
+        .as_array()
+        .ok_or("Core returned an invalid plugin list")?;
+    if items.is_empty() {
+        println!("No plugins are installed.");
+        return Ok(());
+    }
+    println!("ID\tVERSION\tSTATUS\tACTIVE EXECUTIONS\tNAME");
+    for plugin in items {
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            json_string(plugin, "id", "unknown"),
+            json_string(plugin, "version", "unknown"),
+            json_string(plugin, "status", "unknown"),
+            plugin["activeExecutions"].as_u64().unwrap_or(0),
+            json_string(plugin, "name", "unknown")
+        );
+        if let Some(details) = plugin["failureDetails"].as_str() {
+            println!("  failure: {details}");
+        }
+    }
+    Ok(())
+}
+
+fn render_plugin_removal(report: &serde_json::Value) -> Result<(), String> {
+    let status = json_string(report, "status", "unknown");
+    println!(
+        "Plugin {} removal: {status} — {}",
+        json_string(report, "pluginId", "unknown"),
+        json_string(report, "message", "no detail")
+    );
+    if let Some(workflows) = report["affectedWorkflows"].as_array() {
+        if workflows.is_empty() {
+            println!("Affected workflows: none");
+        } else {
+            println!("Disabled workflows:");
+            for workflow in workflows {
+                if let Some(id) = workflow.as_str() {
+                    println!("  {id}");
+                }
+            }
+        }
+    }
+    if report["activeExecutions"].as_u64().unwrap_or(0) > 0 {
+        println!("Active executions: {}", report["activeExecutions"]);
+    }
+    if status == "removal failed" {
+        return Err(
+            "plugin removal failed; inspect `plugin list` and retry after resolving the cause"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn json_string<'a>(value: &'a serde_json::Value, key: &str, fallback: &'a str) -> &'a str {
@@ -5305,12 +4976,11 @@ fn decode_trigger_path_component(value: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthCommand, Cli, Command, ContextFile, DOCTOR_REPORT_FAILURE, ServiceCommand,
+        Cli, Command, ContextFile, DOCTOR_REPORT_FAILURE, ServiceCommand,
         configure_local_connection_with_credentials, execute, execute_with_credentials,
-        local_endpoint, recover_local_auth_with_credential_writer, redact_lifecycle_diagnostic,
-        render_init_report, render_service_error, render_service_operation_error,
-        resolve_initialization_paths, run_initialization_with, save_local_context,
-        selected_management_context, validate_dispatch_arguments, validate_pairing_endpoint,
+        local_endpoint, redact_lifecycle_diagnostic, render_init_report, render_service_error,
+        render_service_operation_error, resolve_initialization_paths, run_initialization_with,
+        save_local_context, selected_management_context, validate_dispatch_arguments,
     };
     use clap::Parser;
     use kakune_core::{
@@ -5411,15 +5081,16 @@ mod tests {
     }
 
     #[test]
-    fn data_directory_option_does_not_imply_standalone_execution() {
+    fn canonical_workflow_data_directory_option_does_not_imply_standalone_execution() {
         let cli = Cli::try_parse_from([
             "kakune",
+            "workflow",
             "run",
-            "workflow.kakune.yaml",
+            "stored-workflow",
             "--data-dir",
             "isolated-data",
         ])
-        .expect("legacy run arguments should parse");
+        .expect("canonical workflow run arguments should parse");
         assert!(!cli.standalone);
     }
 
@@ -5981,87 +5652,6 @@ mod tests {
         assert!(!paths.context_file.exists());
     }
 
-    #[test]
-    fn explicit_auth_recovery_still_replaces_active_access_with_injected_credentials() {
-        let fixture = CliFixture::new();
-        let paths = fixture.paths();
-        let parsed = Cli::try_parse_from([
-            "kakune",
-            "--standalone",
-            "--context-file",
-            paths
-                .context_file
-                .to_str()
-                .expect("fixture path should be UTF-8"),
-            "auth",
-            "recover",
-            "--data-dir",
-            paths
-                .data_dir
-                .to_str()
-                .expect("fixture path should be UTF-8"),
-        ])
-        .expect("explicit auth recover should remain a supported command");
-        assert!(matches!(
-            parsed.command,
-            Command::Auth {
-                command: AuthCommand::Recover { .. }
-            }
-        ));
-
-        let store = Store::open(paths.data_dir.clone()).expect("fixture store should open");
-        let previous = store
-            .create_auth_token(
-                "Existing administrative access".to_string(),
-                vec![AuthScope::Admin],
-                None,
-            )
-            .expect("fixture credential should be issued");
-        let api = ApiConfig::default();
-        let listen = "127.0.0.1:8787"
-            .parse()
-            .expect("loopback address should parse");
-        let mut new_secret = None;
-        let mut new_reference = None;
-
-        let outcome = recover_local_auth_with_credential_writer(
-            &store,
-            &paths.context_file,
-            &api,
-            listen,
-            |reference, secret| {
-                new_reference = Some(reference.to_string());
-                new_secret = Some(secret.to_string());
-                true
-            },
-        )
-        .expect("explicit recovery should persist and authorize replacement access");
-
-        assert_eq!(outcome.revoked_count, 1);
-        assert!(outcome.fallback_token.is_none());
-        let tokens = store
-            .list_auth_tokens()
-            .expect("recovered history should load");
-        assert_eq!(tokens.len(), 2);
-        let old = tokens
-            .iter()
-            .find(|token| token.id == previous.record.id)
-            .expect("the old token should remain in history");
-        assert!(old.revoked_at.is_some());
-        let new_secret = new_secret.expect("secure writer should receive the new credential");
-        assert!(
-            store
-                .authorize_scope(&new_secret, AuthScope::Admin)
-                .expect("replacement access should authorize locally")
-        );
-        let contexts = ContextFile::load(&paths.context_file)
-            .expect("recovery should restore the local context");
-        assert_eq!(
-            contexts.contexts[0].credential_ref.as_deref(),
-            new_reference.as_deref()
-        );
-    }
-
     #[tokio::test]
     async fn init_rejects_remote_context_before_filesystem_or_lock_side_effects() {
         let fixture = CliFixture::new();
@@ -6213,7 +5803,7 @@ mod tests {
         let error = run_initialization_with(failed_paths.clone(), &CliCredentialDouble::new(true))
             .expect_err("injected secure-save failure must remain partial");
         assert!(error.contains("incomplete"));
-        assert!(error.contains("auth recover"));
+        assert!(error.contains("authorized administration channel"));
         assert!(error.contains(failed_paths.data_dir.to_string_lossy().as_ref()));
         assert!(!error.contains("kakune_"));
         assert!(!failed_paths.context_file.exists());
@@ -6235,7 +5825,7 @@ mod tests {
         let invalid_access = run_initialization_with(paths.clone(), &unusable)
             .expect_err("a non-authorizing existing credential should fail");
         assert!(invalid_access.starts_with("initialization incomplete"));
-        assert!(invalid_access.contains("auth recover"));
+        assert!(invalid_access.contains("authorized administration channel"));
         assert!(invalid_access.contains(paths.data_dir.to_string_lossy().as_ref()));
         assert!(invalid_access.contains(paths.config_file.to_string_lossy().as_ref()));
         assert!(invalid_access.contains(paths.context_file.to_string_lossy().as_ref()));
@@ -6317,7 +5907,7 @@ mod tests {
         let secure_save_error = run_initialization_with(retry_paths.clone(), &failed_save)
             .expect_err("secure-save failure should remain visibly incomplete");
         assert!(secure_save_error.starts_with("initialization incomplete"));
-        assert!(secure_save_error.contains("auth recover"));
+        assert!(secure_save_error.contains("authorized administration channel"));
         assert!(secure_save_error.contains(retry_paths.data_dir.to_string_lossy().as_ref()));
         assert!(!secure_save_error.contains("Kakune local initialization complete"));
         assert!(!secure_save_error.contains("kakune_"));
@@ -6330,7 +5920,7 @@ mod tests {
             run_initialization_with(retry_paths.clone(), &CliCredentialDouble::new(false))
                 .expect_err("retry must not silently replace an unsaved initial credential");
         assert!(retry_error.starts_with("initialization incomplete"));
-        assert!(retry_error.contains("auth recover"));
+        assert!(retry_error.contains("authorized administration channel"));
         assert!(retry_error.contains(retry_paths.data_dir.to_string_lossy().as_ref()));
         assert!(!retry_error.contains("Kakune local initialization complete"));
         assert!(!retry_error.contains("kakune_"));
@@ -6383,21 +5973,6 @@ mod tests {
         assert_eq!(
             local_endpoint(&config, "[::]:8787".parse().expect("IPv6 socket is valid")),
             "http://[::1]:8787"
-        );
-    }
-
-    #[test]
-    fn remote_pairing_requires_https_but_loopback_can_use_http() {
-        assert_eq!(
-            validate_pairing_endpoint("http://127.0.0.1:8787")
-                .expect("loopback endpoint should be accepted"),
-            "http://127.0.0.1:8787"
-        );
-        assert!(validate_pairing_endpoint("http://192.168.1.20:8787").is_err());
-        assert_eq!(
-            validate_pairing_endpoint("https://core.example.com:8787/")
-                .expect("HTTPS endpoint should be accepted"),
-            "https://core.example.com:8787"
         );
     }
 }

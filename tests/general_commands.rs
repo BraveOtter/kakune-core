@@ -189,7 +189,7 @@ fn executable_helper_captures_output_and_keeps_child_lifetime_bounded() {
 }
 
 #[test]
-fn general_help_discloses_safe_local_entry_points_and_retains_other_commands() {
+fn general_help_discloses_safe_local_entry_points_and_canonical_commands() {
     let fixture = CommandFixture::new().expect("command fixture should be created");
 
     let top_level = run_kakune(&fixture, &["--help"], Duration::from_secs(10))
@@ -216,11 +216,9 @@ fn general_help_discloses_safe_local_entry_points_and_retains_other_commands() {
             "init",
             "version",
             "daemon",
-            "storage",
             "service",
             "doctor",
             "context",
-            "auth",
             "workflow",
             "execution",
             "trigger",
@@ -228,9 +226,6 @@ fn general_help_discloses_safe_local_entry_points_and_retains_other_commands() {
             "provider",
             "secret",
             "mcp",
-            "run",
-            "executions",
-            "inspect",
             "help",
         ]
     );
@@ -249,7 +244,7 @@ fn general_help_discloses_safe_local_entry_points_and_retains_other_commands() {
         "--ca",
         "safe to repeat",
         "preserves",
-        "auth recover",
+        "cannot recover lost client access",
         "does not rotate",
     ] {
         assert!(init.contains(detail), "init help omitted {detail}:\n{init}");
@@ -274,10 +269,7 @@ fn general_help_discloses_safe_local_entry_points_and_retains_other_commands() {
     for (arguments, expected) in [
         (&["doctor", "--help"][..], "diagnostics"),
         (&["daemon", "--help"][..], "foreground"),
-        (
-            &["auth", "recover", "--help"][..],
-            "Explicitly recovers lost local access",
-        ),
+        (&["workflow", "run", "--help"][..], "Manually submits"),
     ] {
         let help = run_kakune(&fixture, arguments, Duration::from_secs(10))
             .expect("retained-command help should be bounded");
@@ -289,10 +281,6 @@ fn general_help_discloses_safe_local_entry_points_and_retains_other_commands() {
     let retained_groups: &[(&[&str], &[&str])] = &[
         (&["daemon", "--help"], &["start", "stop", "status"]),
         (
-            &["storage", "--help"],
-            &["backup", "restore", "retain", "compact", "pin"],
-        ),
-        (
             &["service", "--help"],
             &["install", "uninstall", "start", "stop", "status"],
         ),
@@ -303,22 +291,33 @@ fn general_help_discloses_safe_local_entry_points_and_retains_other_commands() {
             ],
         ),
         (
-            &["auth", "--help"],
-            &["recover", "pair", "tokens", "revoke"],
+            &["workflow", "--help"],
+            &[
+                "create", "import", "export", "validate", "plan", "list", "run", "enable",
+                "disable",
+            ],
         ),
         (
-            &["workflow", "--help"],
-            &["validate", "list", "enable", "disable"],
+            &["execution", "--help"],
+            &["list", "inspect", "cancel", "logs"],
         ),
+        (&["trigger", "--help"], &["list", "inspect"]),
         (
             &["plugin", "--help"],
-            &["prepare", "commit", "list", "remove"],
+            &[
+                "create", "inspect", "install", "list", "update", "remove", "doctor", "test",
+            ],
         ),
         (
             &["provider", "--help"],
-            &["list", "upsert", "status", "remove", "login"],
+            &["add", "list", "auth", "test", "models"],
         ),
-        (&["mcp", "--help"], &["call"]),
+        (&["secret", "--help"], &["set", "list", "remove"]),
+        (
+            &["mcp", "--help"],
+            &["add", "list", "inspect", "auth", "tool"],
+        ),
+        (&["mcp", "tool", "--help"], &["list", "call"]),
     ];
     for (arguments, commands) in retained_groups {
         let output = run_kakune(&fixture, arguments, Duration::from_secs(10))

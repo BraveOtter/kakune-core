@@ -163,7 +163,7 @@ impl fmt::Display for InitializationCorrection {
             Self::InspectResource => "inspect or correct the affected local resource",
             Self::RepairOrRestoreStorage => "repair the storage or restore its pre-upgrade backup",
             Self::RunExplicitAuthRecovery => {
-                "run `kakune auth recover` explicitly for the selected local installation"
+                "restore client access through an authorized administration channel; initialization does not replace credentials"
             }
             Self::RetryAfterContention => {
                 "retry initialization after the other setup operation has finished"
