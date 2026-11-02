@@ -26,7 +26,7 @@ pub fn observe_plugins(data_dir: &Path) -> Result<Vec<(String, String, String)>,
 }
 
 /// Bounded, read-only plugin catalog metadata for an explicitly selected local store.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginCatalogEntry {
     pub id: String,
@@ -227,14 +227,14 @@ impl IsolatedDatabaseObservationExecutor {
         Ok(Self { executable })
     }
 
-    fn run(&self, path: &Path, plugins: bool) -> Option<Vec<u8>> {
+    fn run(&self, path: &Path, mode: Option<&str>) -> Option<Vec<u8>> {
         use crate::lifecycle::{
             Deadline, SystemMonotonicClock, service::native::run_owned_command,
         };
         use std::process::{Command, Stdio};
         let mut command = Command::new(&self.executable);
-        if plugins {
-            command.arg("--plugins");
+        if let Some(mode) = mode {
+            command.arg(mode);
         }
         command.arg(path).env_clear().stdin(Stdio::null());
         let clock = SystemMonotonicClock::default();
@@ -257,7 +257,7 @@ impl IsolatedDatabaseObservationExecutor {
         data_dir: &Path,
     ) -> Result<Vec<(String, String, String)>, String> {
         let bytes = self
-            .run(&data_dir.join("kakune.sqlite3"), true)
+            .run(&data_dir.join("kakune.sqlite3"), Some("--plugins"))
             .ok_or_else(|| "isolated plugin catalog observation unavailable".to_owned())?;
         let response: IsolatedPluginResponse = serde_json::from_slice(&bytes)
             .map_err(|_| "isolated plugin catalog observation unavailable".to_owned())?;
@@ -281,6 +281,60 @@ impl IsolatedDatabaseObservationExecutor {
         }
         Ok(response.items)
     }
+
+    /// Reads the bounded plugin catalog through the explicitly trusted helper.
+    ///
+    /// The in-process observer cannot open the database on these platforms
+    /// without releasing the Core's own SQLite locks, so the catalog is read
+    /// by the separate worker and returned as bounded metadata.
+    pub fn observe_plugin_catalog(
+        &self,
+        data_dir: &Path,
+    ) -> Result<Vec<PluginCatalogEntry>, String> {
+        let bytes = self
+            .run(&data_dir.join("kakune.sqlite3"), Some("--catalog"))
+            .ok_or_else(|| "isolated plugin catalog observation unavailable".to_owned())?;
+        let response: IsolatedPluginCatalogResponse = serde_json::from_slice(&bytes)
+            .map_err(|_| "isolated plugin catalog observation unavailable".to_owned())?;
+        if response.status != ObservationStatus::Healthy
+            || response.schema_version != SUPPORTED_SCHEMA_VERSION
+            || response.items.len() > 10_000
+        {
+            return Err("isolated plugin catalog observation unavailable".to_owned());
+        }
+        let mut total = 0_usize;
+        for item in &response.items {
+            for value in [
+                Some(item.id.len()),
+                Some(item.name.len()),
+                Some(item.version.len()),
+                Some(item.status.len()),
+                item.failure_details.as_ref().map(|details| details.len()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if value > 4096 {
+                    return Err("plugin metadata exceeds the observation limit".to_owned());
+                }
+                total = total.saturating_add(value);
+            }
+            if !matches!(
+                item.status.as_str(),
+                "active" | "pending removal" | "removal failed"
+            ) || item
+                .failure_details
+                .as_ref()
+                .is_some_and(|details| details.len() > 256)
+            {
+                return Err("plugin catalog contains invalid lifecycle metadata".to_owned());
+            }
+        }
+        if total > 1_048_576 {
+            return Err("plugin catalog exceeds the observation limit".to_owned());
+        }
+        Ok(response.items)
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -290,6 +344,15 @@ struct IsolatedPluginResponse {
     status: ObservationStatus,
     schema_version: u32,
     items: Vec<(String, String, String)>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IsolatedPluginCatalogResponse {
+    status: ObservationStatus,
+    schema_version: u32,
+    items: Vec<PluginCatalogEntry>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -326,7 +389,7 @@ impl DatabaseObservationExecutor for IsolatedDatabaseObservationExecutor {
             Err(_) => return unavailable(),
             Ok(_) => {}
         }
-        let Some(output) = self.run(path, false) else {
+        let Some(output) = self.run(path, None) else {
             return unavailable();
         };
         let Ok(response) = serde_json::from_slice::<IsolatedObservationResponse>(&output) else {

@@ -372,7 +372,7 @@ fn local_cli_lists_catalog_in_isolated_helper_and_preserves_writer_locks() {
     );
     assert_eq!(
         String::from_utf8_lossy(&result.stdout),
-        "example\t1.0.0\tExample\n"
+        "ID\tVERSION\tSTATUS\tACTIVE EXECUTIONS\tNAME\nexample\t1.0.0\tactive\t0\tExample\n"
     );
     before.ensure_unchanged(&directory).unwrap();
     db.execute_batch("BEGIN EXCLUSIVE").unwrap();

@@ -876,6 +876,20 @@ fn cli_observation_executor()
     )
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cli_observe_plugin_catalog(
+    data_dir: &Path,
+) -> Result<Vec<kakune_core::observation::PluginCatalogEntry>, String> {
+    cli_observation_executor()?.observe_plugin_catalog(data_dir)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn cli_observe_plugin_catalog(
+    data_dir: &Path,
+) -> Result<Vec<kakune_core::observation::PluginCatalogEntry>, String> {
+    kakune_core::observation::observe_plugin_catalog(data_dir)
+}
+
 fn main() -> ExitCode {
     let args = std::env::args_os().collect::<Vec<_>>();
     #[cfg(windows)]
@@ -1144,7 +1158,7 @@ async fn execute_with_credentials(
                 data_dir: Some(data_dir),
                 json,
             } => {
-                let items = kakune_core::observation::observe_plugin_catalog(&data_dir)?;
+                let items = cli_observe_plugin_catalog(&data_dir)?;
                 let page = serde_json::json!({ "items": items });
                 print_management_value(&page, json, render_plugin_list)?;
             }

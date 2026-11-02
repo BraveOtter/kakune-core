@@ -7,18 +7,18 @@ fn main() {
     let Some(first) = args.next() else {
         std::process::exit(2);
     };
-    let (plugins, path) = if first == "--plugins" {
+    let (mode, path) = if first == "--plugins" || first == "--catalog" {
         let Some(path) = args.next() else {
             std::process::exit(2)
         };
-        (true, path)
+        (Some(first.to_string_lossy().into_owned()), path)
     } else {
-        (false, first)
+        (None, first)
     };
     if args.next().is_some() {
         std::process::exit(2);
     }
-    let result = observe(std::path::Path::new(&path), plugins)
+    let result = observe(std::path::Path::new(&path), mode.as_deref())
         .unwrap_or_else(|_| serde_json::json!({"status": "unavailable"}));
     let output = result.to_string();
     if output.len() > 500_000 {
@@ -34,7 +34,7 @@ fn main() {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn observe(path: &std::path::Path, plugins: bool) -> Result<serde_json::Value, ()> {
+fn observe(path: &std::path::Path, mode: Option<&str>) -> Result<serde_json::Value, ()> {
     use nix::{
         fcntl::{FcntlArg, fcntl},
         libc,
@@ -132,7 +132,7 @@ fn observe(path: &std::path::Path, plugins: bool) -> Result<serde_json::Value, (
     if version == supported && executions.is_none() {
         return Ok(serde_json::json!({"status":"corrupt"}));
     }
-    if plugins {
+    if mode == Some("--plugins") {
         if version != supported {
             return Err(());
         }
@@ -164,6 +164,89 @@ fn observe(path: &std::path::Path, plugins: bool) -> Result<serde_json::Value, (
                 return Err(());
             }
             items.push((id, version, name));
+        }
+        return Ok(serde_json::json!({"status":"healthy", "schemaVersion":version, "items":items}));
+    }
+    if mode == Some("--catalog") {
+        if version != supported {
+            return Err(());
+        }
+        let pin_rows: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM plugin_execution_pins LIMIT 100001)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| ())?;
+        if pin_rows > 100_000 {
+            return Err(());
+        }
+        let mut statement = db
+            .prepare(
+                "WITH pin_counts AS (
+                    SELECT plugin_id, COUNT(*) AS active_count
+                    FROM plugin_execution_pins GROUP BY plugin_id
+                 )
+                 SELECT substr(p.id,1,4097), substr(p.name,1,4097), substr(p.version,1,4097),
+                        p.enabled, substr(l.status,1,65), substr(l.failure_details,1,257),
+                        COALESCE(pin_counts.active_count, 0)
+                 FROM installed_plugins p
+                 LEFT JOIN plugin_lifecycle l ON l.plugin_id=p.id
+                 LEFT JOIN pin_counts ON pin_counts.plugin_id=p.id
+                 ORDER BY p.id LIMIT 10001",
+            )
+            .map_err(|_| ())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(|_| ())?;
+        let mut items = Vec::new();
+        let mut bytes = 0_usize;
+        for row in rows {
+            let (id, name, version, enabled, status, failure_details, active_executions) =
+                row.map_err(|_| ())?;
+            let status = status.ok_or(())?;
+            if [id.len(), name.len(), version.len(), status.len()]
+                .into_iter()
+                .any(|length| length > 4096)
+                || failure_details
+                    .as_ref()
+                    .is_some_and(|details| details.len() > 256)
+                || !matches!(
+                    status.as_str(),
+                    "active" | "pending removal" | "removal failed"
+                )
+                || active_executions < 0
+            {
+                return Err(());
+            }
+            bytes = bytes
+                .saturating_add(id.len())
+                .saturating_add(name.len())
+                .saturating_add(version.len())
+                .saturating_add(status.len())
+                .saturating_add(failure_details.as_ref().map_or(0, String::len));
+            if items.len() >= 10_000 || bytes > 1_048_576 {
+                return Err(());
+            }
+            items.push(kakune_core::observation::PluginCatalogEntry {
+                id,
+                name,
+                version,
+                enabled,
+                status,
+                failure_details,
+                active_executions: u64::try_from(active_executions).map_err(|_| ())?,
+            });
         }
         return Ok(serde_json::json!({"status":"healthy", "schemaVersion":version, "items":items}));
     }

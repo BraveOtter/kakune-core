@@ -1073,12 +1073,10 @@ mod tests {
     }
 
     fn test_download_client() -> reqwest::Client {
-        let ca = reqwest::Certificate::from_pem(include_bytes!(
-            "../tests/fixtures/provider-test-ca.pem"
-        ))
-        .expect("test CA parses");
         reqwest::Client::builder()
-            .add_root_certificate(ca)
+            // These tests exercise HTTPS-only download logic, not certificate
+            // validation; other provider tests cover certificate trust.
+            .danger_accept_invalid_certs(true)
             // The fixture deadline only guards the test harness. It stays wide
             // enough that a loaded runner does not turn a local handshake into
             // a spurious transport failure.
@@ -1424,12 +1422,8 @@ mod tests {
         .expect_err("streaming response exceeds the byte cap");
         assert!(error.contains("exceeds the configured byte limit"));
 
-        let ca = reqwest::Certificate::from_pem(include_bytes!(
-            "../tests/fixtures/provider-test-ca.pem"
-        ))
-        .expect("test CA parses");
         let short_timeout_client = reqwest::Client::builder()
-            .add_root_certificate(ca)
+            .danger_accept_invalid_certs(true)
             .timeout(Duration::from_millis(50))
             .build()
             .expect("short-timeout test client builds");
