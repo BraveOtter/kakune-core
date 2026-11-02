@@ -1,0 +1,1 @@
+This file is fixture input, not an execution marker. Tests must create a separate marker path in an isolated temporary directory and assert it remains absent.

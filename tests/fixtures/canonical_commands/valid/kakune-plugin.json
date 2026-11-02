@@ -1,0 +1,9 @@
+{
+  "manifestVersion": "1.0",
+  "id": "org.example.canonical-fixture",
+  "name": "Canonical fixture",
+  "version": "0.1.0",
+  "pluginProtocol": ">=1.0.0 <2.0.0",
+  "runtime": { "kind": "process", "command": "canonical-sentinel-not-executable", "args": [] },
+  "contributes": { "nodes": ["definitions/sentinel.json"], "triggers": [], "providers": [], "services": [] }
+}

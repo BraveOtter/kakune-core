@@ -1,0 +1,8 @@
+{
+  "manifestVersion": "1.0",
+  "id": "org.example.canonical-incompatible",
+  "name": "Incompatible fixture",
+  "version": "0.1.0",
+  "pluginProtocol": ">=99.0.0 <100.0.0",
+  "runtime": { "kind": "process", "command": "canonical-sentinel-not-executable", "args": [] }
+}

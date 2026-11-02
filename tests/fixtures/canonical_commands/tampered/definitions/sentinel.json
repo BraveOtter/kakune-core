@@ -1,0 +1,8 @@
+{
+  "apiVersion": "kakune.dev/v1",
+  "kind": "NodeDefinition",
+  "type": "org.example.canonical-sentinel@1",
+  "name": "Canonical sentinel",
+  "inputSchema": { "type": "object" },
+  "outputSchema": { "type": "object" }
+}

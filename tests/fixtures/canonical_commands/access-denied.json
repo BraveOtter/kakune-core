@@ -1,0 +1,6 @@
+{
+  "scenario": "authorization-denied",
+  "requiredScope": "admin",
+  "grantedScopes": ["read"],
+  "token": "canonical-fixture-fake-token-do-not-use"
+}

@@ -1,0 +1,21 @@
+apiVersion: kakune/v1
+kind: Workflow
+metadata:
+  id: canonical-nested-plugin
+  name: Canonical nested plugin
+triggers:
+  - id: manual
+    type: kakune.trigger.manual@1
+entry: each
+nodes:
+  - id: each
+    type: kakune.flow.foreach@1
+    inputs:
+      items: { literal: [fixture] }
+    with:
+      maxConcurrency: 1
+    body:
+      entry: sentinel
+      nodes:
+        - id: sentinel
+          type: org.example.canonical-sentinel@1

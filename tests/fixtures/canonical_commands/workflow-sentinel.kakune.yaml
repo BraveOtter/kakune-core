@@ -1,0 +1,15 @@
+apiVersion: kakune/v1
+kind: Workflow
+metadata:
+  id: canonical-workflow-sentinel
+  name: Canonical workflow sentinel
+triggers:
+  - id: manual
+    type: kakune.trigger.manual@1
+entry: write-marker
+nodes:
+  - id: write-marker
+    type: kakune.fs.write-text@1
+    inputs:
+      path: { literal: canonical-workflow-executed.txt }
+      content: { literal: workflow-executed }
