@@ -11,8 +11,11 @@ pub mod mcp;
 pub mod minimax;
 pub mod observation;
 mod planner;
+pub mod plugin_diagnostics;
 pub mod plugin_install;
 pub mod plugin_process;
+pub mod plugin_scaffold;
+pub mod plugin_services;
 pub mod remote;
 pub mod reporting;
 mod runtime;
@@ -47,12 +50,12 @@ pub use store::{
     AuthPairingState, AuthPairingStatus, AuthScope, AuthTokenRecord, BackupSummary,
     CreatedAuthPairingCode, CreatedAuthToken, ExecutionRecord, ExecutionTraceRecord,
     InstalledPluginRecord, McpConnectionTransport, NamedMcpConnection, NativeCredentialBackend,
-    NewNamedMcpConnection, NodeRunRecord, OperationalMetrics, PreparedPluginInstallRecord,
-    ProviderAuth, ProviderInvocationRecord, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileStatus, ProviderProfileUpsert, ProviderType, ProviderUsageSummary,
-    RetentionPolicy, RetentionReport, SecretBackendKind, SecretRecord, SecretRemoveOutcome,
-    SecretSetOutcome, Store, TraceArtifactLink, TraceSpanRecord, WorkflowRecord,
-    WorkflowRevisionComparison, WorkflowRevisionRecord, WorkflowRevisionSource,
+    NewNamedMcpConnection, NodeRunRecord, OperationalMetrics, PluginRemovalState,
+    PreparedPluginInstallRecord, ProviderAuth, ProviderInvocationRecord, ProviderProfile,
+    ProviderProfileDiagnostic, ProviderProfileStatus, ProviderProfileUpsert, ProviderType,
+    ProviderUsageSummary, RetentionPolicy, RetentionReport, SecretBackendKind, SecretRecord,
+    SecretRemoveOutcome, SecretSetOutcome, Store, TraceArtifactLink, TraceSpanRecord,
+    WorkflowRecord, WorkflowRevisionComparison, WorkflowRevisionRecord, WorkflowRevisionSource,
     WorkflowSourceRecord, WorkflowSourceUpdate, WorkflowStatusUpdate,
 };
 pub use workflow::WorkflowDocument;
@@ -137,4 +140,3 @@ pub mod codex_adapter;
 
 pub mod process_supervisor;
 
-mod plugin_services;

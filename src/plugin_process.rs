@@ -47,6 +47,7 @@ pub struct PluginManifest {
     pub contributes: Option<PluginContributions>,
     pub permissions: Option<PluginPermissions>,
     manifest_dir: PathBuf,
+    manifest_path: Option<PathBuf>,
 }
 
 impl PluginManifest {
@@ -73,7 +74,9 @@ impl PluginManifest {
         })?;
         let manifest: RawPluginManifest = serde_json::from_str(&source)
             .map_err(|source| PluginHostError::ManifestParse { source })?;
-        manifest.validate(path.parent().unwrap_or_else(|| Path::new(".")))
+        let mut validated = manifest.validate(path.parent().unwrap_or_else(|| Path::new(".")))?;
+        validated.manifest_path = Some(path.to_path_buf());
+        Ok(validated)
     }
 
     fn load_node_definition(
@@ -281,6 +284,7 @@ impl RawPluginManifest {
             contributes: self.contributes,
             permissions: self.permissions,
             manifest_dir: manifest_dir.to_path_buf(),
+            manifest_path: None,
         })
     }
 }
@@ -377,10 +381,22 @@ pub struct RegisteredPluginNode {
     pub manifest_id: String,
     pub definition: PluginNodeDefinition,
     manifest: PluginManifest,
+    content_digest: String,
     options: PluginHostOptions,
 }
 
 impl RegisteredPluginNode {
+    pub(crate) fn content_digest(&self) -> &str {
+        &self.content_digest
+    }
+    pub(crate) fn plugin_version(&self) -> &str {
+        &self.manifest.version
+    }
+
+    pub(crate) fn manifest_path(&self) -> Option<&Path> {
+        self.manifest.manifest_path.as_deref()
+    }
+
     pub fn uses_secrets(&self) -> bool {
         self.manifest
             .permissions
@@ -413,6 +429,28 @@ impl RegisteredPluginNode {
         inputs: BTreeMap<String, Value>,
         reporter: DiagnosticReporter,
     ) -> Result<PluginNodeResult, PluginNodeExecutionError> {
+        let package_dir = self.manifest.manifest_dir.clone();
+        let verification = tokio::time::timeout(
+            self.options.request_timeout,
+            tokio::task::spawn_blocking(move || {
+                crate::plugin_install::package_digest(&package_dir)
+            }),
+        )
+        .await
+        .map_err(|_| {
+            PluginNodeExecutionError::Result("plugin content verification timed out".to_owned())
+        })?
+        .map_err(|_| {
+            PluginNodeExecutionError::Result("plugin content verification failed".to_owned())
+        })?
+        .map_err(|_| {
+            PluginNodeExecutionError::Result("plugin content could not be verified".to_owned())
+        })?;
+        if verification != self.content_digest {
+            return Err(PluginNodeExecutionError::Result(
+                "plugin content changed after catalog loading".to_owned(),
+            ));
+        }
         let mut host = PluginHost::start(&self.manifest, self.options.clone())
             .await
             .map_err(PluginNodeExecutionError::Host)?;
@@ -525,6 +563,8 @@ impl PluginRegistry {
         }
 
         let mut additions = Vec::with_capacity(declarations.len());
+        let content_digest = crate::plugin_install::package_digest(&manifest.manifest_dir)
+            .map_err(PluginRegistryError::PackageDigest)?;
         for declaration in declarations {
             let definition = manifest.load_node_definition(declaration)?;
             if crate::runtime::is_builtin_node_type(&definition.node_type) {
@@ -541,8 +581,17 @@ impl PluginRegistry {
                 manifest_id: manifest.id.clone(),
                 definition,
                 manifest: manifest.clone(),
+                content_digest: content_digest.clone(),
                 options: options.clone(),
             });
+        }
+        if crate::plugin_install::package_digest(&manifest.manifest_dir)
+            .map_err(PluginRegistryError::PackageDigest)?
+            != content_digest
+        {
+            return Err(PluginRegistryError::PackageDigest(
+                "package changed during catalog loading".to_owned(),
+            ));
         }
         for node in additions {
             self.nodes.insert(node.definition.node_type.clone(), node);
@@ -570,6 +619,8 @@ impl PluginRegistry {
 /// Failures while explicitly loading node definitions into a local registry.
 #[derive(Debug, Error)]
 pub enum PluginRegistryError {
+    #[error("cannot digest plugin package: {0}")]
+    PackageDigest(String),
     #[error("cannot load plugin manifest: {0}")]
     Manifest(#[source] PluginHostError),
     #[error("plugin {0} declares no node definitions")]

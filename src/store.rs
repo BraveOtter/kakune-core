@@ -27,6 +27,7 @@ use crate::{
 };
 
 const MAX_STORE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+type PluginRequirement<'a> = (&'a str, Option<&'a str>, Option<&'a str>, Option<&'a str>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReadOnlyDatabaseStatus {
@@ -573,6 +574,15 @@ pub struct InstalledPluginRecord {
     pub digest: String,
     pub resolved_lock: Value,
     pub provenance: Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginRemovalState {
+    pub status: String,
+    pub failure_details: Option<String>,
+    pub source: Option<String>,
+    pub removal_requested_at: Option<String>,
 }
 
 /// A staged plugin inspection. Its content is never activated until its digest
@@ -2208,24 +2218,252 @@ impl Store {
     }
 
     pub fn upsert_plugin_install(&self, plugin: &InstalledPluginRecord) -> Result<(), String> {
+        self.upsert_plugin_install_with_source(plugin, None)
+    }
+
+    /// Publishes a validated plugin record and its update source in one SQLite
+    /// transaction. `None` preserves an existing source for compatibility.
+    pub fn upsert_plugin_install_with_source(
+        &self,
+        plugin: &InstalledPluginRecord,
+        source: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(source) = source {
+            validate_plugin_source(source)?;
+        }
         self.with_connection(|connection| {
-            connection.execute(
-                "INSERT INTO installed_plugins (id, name, version, manifest_path, installed_at, enabled, policy_json, digest, lock_json, provenance_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(id) DO UPDATE SET name=excluded.name, version=excluded.version, manifest_path=excluded.manifest_path, installed_at=excluded.installed_at, enabled=excluded.enabled, policy_json=excluded.policy_json, digest=excluded.digest, lock_json=excluded.lock_json, provenance_json=excluded.provenance_json",
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            let changed = transaction.execute(
+                "INSERT INTO installed_plugins (id, name, version, manifest_path, installed_at, enabled, policy_json, digest, lock_json, provenance_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(id) DO UPDATE SET name=excluded.name, version=excluded.version, manifest_path=excluded.manifest_path, installed_at=excluded.installed_at, enabled=excluded.enabled, policy_json=excluded.policy_json, digest=excluded.digest, lock_json=excluded.lock_json, provenance_json=excluded.provenance_json WHERE EXISTS(SELECT 1 FROM plugin_lifecycle WHERE plugin_id=excluded.id AND status='active') AND NOT EXISTS(SELECT 1 FROM plugin_execution_pins WHERE plugin_id=excluded.id)",
                 params![plugin.id, plugin.name, plugin.version, plugin.manifest_path, plugin.installed_at, plugin.enabled, serde_json::to_string(&plugin.policy).map_err(|error| error.to_string())?, plugin.digest, serde_json::to_string(&plugin.resolved_lock).map_err(|error| error.to_string())?, serde_json::to_string(&plugin.provenance).map_err(|error| error.to_string())?],
             ).map_err(database_error)?;
+            if changed == 0 {
+                return Err("plugin is in use or pending removal".to_owned());
+            }
+            if let Some(source) = source {
+                let changed = transaction
+                    .execute(
+                        "UPDATE plugin_lifecycle SET source=?2 WHERE plugin_id=?1 AND status='active'",
+                        params![plugin.id, source],
+                    )
+                    .map_err(database_error)?;
+                if changed != 1 {
+                    return Err("plugin lifecycle is unavailable for source publication".to_owned());
+                }
+            }
+            transaction.commit().map_err(database_error)?;
             Ok(())
+        })
+    }
+
+    /// Atomically pins active plugin content for an already admitted execution.
+    pub fn acquire_plugin_uses(
+        &self,
+        execution_id: &str,
+        plugin_ids: &[&str],
+    ) -> Result<(), String> {
+        if plugin_ids.len() > 10_000 {
+            return Err("too many plugin references".to_owned());
+        }
+        self.with_connection(|connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(database_error)?;
+            let status: Option<String> = tx.query_row("SELECT status FROM executions WHERE id=?1", [execution_id], |row| row.get(0)).optional().map_err(database_error)?;
+            if !matches!(status.as_deref(), Some("queued" | "running" | "cancelling" | "recoverable")) {
+                return Err("execution is absent or cannot acquire plugin use".to_owned());
+            }
+            for id in plugin_ids {
+                let changed = tx.execute("INSERT INTO plugin_execution_pins (execution_id,plugin_id,version,digest,manifest_path)
+                    SELECT ?1,p.id,p.version,p.digest,p.manifest_path FROM installed_plugins p
+                    JOIN plugin_lifecycle l ON l.plugin_id=p.id WHERE p.id=?2 AND l.status='active' AND p.enabled=1
+                    ON CONFLICT(execution_id,plugin_id) DO NOTHING", params![execution_id, id]).map_err(database_error)?;
+                if changed == 0 {
+                    let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM plugin_lifecycle l JOIN installed_plugins p ON p.id=l.plugin_id WHERE l.plugin_id=?1 AND l.status='active' AND p.enabled=1)", [id], |row| row.get(0)).map_err(database_error)?;
+                    if !active { return Err(format!("plugin {id} is unavailable or pending removal")); }
+                }
+            }
+            tx.commit().map_err(database_error)
+        })
+    }
+
+    /// Publishes the removal barrier and disables the supplied dependent workflows atomically.
+    pub fn request_plugin_removal(
+        &self,
+        plugin_id: &str,
+        workflow_ids: &[&str],
+    ) -> Result<u64, String> {
+        if workflow_ids.len() > 10_000 {
+            return Err("too many dependent workflows".to_owned());
+        }
+        let timestamp = now()?;
+        self.with_connection(|connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(database_error)?;
+            let changed = tx.execute("UPDATE plugin_lifecycle SET status='pending removal', failure_details=NULL, removal_requested_at=COALESCE(removal_requested_at,?2) WHERE plugin_id=?1", params![plugin_id, timestamp]).map_err(database_error)?;
+            if changed == 0 { return Err(format!("plugin {plugin_id} is not installed")); }
+            tx.execute("UPDATE installed_plugins SET enabled=0 WHERE id=?1", [plugin_id])
+                .map_err(database_error)?;
+            for id in workflow_ids {
+                let changed = tx.execute("UPDATE workflows SET status='disabled', updated_at=?2 WHERE id=?1", params![id,timestamp]).map_err(database_error)?;
+                if changed == 0 { return Err(format!("workflow {id} was not found")); }
+                tx.execute("INSERT OR IGNORE INTO plugin_removal_workflows(plugin_id,workflow_id) VALUES (?1,?2)", params![plugin_id,id]).map_err(database_error)?;
+            }
+            let count: i64 = tx.query_row("SELECT COUNT(*) FROM plugin_execution_pins WHERE plugin_id=?1", [plugin_id], |row| row.get(0)).map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+            u64::try_from(count).map_err(|_| "invalid plugin pin count".to_owned())
+        })
+    }
+
+    pub fn plugin_removal_state(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Option<PluginRemovalState>, String> {
+        self.with_connection(|connection| connection.query_row("SELECT status,failure_details,source,removal_requested_at FROM plugin_lifecycle WHERE plugin_id=?1", [plugin_id], |row| Ok(PluginRemovalState { status: row.get(0)?, failure_details: row.get(1)?, source: row.get(2)?, removal_requested_at: row.get(3)? })).optional().map_err(database_error))
+    }
+
+    /// Stores non-secret update provenance for an installed plugin.
+    pub fn set_plugin_source(&self, plugin_id: &str, source: Option<&str>) -> Result<(), String> {
+        if let Some(source) = source {
+            validate_plugin_source(source)?;
+        }
+        self.with_connection(|connection| {
+            let count = connection
+                .execute(
+                    "UPDATE plugin_lifecycle SET source=?2 WHERE plugin_id=?1",
+                    params![plugin_id, source],
+                )
+                .map_err(database_error)?;
+            if count == 0 {
+                return Err("plugin is not installed".to_owned());
+            }
+            Ok(())
+        })
+    }
+
+    /// Records a bounded, non-sensitive failure category after a pending removal fails.
+    pub fn mark_plugin_removal_failed(&self, plugin_id: &str, details: &str) -> Result<(), String> {
+        if details.is_empty()
+            || details.len() > 256
+            || !details
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_' | '.'))
+        {
+            return Err("invalid plugin removal failure category".to_owned());
+        }
+        self.with_connection(|connection| {
+            let count = connection.execute("UPDATE plugin_lifecycle SET status='removal failed', failure_details=?2 WHERE plugin_id=?1 AND status='pending removal'", params![plugin_id, details]).map_err(database_error)?;
+            if count == 0 { return Err("plugin removal is not pending".to_owned()); }
+            Ok(())
+        })
+    }
+
+    /// Moves a failed removal back to pending for an explicit retry.
+    pub fn resume_plugin_removal(&self, plugin_id: &str) -> Result<bool, String> {
+        self.with_connection(|connection| {
+            let changed = connection
+                .execute(
+                    "UPDATE plugin_lifecycle SET status='pending removal', failure_details=NULL WHERE plugin_id=?1 AND status='removal failed'",
+                    [plugin_id],
+                )
+                .map_err(database_error)?;
+            Ok(changed == 1)
+        })
+    }
+
+    /// Deletes the durable installation record only after filesystem removal
+    /// has completed and all execution pins are gone.
+    pub fn finalize_plugin_removal(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Option<InstalledPluginRecord>, String> {
+        self.with_connection(|connection| {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            let status: Option<String> = transaction
+                .query_row(
+                    "SELECT status FROM plugin_lifecycle WHERE plugin_id=?1",
+                    [plugin_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(database_error)?;
+            let Some(status) = status else {
+                transaction.commit().map_err(database_error)?;
+                return Ok(None);
+            };
+            if status != "pending removal" {
+                return Err(format!("plugin removal is not pending (status: {status})"));
+            }
+            let pins: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM plugin_execution_pins WHERE plugin_id=?1",
+                    [plugin_id],
+                    |row| row.get(0),
+                )
+                .map_err(database_error)?;
+            if pins != 0 {
+                return Err("plugin is still pinned by an execution".to_owned());
+            }
+            let record = transaction
+                .query_row(
+                    "SELECT id, name, version, manifest_path, installed_at, enabled, policy_json, digest, lock_json, provenance_json FROM installed_plugins WHERE id=?1",
+                    [plugin_id],
+                    installed_plugin_from_row,
+                )
+                .optional()
+                .map_err(database_error)?;
+            let Some(record) = record else {
+                return Err("pending plugin removal has no installation record".to_owned());
+            };
+            transaction
+                .execute("DELETE FROM installed_plugins WHERE id=?1", [plugin_id])
+                .map_err(database_error)?;
+            transaction.commit().map_err(database_error)?;
+            Ok(Some(record))
+        })
+    }
+
+    pub fn plugin_execution_pin_count(&self, plugin_id: &str) -> Result<u64, String> {
+        self.with_connection(|connection| {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM plugin_execution_pins WHERE plugin_id=?1",
+                    [plugin_id],
+                    |row| row.get(0),
+                )
+                .map_err(database_error)?;
+            u64::try_from(count).map_err(|_| "invalid plugin pin count".to_owned())
+        })
+    }
+
+    /// Returns lifecycle and pin count from one SQLite snapshot.
+    pub fn plugin_lifecycle_snapshot(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Option<(PluginRemovalState, u64)>, String> {
+        self.with_connection(|connection| {
+            let row: Option<(PluginRemovalState, i64)> = connection.query_row(
+                "SELECT status,failure_details,source,removal_requested_at,(SELECT COUNT(*) FROM plugin_execution_pins p WHERE p.plugin_id=l.plugin_id) FROM plugin_lifecycle l WHERE plugin_id=?1",
+                [plugin_id], |row| Ok((PluginRemovalState { status:row.get(0)?, failure_details:row.get(1)?, source:row.get(2)?, removal_requested_at:row.get(3)? }, row.get(4)?)),
+            ).optional().map_err(database_error)?;
+            row.map(|(state,count)| u64::try_from(count).map(|count| (state,count)).map_err(|_| "invalid plugin pin count".to_owned())).transpose()
         })
     }
 
     pub fn set_plugin_enabled(&self, id: &str, enabled: bool) -> Result<bool, String> {
         self.with_connection(|connection| {
-            Ok(connection
+            let changed = connection
                 .execute(
-                    "UPDATE installed_plugins SET enabled = ?1 WHERE id = ?2",
+                    "UPDATE installed_plugins SET enabled = ?1 WHERE id = ?2 AND (?1 = 0 OR EXISTS(SELECT 1 FROM plugin_lifecycle WHERE plugin_id=?2 AND status='active'))",
                     params![enabled, id],
                 )
-                .map_err(database_error)?
-                == 1)
+                .map_err(database_error)?;
+            if enabled && changed == 0 {
+                let exists: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM installed_plugins WHERE id=?1)", [id], |row| row.get(0)).map_err(database_error)?;
+                if exists { return Err("plugin is pending removal".to_owned()); }
+            }
+            Ok(changed == 1)
         })
     }
 
@@ -2238,8 +2476,14 @@ impl Store {
 
     pub fn remove_plugin_install(&self, id: &str) -> Result<Option<InstalledPluginRecord>, String> {
         self.with_connection(|connection| {
-            let record = connection.query_row("SELECT id, name, version, manifest_path, installed_at, enabled, policy_json, digest, lock_json, provenance_json FROM installed_plugins WHERE id = ?1", [id], installed_plugin_from_row).optional().map_err(database_error)?;
-            if record.is_some() { connection.execute("DELETE FROM installed_plugins WHERE id = ?1", [id]).map_err(database_error)?; }
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(database_error)?;
+            let record = transaction.query_row("SELECT id, name, version, manifest_path, installed_at, enabled, policy_json, digest, lock_json, provenance_json FROM installed_plugins WHERE id = ?1", [id], installed_plugin_from_row).optional().map_err(database_error)?;
+            if record.is_some() {
+                let blocked: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM plugin_lifecycle WHERE plugin_id=?1 AND status!='active') OR EXISTS(SELECT 1 FROM plugin_execution_pins WHERE plugin_id=?1)", [id], |row| row.get(0)).map_err(database_error)?;
+                if blocked { return Err("plugin is in use or has a pending removal; use coordinated finalization".to_owned()); }
+                transaction.execute("DELETE FROM installed_plugins WHERE id = ?1", [id]).map_err(database_error)?;
+            }
+            transaction.commit().map_err(database_error)?;
             Ok(record)
         })
     }
@@ -2842,7 +3086,12 @@ impl Store {
     pub fn set_workflow_status(&self, id: &str, status: &str) -> Result<(), String> {
         let now = now()?;
         self.with_connection(|connection| {
-            let transaction = connection.transaction().map_err(database_error)?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            if status == "enabled" {
+                ensure_workflow_not_blocked(&transaction, id)?;
+            }
             let affected = transaction
                 .execute(
                     "UPDATE workflows SET status = ?1, updated_at = ?2 WHERE id = ?3",
@@ -2878,7 +3127,9 @@ impl Store {
         }
         let now = now()?;
         self.with_connection(|connection| {
-            let transaction = connection.transaction().map_err(database_error)?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
             let current: Option<(String, String, String, String)> = transaction
                 .query_row(
                     "SELECT name, status, revision, updated_at FROM workflows WHERE id = ?1",
@@ -2892,6 +3143,9 @@ impl Store {
             };
             if current_revision != expected_revision {
                 return Ok(WorkflowStatusUpdate::Conflict { current_revision });
+            }
+            if status == "enabled" {
+                ensure_workflow_not_blocked(&transaction, id)?;
             }
             let updated_at = if current_status == status {
                 current_updated_at
@@ -2989,8 +3243,8 @@ impl Store {
             workflow_revision,
             plan,
             identity,
-            false,
-            false,
+            (false, false),
+            &[],
         )
     }
 
@@ -3010,8 +3264,61 @@ impl Store {
             workflow_revision,
             plan,
             identity,
-            true,
-            require_enabled,
+            (true, require_enabled),
+            &[],
+        )
+    }
+
+    /// Atomically admits a current workflow revision and pins its plugin content.
+    pub fn admit_plan_with_plugin_uses(
+        &self,
+        workflow_id: &str,
+        workflow_revision: &str,
+        plan: &Value,
+        plugin_ids: &[&str],
+        identity: Option<(&str, &str)>,
+        require_enabled: bool,
+    ) -> Result<(ExecutionRecord, bool), String> {
+        if plugin_ids.len() > 10_000 {
+            return Err("too many plugin references".to_owned());
+        }
+        let requirements: Vec<_> = plugin_ids
+            .iter()
+            .map(|id| (*id, None, None, None))
+            .collect();
+        self.create_execution_with_plan_guarded(
+            workflow_id,
+            workflow_revision,
+            plan,
+            identity,
+            (true, require_enabled),
+            &requirements,
+        )
+    }
+
+    pub(crate) fn admit_plan_with_plugin_versions(
+        &self,
+        workflow_id: &str,
+        workflow_revision: &str,
+        plan: &Value,
+        plugin_versions: &[(&str, &str, &str, &str)],
+        identity: Option<(&str, &str)>,
+        require_enabled: bool,
+    ) -> Result<(ExecutionRecord, bool), String> {
+        if plugin_versions.len() > 10_000 {
+            return Err("too many plugin references".to_owned());
+        }
+        let requirements: Vec<_> = plugin_versions
+            .iter()
+            .map(|(id, version, path, digest)| (*id, Some(*version), Some(*path), Some(*digest)))
+            .collect();
+        self.create_execution_with_plan_guarded(
+            workflow_id,
+            workflow_revision,
+            plan,
+            identity,
+            (true, require_enabled),
+            &requirements,
         )
     }
 
@@ -3021,9 +3328,10 @@ impl Store {
         workflow_revision: &str,
         plan: &Value,
         identity: Option<(&str, &str)>,
-        require_current_revision: bool,
-        require_enabled: bool,
+        requirements: (bool, bool),
+        plugin_ids: &[PluginRequirement<'_>],
     ) -> Result<(ExecutionRecord, bool), String> {
+        let (require_current_revision, require_enabled) = requirements;
         let policy = serde_json::from_value::<crate::workflow::WorkflowPolicy>(
             plan.get("policy").cloned().unwrap_or(Value::Null),
         )
@@ -3034,7 +3342,7 @@ impl Store {
             .map_err(|error| format!("cannot serialize execution plan: {error}"))?;
         let plan_hash = artifacts::artifact_id(plan_json.as_bytes());
         self.with_connection(|connection| {
-            let transaction = connection.transaction().map_err(database_error)?;
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(database_error)?;
             if let Some((key, hash)) = identity
                 && let Some(record) = idempotent_execution(&transaction, key, hash)?
             {
@@ -3060,6 +3368,7 @@ impl Store {
                 if require_enabled && status != "enabled" {
                     return Err(format!("workflow {workflow_name} is not enabled"));
                 }
+                ensure_workflow_not_blocked(&transaction, workflow_name)?;
             }
             let status = execution_admission(&transaction, workflow_name, policy.concurrency.as_ref())?;
             transaction
@@ -3068,6 +3377,18 @@ impl Store {
                     params![execution_id, workflow_name, status, created_at],
                 )
                 .map_err(database_error)?;
+            for (plugin_id, version, path, digest) in plugin_ids {
+                let changed = transaction.execute(
+                    "INSERT INTO plugin_execution_pins(execution_id,plugin_id,version,digest,manifest_path)
+                     SELECT ?1,p.id,p.version,p.digest,p.manifest_path FROM installed_plugins p JOIN plugin_lifecycle l ON l.plugin_id=p.id
+                     WHERE p.id=?2 AND p.enabled=1 AND l.status='active' AND (?3 IS NULL OR p.version=?3) AND (?4 IS NULL OR p.manifest_path=?4) AND (?5 IS NULL OR p.digest=?5) ON CONFLICT(execution_id,plugin_id) DO NOTHING",
+                    params![execution_id, plugin_id, version, path, digest],
+                ).map_err(database_error)?;
+                if changed == 0 {
+                    let exists: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM plugin_execution_pins WHERE execution_id=?1 AND plugin_id=?2)", params![execution_id, plugin_id], |row| row.get(0)).map_err(database_error)?;
+                    if !exists { return Err(format!("plugin {plugin_id} is unavailable or pending removal")); }
+                }
+            }
             transaction
                 .execute(
                     "INSERT INTO execution_plans (execution_id, workflow_revision, plan_json, plan_hash, created_at)
@@ -3276,7 +3597,7 @@ impl Store {
         error: Option<&str>,
     ) -> Result<(), String> {
         let completed_at = now()?;
-        self.with_connection(|connection| {
+        let transitioned = self.with_connection(|connection| {
             let transaction = connection.transaction().map_err(database_error)?;
             let execution = transaction
                 .query_row(
@@ -3294,7 +3615,7 @@ impl Store {
                 .ok_or_else(|| format!("execution {id} was not found"))?;
             let (workflow_id, observed_status) = execution;
             if !matches!(observed_status.as_str(), "queued" | "running" | "cancelling") {
-                return Ok(());
+                return Ok(false);
             }
             let changed = transaction
                 .execute(
@@ -3304,7 +3625,7 @@ impl Store {
                 )
                 .map_err(database_error)?;
             if changed == 0 {
-                return Ok(());
+                return Ok(false);
             }
             transaction.execute("UPDATE execution_trace_spans SET status=?2,completed_at=?3,error=COALESCE(?4,'Execution ended before this span was closed') WHERE execution_id=?1 AND status='running'", params![id,if status == "failed" { "failed" } else { "cancelled" },completed_at,error]).map_err(database_error)?;
             append_event(
@@ -3316,8 +3637,14 @@ impl Store {
                 &completed_at,
             )?;
             transaction.commit().map_err(database_error)?;
-            Ok(())
-        })
+            Ok(true)
+        })?;
+        if transitioned {
+            // Execution terminal state and pin release are durable before the
+            // filesystem-side removal reconciliation begins.
+            let _ = crate::plugin_services::reconcile_pending_removals(self);
+        }
+        Ok(())
     }
 
     /// Runtime checkpoints are keyed by the full activation scope. A checkpoint
@@ -4168,7 +4495,7 @@ fn execution_admission(
     Ok("queued".to_string())
 }
 
-const LATEST_SCHEMA_VERSION: u32 = 16;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 17;
 
 fn migrate(connection: &mut Connection) -> Result<(), String> {
     migrate_through_version(connection, LATEST_SCHEMA_VERSION)
@@ -4206,6 +4533,7 @@ fn migrate_through_version(connection: &mut Connection, target_version: u32) -> 
             12 => add_secret_backend(&transaction)?,
             15 => add_auth_pairing_codes(&transaction)?,
             16 => add_management_storage(&transaction)?,
+            17 => add_plugin_lifecycle_storage(&transaction)?,
             14 => transaction.execute_batch("CREATE TABLE execution_idempotency (request_key TEXT PRIMARY KEY, request_hash TEXT NOT NULL, execution_id TEXT NOT NULL REFERENCES executions(id) ON DELETE CASCADE);").map_err(database_error)?,
             13 => transaction
                 .execute_batch(
@@ -4229,6 +4557,42 @@ fn migrate_through_version(connection: &mut Connection, target_version: u32) -> 
         transaction.commit().map_err(database_error)?;
     }
     Ok(())
+}
+
+fn add_plugin_lifecycle_storage(transaction: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS executions (
+            id TEXT PRIMARY KEY, workflow_name TEXT NOT NULL, status TEXT NOT NULL,
+            created_at TEXT NOT NULL, completed_at TEXT, error TEXT
+         );
+         CREATE TABLE plugin_lifecycle (
+            plugin_id TEXT PRIMARY KEY REFERENCES installed_plugins(id) ON DELETE CASCADE,
+            source TEXT,
+            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'pending removal', 'removal failed')),
+            failure_details TEXT,
+            removal_requested_at TEXT,
+            CHECK(status = 'removal failed' OR failure_details IS NULL)
+         );
+         INSERT INTO plugin_lifecycle (plugin_id) SELECT id FROM installed_plugins;
+         CREATE TRIGGER installed_plugin_lifecycle_insert AFTER INSERT ON installed_plugins
+         BEGIN INSERT INTO plugin_lifecycle (plugin_id) VALUES (NEW.id); END;
+         CREATE TABLE plugin_removal_workflows (
+            plugin_id TEXT NOT NULL REFERENCES plugin_lifecycle(plugin_id) ON DELETE CASCADE,
+            workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+            PRIMARY KEY(plugin_id, workflow_id)
+         );
+         CREATE TABLE plugin_execution_pins (
+            execution_id TEXT NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
+            plugin_id TEXT NOT NULL REFERENCES plugin_lifecycle(plugin_id),
+            version TEXT NOT NULL,
+            digest TEXT NOT NULL,
+            manifest_path TEXT NOT NULL,
+            PRIMARY KEY(execution_id, plugin_id)
+         );
+         CREATE TRIGGER execution_release_plugin_pins AFTER UPDATE OF status ON executions
+         WHEN NEW.status IN ('succeeded', 'failed', 'cancelled', 'timed_out')
+         BEGIN DELETE FROM plugin_execution_pins WHERE execution_id=NEW.id; END;",
+    ).map_err(database_error)
 }
 
 fn schema_version(connection: &Connection) -> Result<u32, String> {
@@ -5881,6 +6245,20 @@ fn execution_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExecutionReco
     })
 }
 
+fn ensure_workflow_not_blocked(
+    transaction: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> Result<(), String> {
+    let blocked: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM plugin_removal_workflows w JOIN plugin_lifecycle l ON l.plugin_id=w.plugin_id WHERE w.workflow_id=?1 AND l.status IN ('pending removal', 'removal failed'))",
+        [id], |row| row.get(0),
+    ).map_err(database_error)?;
+    if blocked {
+        return Err(format!("workflow {id} depends on a plugin pending removal"));
+    }
+    Ok(())
+}
+
 fn execution_status(transaction: &rusqlite::Transaction<'_>, id: &str) -> Result<String, String> {
     transaction
         .query_row("SELECT status FROM executions WHERE id = ?1", [id], |row| {
@@ -6013,6 +6391,21 @@ fn now() -> Result<String, String> {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .map_err(|error| format!("cannot format current time: {error}"))
+}
+
+fn validate_plugin_source(source: &str) -> Result<(), String> {
+    if source.is_empty() || source.len() > 4096 || source.contains(['\r', '\n']) {
+        return Err("invalid plugin source".to_owned());
+    }
+    if let Some(location) = source.strip_prefix("git:") {
+        let url = Url::parse(location).map_err(|_| "invalid plugin source".to_owned())?;
+        if !url.username().is_empty() || url.password().is_some() || url.query().is_some() {
+            return Err(
+                "plugin source must not contain credentials or query parameters".to_owned(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn database_error(error: rusqlite::Error) -> String {

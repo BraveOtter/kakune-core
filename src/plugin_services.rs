@@ -6,6 +6,8 @@ use crate::{
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -126,4 +128,161 @@ fn required<'a>(value: &'a Value, name: &str) -> Result<&'a str, String> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("service parameter {name} is required"))
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginRemovalReport {
+    pub plugin_id: String,
+    pub status: String,
+    pub active_executions: u64,
+    pub affected_workflows: Vec<String>,
+    pub message: String,
+}
+
+/// Atomically publishes the removal barrier and disables workflows that
+/// reference node types actually declared by the installed plugin.
+pub fn request_removal(store: &Store, plugin_id: &str) -> Result<PluginRemovalReport, String> {
+    let plugin = store
+        .list_installed_plugins()?
+        .into_iter()
+        .find(|plugin| plugin.id == plugin_id)
+        .ok_or_else(|| format!("plugin {plugin_id} is not installed"))?;
+    let lifecycle = store
+        .plugin_removal_state(plugin_id)?
+        .ok_or_else(|| "plugin lifecycle record is missing".to_owned())?;
+    if lifecycle.status == "removal failed" {
+        store.resume_plugin_removal(plugin_id)?;
+        if store.plugin_execution_pin_count(plugin_id)? == 0 {
+            reconcile_one(store, plugin_id)?;
+        }
+        return removal_report(store, plugin_id, Vec::new());
+    }
+
+    let node_types =
+        crate::plugin_diagnostics::declared_node_types(Path::new(&plugin.manifest_path))?;
+    let workflows = store.list_workflows()?;
+    if workflows.len() > 10_000 {
+        return Err("plugin removal reference scan exceeds the workflow limit".to_owned());
+    }
+    let mut affected = Vec::new();
+    for workflow in workflows {
+        let Some(source) = store.get_workflow_source(&workflow.id)? else {
+            return Err(format!(
+                "workflow {} disappeared during removal review",
+                workflow.id
+            ));
+        };
+        if crate::plugin_diagnostics::workflow_references(&source.source, &node_types)? {
+            affected.push(workflow.id);
+        }
+    }
+    if affected.len() > 10_000 {
+        return Err("plugin removal affects too many workflows".to_owned());
+    }
+    let ids = affected.iter().map(String::as_str).collect::<Vec<_>>();
+    let active_executions = store.request_plugin_removal(plugin_id, &ids)?;
+    if active_executions == 0 {
+        reconcile_one(store, plugin_id)?;
+    }
+    removal_report(store, plugin_id, affected)
+}
+
+/// Retries pending removals after startup and terminal execution transitions.
+/// Failed removals remain observable until an operator explicitly retries.
+pub fn reconcile_pending_removals(store: &Store) -> Result<Vec<PluginRemovalReport>, String> {
+    let plugins = store.list_installed_plugins()?;
+    if plugins.len() > 10_000 {
+        return Err("plugin removal reconciliation exceeds the installation limit".to_owned());
+    }
+    let mut results = Vec::new();
+    for plugin in plugins {
+        let Some(state) = store.plugin_removal_state(&plugin.id)? else {
+            continue;
+        };
+        if state.status != "pending removal" {
+            continue;
+        }
+        let pins = store.plugin_execution_pin_count(&plugin.id)?;
+        if pins > 0 {
+            continue;
+        }
+        reconcile_one(store, &plugin.id)?;
+        results.push(removal_report(store, &plugin.id, Vec::new())?);
+    }
+    Ok(results)
+}
+
+fn removal_report(
+    store: &Store,
+    plugin_id: &str,
+    affected_workflows: Vec<String>,
+) -> Result<PluginRemovalReport, String> {
+    let lifecycle = store.plugin_removal_state(plugin_id)?;
+    let active_executions = store.plugin_execution_pin_count(plugin_id)?;
+    let (status, message) = match lifecycle {
+        Some(state) if state.status == "pending removal" => (
+            state.status,
+            "removal is pending until all admitted executions finish".to_owned(),
+        ),
+        Some(state) if state.status == "removal failed" => (
+            state.status,
+            state
+                .failure_details
+                .unwrap_or_else(|| "removal failed; retry with plugin remove".to_owned()),
+        ),
+        None => ("removed".to_owned(), "plugin removal completed".to_owned()),
+        Some(state) => (state.status, "plugin removal has not completed".to_owned()),
+    };
+    Ok(PluginRemovalReport {
+        plugin_id: plugin_id.to_owned(),
+        status,
+        active_executions,
+        affected_workflows,
+        message,
+    })
+}
+
+fn reconcile_one(store: &Store, plugin_id: &str) -> Result<(), String> {
+    if store.plugin_execution_pin_count(plugin_id)? > 0 {
+        return Ok(());
+    }
+    let Some(plugin) = store
+        .list_installed_plugins()?
+        .into_iter()
+        .find(|plugin| plugin.id == plugin_id)
+    else {
+        return Ok(());
+    };
+    let outcome = remove_plugin_files(store.data_dir(), &plugin.manifest_path);
+    if let Err(category) = outcome {
+        store.mark_plugin_removal_failed(plugin_id, category)?;
+        return Ok(());
+    }
+    if store.finalize_plugin_removal(plugin_id).is_err() {
+        store.mark_plugin_removal_failed(plugin_id, "storage finalization failed")?;
+    }
+    Ok(())
+}
+
+fn remove_plugin_files(data_dir: &Path, manifest_path: &str) -> Result<(), &'static str> {
+    let root = data_dir.join("plugins");
+    let manifest = PathBuf::from(manifest_path);
+    let package = manifest.parent().ok_or("invalid plugin path")?;
+    if !package.starts_with(&root) || package == root {
+        return Err("plugin path outside managed directory");
+    }
+    if !package.exists() {
+        return Ok(());
+    }
+    let root_canonical = fs::canonicalize(&root).map_err(|_| "managed directory unavailable")?;
+    let package_metadata = fs::symlink_metadata(package).map_err(|_| "plugin path unavailable")?;
+    if package_metadata.file_type().is_symlink() || !package_metadata.is_dir() {
+        return Err("plugin path is not a managed directory");
+    }
+    let package_canonical = fs::canonicalize(package).map_err(|_| "plugin path unavailable")?;
+    if !package_canonical.starts_with(&root_canonical) {
+        return Err("plugin path outside managed directory");
+    }
+    fs::remove_dir_all(package).map_err(|_| "plugin filesystem removal failed")
 }

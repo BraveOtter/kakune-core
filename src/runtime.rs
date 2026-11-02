@@ -23,14 +23,14 @@ use crate::{
     workflow::{WorkflowBinding, WorkflowNode, WorkflowSubgraph},
 };
 
-const STANDALONE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
-const STANDALONE_MAX_TIMEOUT: Duration = Duration::from_secs(3_600);
+const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_EXECUTION_TIMEOUT: Duration = Duration::from_secs(3_600);
 const STANDALONE_ADMISSION_WAIT: Duration = Duration::from_secs(30);
 const STANDALONE_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
-const STANDALONE_MAX_RESULT_BYTES: usize = 4 * 1_048_576;
-const STANDALONE_MAX_NODE_RESULT_BYTES: usize = 1_048_576;
+const MAX_EXECUTION_RESULT_BYTES: usize = 4 * 1_048_576;
+const MAX_NODE_RESULT_BYTES: usize = 1_048_576;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct ExecutionLimits {
     max_execution_result_bytes: Option<usize>,
     max_node_result_bytes: Option<usize>,
@@ -38,15 +38,44 @@ struct ExecutionLimits {
     shutdown_grace: Option<Duration>,
 }
 
+impl Default for ExecutionLimits {
+    fn default() -> Self {
+        Self {
+            max_execution_result_bytes: Some(MAX_EXECUTION_RESULT_BYTES),
+            max_node_result_bytes: Some(MAX_NODE_RESULT_BYTES),
+            admission_wait: None,
+            shutdown_grace: None,
+        }
+    }
+}
+
 impl ExecutionLimits {
     fn standalone() -> Self {
         Self {
-            max_execution_result_bytes: Some(STANDALONE_MAX_RESULT_BYTES),
-            max_node_result_bytes: Some(STANDALONE_MAX_NODE_RESULT_BYTES),
+            max_execution_result_bytes: Some(MAX_EXECUTION_RESULT_BYTES),
+            max_node_result_bytes: Some(MAX_NODE_RESULT_BYTES),
             admission_wait: Some(STANDALONE_ADMISSION_WAIT),
             shutdown_grace: Some(STANDALONE_SHUTDOWN_GRACE),
         }
     }
+}
+
+fn ensure_finite_execution_timeout(
+    policy: &mut crate::workflow::WorkflowPolicy,
+) -> Result<Duration, String> {
+    if policy.timeout.is_none() {
+        policy.timeout = Some(format!("{}s", DEFAULT_EXECUTION_TIMEOUT.as_secs()));
+    }
+    let timeout = parse_duration(
+        policy
+            .timeout
+            .as_deref()
+            .expect("execution timeout is always set above"),
+    )?;
+    if timeout > MAX_EXECUTION_TIMEOUT {
+        return Err("workflow timeout must not exceed 3,600 seconds".to_owned());
+    }
+    Ok(timeout)
 }
 
 pub fn run_workflow(store: &Store, workflow: &WorkflowDocument) -> Result<ExecutionRecord, String> {
@@ -174,6 +203,7 @@ pub fn prepare_execution_with_context_request(
     }
     let mut compiled = planner::compile(source, plugins)
         .map_err(|diagnostics| planner::diagnostics_message(&diagnostics))?;
+    ensure_finite_execution_timeout(&mut compiled.plan.policy)?;
     validate_provider_profiles(store, &compiled.ir.nodes)?;
     compiled.plan.input_values = input_values;
     compiled.plan.trigger_values = trigger_values;
@@ -190,7 +220,8 @@ pub fn prepare_execution_with_context_request(
 
 /// Canonical management admission pins the workflow revision in the same
 /// transaction that stores the executable plan and always has a finite
-/// deadline. Legacy entry points retain their existing policy behavior.
+/// deadline. Legacy entry points receive the same finite default when policy
+/// does not set one.
 pub fn prepare_canonical_execution_with_context_request(
     store: &Store,
     source: &str,
@@ -259,28 +290,46 @@ fn prepare_canonical_execution_with_eligibility(
     let mut compiled = planner::compile(source, plugins)
         .map_err(|diagnostics| planner::diagnostics_message(&diagnostics))?;
     validate_provider_profiles(store, &compiled.ir.nodes)?;
-    if compiled.plan.policy.timeout.is_none() {
-        compiled.plan.policy.timeout = Some("300s".to_owned());
-    }
-    let timeout = parse_duration(
-        compiled
-            .plan
-            .policy
-            .timeout
-            .as_deref()
-            .expect("canonical execution always has a deadline"),
-    )?;
-    if timeout > Duration::from_secs(3_600) {
-        return Err("canonical workflow timeout must not exceed 3,600 seconds".into());
-    }
+    ensure_finite_execution_timeout(&mut compiled.plan.policy)?;
     compiled.plan.input_values = input_values;
     compiled.plan.trigger_values = trigger_values;
     let plan_value = serde_json::to_value(&compiled.plan)
         .map_err(|error| format!("cannot encode execution plan: {error}"))?;
-    store.create_execution_with_plan_if_current_revision_request(
+    let mut pending: Vec<&WorkflowNode> = compiled.ir.nodes.iter().collect();
+    let mut plugin_ids = std::collections::BTreeSet::new();
+    while let Some(node) = pending.pop() {
+        if let Some(plugin) = plugins.get(&node.node_type) {
+            let path = plugin
+                .manifest_path()
+                .and_then(Path::to_str)
+                .ok_or_else(|| "plugin catalog does not have a valid manifest path".to_owned())?;
+            let root = Path::new(path)
+                .parent()
+                .ok_or_else(|| "plugin manifest has no package directory".to_owned())?;
+            let digest = crate::plugin_install::package_digest(root)?;
+            if digest != plugin.content_digest() {
+                return Err("plugin content changed since catalog loading".to_owned());
+            }
+            plugin_ids.insert((
+                plugin.manifest_id.as_str(),
+                plugin.plugin_version(),
+                path,
+                plugin.content_digest(),
+            ));
+        }
+        if let Some(body) = &node.body {
+            pending.extend(&body.nodes);
+        }
+        for branch in node.branches.values() {
+            pending.extend(&branch.nodes);
+        }
+    }
+    let plugin_ids: Vec<(&str, &str, &str, &str)> = plugin_ids.into_iter().collect();
+    store.admit_plan_with_plugin_versions(
         &compiled.ir.metadata.id,
         revision,
         &plan_value,
+        &plugin_ids,
         eligibility.identity,
         eligibility.require_enabled,
     )
@@ -319,14 +368,14 @@ fn run_standalone_workflow_with_limits(
     } else if let Some(timeout) = compiled.plan.policy.timeout.as_deref() {
         Some(timeout.to_owned())
     } else {
-        Some(format!("{}s", STANDALONE_DEFAULT_TIMEOUT.as_secs()))
+        Some(format!("{}s", DEFAULT_EXECUTION_TIMEOUT.as_secs()))
     };
     let timeout_duration = parse_duration(
         timeout
             .as_deref()
             .expect("standalone executions always have a timeout"),
     )?;
-    if timeout_duration > STANDALONE_MAX_TIMEOUT {
+    if timeout_duration > MAX_EXECUTION_TIMEOUT {
         return Err("standalone workflow timeout must not exceed 3,600 seconds".to_owned());
     }
     compiled.plan.policy.timeout = timeout;
@@ -377,19 +426,15 @@ fn execute_prepared_workflow_with_shutdown(
     shutdown_requested: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     limits: ExecutionLimits,
 ) -> Result<ExecutionRecord, String> {
-    let plan: planner::ExecutionPlan = serde_json::from_value(
+    let mut plan: planner::ExecutionPlan = serde_json::from_value(
         store
             .execution_plan(&execution.id)?
             .ok_or_else(|| format!("execution {} has no persisted plan", execution.id))?,
     )
     .map_err(|error| format!("cannot decode persisted execution plan: {error}"))?;
-    let total_deadline = plan
-        .policy
-        .timeout
-        .as_deref()
-        .map(|timeout| store.execution_time_remaining(&execution.id, parse_duration(timeout)?))
-        .transpose()?
-        .map(|remaining| Instant::now() + remaining);
+    let timeout = ensure_finite_execution_timeout(&mut plan.policy)?;
+    let total_deadline =
+        Some(Instant::now() + store.execution_time_remaining(&execution.id, timeout)?);
     let admission_deadline = limits.admission_wait.map(|wait| {
         let admission_deadline = Instant::now() + wait;
         total_deadline.map_or(admission_deadline, |total| total.min(admission_deadline))
@@ -537,9 +582,7 @@ fn execute_nodes(
             .len()
             > limit
     {
-        return Err(format!(
-            "standalone execution result exceeds the {limit}-byte limit"
-        ));
+        return Err(format!("execution result exceeds the {limit}-byte limit"));
     }
     store.set_execution_result(execution_id, &result)?;
     Ok(())
@@ -4212,6 +4255,97 @@ nodes:
     }
 
     #[test]
+    fn library_execution_preparation_sets_a_deadline_and_result_limits_are_defaulted() {
+        let directory = std::env::temp_dir().join(format!(
+            "kakune-default-execution-limits-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(directory.clone()).expect("store should open");
+        let source = "apiVersion: kakune/v1\nkind: Workflow\nmetadata: {id: bounded, name: Bounded}\ntriggers: [{id: manual, type: kakune.trigger.manual@1}]\nentry: pass\nnodes: [{id: pass, type: kakune.flow.pass@1}]\n";
+        let prepared = prepare_execution_with_context(
+            &store,
+            source,
+            "test",
+            &PluginRegistry::default(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        )
+        .expect("library preparation should succeed");
+        let prepared_plan = store
+            .execution_plan(&prepared.id)
+            .expect("prepared plan should load")
+            .expect("prepared plan should exist");
+        assert_eq!(prepared_plan["policy"]["timeout"], "300s");
+
+        let mut oversized_node = super::planner::compile(source, &PluginRegistry::default())
+            .expect("workflow should compile");
+        oversized_node.plan.nodes[0].node.inputs.insert(
+            "value".to_owned(),
+            crate::workflow::WorkflowBinding::Literal {
+                literal: Value::String("x".repeat(super::MAX_NODE_RESULT_BYTES + 1)),
+            },
+        );
+        let node_execution = store
+            .create_execution_with_plan(
+                "bounded",
+                "node-limit",
+                &serde_json::to_value(&oversized_node.plan)
+                    .expect("node-limited plan should serialize"),
+            )
+            .expect("node-limited execution should be admitted");
+        let node_error = execute_prepared_workflow_with_plugins(
+            &store,
+            node_execution,
+            &PluginRegistry::default(),
+        )
+        .expect_err("default execution must cap node results");
+        assert!(
+            node_error.contains("node pass result exceeds"),
+            "{node_error}"
+        );
+
+        let mut oversized_result = super::planner::compile(source, &PluginRegistry::default())
+            .expect("workflow should compile");
+        oversized_result.plan.nodes[0].node.inputs.insert(
+            "value".to_owned(),
+            crate::workflow::WorkflowBinding::Literal {
+                literal: Value::String("x".repeat(900_000)),
+            },
+        );
+        oversized_result.plan.outputs = (0..5)
+            .map(|index| {
+                (
+                    format!("result{index}"),
+                    crate::workflow::WorkflowBinding::From {
+                        from: "pass.value".to_owned(),
+                    },
+                )
+            })
+            .collect();
+        let result_execution = store
+            .create_execution_with_plan(
+                "bounded",
+                "execution-limit",
+                &serde_json::to_value(&oversized_result.plan)
+                    .expect("result-limited plan should serialize"),
+            )
+            .expect("result-limited execution should be admitted");
+        let result_error = execute_prepared_workflow_with_plugins(
+            &store,
+            result_execution,
+            &PluginRegistry::default(),
+        )
+        .expect_err("default execution must cap aggregate results");
+        assert!(
+            result_error.contains("execution result exceeds"),
+            "{result_error}"
+        );
+
+        drop(store);
+        fs::remove_dir_all(directory).expect("temporary data should be removed");
+    }
+
+    #[test]
     fn standalone_admission_wait_is_bounded_by_its_own_and_total_deadlines() {
         let directory = std::env::temp_dir().join(format!(
             "kakune-standalone-admission-{}",
@@ -4269,7 +4403,7 @@ nodes:
         oversized_node.plan.nodes[0].node.inputs.insert(
             "value".to_owned(),
             crate::workflow::WorkflowBinding::Literal {
-                literal: Value::String("x".repeat(super::STANDALONE_MAX_NODE_RESULT_BYTES + 1)),
+                literal: Value::String("x".repeat(super::MAX_NODE_RESULT_BYTES + 1)),
             },
         );
         let node_plan = serde_json::to_value(&oversized_node.plan)
@@ -4322,7 +4456,7 @@ nodes:
         )
         .expect_err("an execution result over 4 MiB should fail");
         assert!(
-            result_error.contains("standalone execution result exceeds"),
+            result_error.contains("execution result exceeds"),
             "{result_error}"
         );
 

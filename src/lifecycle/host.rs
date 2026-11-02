@@ -114,6 +114,14 @@ pub async fn serve(
                 "Recovered {recovered} incomplete execution(s) after a previous Core shutdown."
             )))?;
         }
+        for removal in crate::plugin_services::reconcile_pending_removals(&store)? {
+            if removal.status != "removed" {
+                host.report(HostEvent::Diagnostic(format!(
+                    "Plugin {} removal remains {}.",
+                    removal.plugin_id, removal.status
+                )))?;
+            }
+        }
         let plugins =
             load_installed_plugin_registry(&store)?.with_diagnostic_reporter(reporter.clone());
         let queued = store.queued_executions()?;
