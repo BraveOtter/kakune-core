@@ -57,7 +57,7 @@ keyring = "4.2.0"
 notify = "8.2.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["form", "json", "rustls", "stream"] }
 rpassword = "=7.5.4"
-rusqlite = { version = "0.40.2", features = ["backup", "bundled", "chrono"] }
+rusqlite = { version = "0.40.2", features = ["backup", "bundled", "chrono", "serialize"] }
 saphyr = "0.0.12"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -81,6 +81,7 @@ tower = "0.5.2"
 
 [target.'cfg(windows)'.dependencies]
 known-folders = "1.4.2"
+tempfile = "3.27.0"
 windows = { version = "0.62.2", features = ["Win32_System_Threading"] }
 windows-permissions = "0.2.4"
 windows-service = "0.8.1"
@@ -89,7 +90,12 @@ windows-service = "0.8.1"
 rustix = { version = "1.1.4", default-features = false, features = ["process", "std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.7"
+nix = { version = "0.31.3", features = ["fs"] }
 sd-notify = "0.5.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { version = "0.31.3", features = ["fs"] }
 
 [lints.rust]
 unsafe_code = "forbid"
