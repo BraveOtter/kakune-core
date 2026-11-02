@@ -2,6 +2,12 @@
 
 Kakune Core es el runtime local-first para los workflows de Kakune. Se encarga de validar workflows, conservar el historial de ejecuciones, proporcionar un workspace aislado y exponer la API HTTP publica que consumen la GUI y el SDK.
 
+## Documentacion
+
+- [Manual tecnico y de uso (espanol)](docs/manual-es.md): instalacion, arquitectura, referencia completa de la CLI, lenguaje de workflows, catalogo de nodos, triggers, integraciones, API HTTP, almacenamiento y diagnostico.
+- [Guia de migracion de la CLI](docs/cli-migration.md): rutas eliminadas y su equivalente canonico.
+- [Esquema de almacenamiento 17](docs/storage-schema-17.md): esquema SQLite, respaldo previo a migraciones y superficie de observacion.
+
 ## Requisitos
 
 - Rust 1.98.1, instalado automaticamente por `rustup` mediante `rust-toolchain.toml`.
@@ -115,7 +121,7 @@ Las raices filesystem deben ser directorios existentes expresados como paths rel
 
 ## Nodos de plugins externos
 
-Los nodos externos son plugins de proceso locales y requieren una accion explicita. `kakune plugin prepare` descarga o copia bytes sin ejecutar scripts ni procesos, valida sus manifiestos estaticos y devuelve un digest; `kakune plugin commit <prepared-id> --digest <digest>` activa exactamente esos bytes. El mismo flujo esta disponible mediante `POST /api/v1/plugins/prepare` y `POST /api/v1/plugin-installations/{id}/commit`. Un llamador Rust embebido tambien puede cargar el manifiesto estatico y registrar sus definiciones antes de usar `run_workflow_with_plugins`:
+Los nodos externos son plugins de proceso locales y requieren una accion explicita. `kakune plugin install <ruta-local|npm:paquete@version|git:url#ref>` y `plugin update` revisan la identidad, version, digest, contenido y capacidades solicitadas antes de activar solo el digest aprobado. La revision no ejecuta scripts, instaladores de dependencias ni procesos del plugin. La API de gestion mantiene endpoints separados de preparacion/confirmacion para clientes que implementen ese protocolo; no son comandos adicionales del CLI. Un llamador Rust embebido tambien puede cargar el manifiesto estatico y registrar sus definiciones antes de usar `run_workflow_with_plugins`:
 
 ```rust
 use kakune_core::{PluginRegistry, run_workflow_with_plugins};
@@ -158,9 +164,9 @@ La API versionada usa la raiz `/api/v1`:
 - `GET, POST /api/v1/executions`
 - `GET /api/v1/executions/{id}`
 
-`kakune init` guarda la credencial `admin` inicial en el gestor de credenciales del sistema y configura el contexto local del CLI; el uso local habitual no requiere copiar tokens. La base de datos solo conserva digests SHA-256. Si se pierde el acceso local, ejecuta `kakune auth recover --data-dir <directorio>` en la maquina del Core para emitir una credencial nueva y revocar todos los tokens activos anteriores. Si el gestor de credenciales del sistema no esta disponible, el comando muestra el token nuevo una sola vez para usarlo mediante `KAKUNE_TOKEN`.
+`kakune init` guarda la credencial `admin` inicial en el gestor de credenciales del sistema y configura el contexto local del CLI; el uso local habitual no requiere copiar tokens. La base de datos solo conserva digests SHA-256. El CLI canonico no incluye comandos de recuperacion de acceso, invitacion de emparejamiento, listado de tokens ni revocacion. Repetir la inicializacion no recupera el acceso ni sustituye/revoca credenciales existentes. Si se pierde el acceso, sigue el procedimiento administrativo autorizado de la implementacion y conserva el directorio de datos; no uses comandos eliminados ni borres el almacenamiento.
 
-Para conectar una GUI, ejecuta `kakune auth pair --data-dir <directorio>` en una terminal del Core, escanea el QR desde la GUI y aprueba el dispositivo identificado en esa terminal. Para habilitar los endpoints en un Core existente, actualiza el binario y reinicialo una vez; la migracion de la base de datos y su copia de seguridad previa se realizan automaticamente. La invitacion caduca a los cinco minutos y solo puede reclamarse una vez. Por defecto, el token del dispositivo tiene scopes `read`, `run` y `manage`; `--admin` concede administracion completa de forma explicita. Para una GUI en otro equipo, indica la URL HTTPS accesible del Core con `--endpoint https://core.example.com:8787`. Antes del emparejamiento configura `api.allowedHosts` y, si la GUI usa navegador, su origen en `api.allowedOrigins`. La GUI debe consultar el estado hasta recibir aprobacion, intercambiar la solicitud aprobada por su token y guardar ese token en su propio gestor de credenciales. Usa `kakune auth tokens --data-dir <directorio>` para listar credenciales y `kakune auth revoke <id-del-token> --data-dir <directorio>` para revocar un dispositivo. Los endpoints de emparejamiento no requieren autenticacion Bearer, pero exigen el QR de alta entropia, un secreto de reclamacion generado por la GUI, aprobacion local y HTTPS para endpoints que no sean loopback.
+La API HTTP conserva endpoints de gestion de tokens y emparejamiento de GUI, pero los comandos interactivos eliminados no estan disponibles. Los clientes de API deben usar el protocolo documentado `/api/v1/auth/tokens` y `/api/v1/auth/pair/*` con las protecciones TLS, host y origen configuradas. Las solicitudes de emparejamiento requieren un codigo de invitacion, un secreto de reclamacion generado por la GUI y aprobacion local; el protocolo API no convierte `auth pair`, `auth tokens`, `auth revoke` ni `auth recover` en comandos validos del CLI.
 
 El payload del QR usa `format: "kakune-pairing/v1"` e incluye `endpoint`, `coreId`, `pairingCode`, `expiresAt` y los scopes concedidos. La GUI genera un `claimSecret` nuevo con al menos 32 bytes aleatorios, envia `{ pairingCode, claimSecret, deviceName }` a `/api/v1/auth/pair/claim` y consulta `/api/v1/auth/pair/status` con `{ pairingCode, claimSecret }`. Tras la aprobacion local, envia la misma prueba a `/api/v1/auth/pair/exchange`; la respuesta de un solo uso contiene `coreId`, `token`, `tokenId`, `name` y `scopes`. Antes de guardar el token, la GUI debe comprobar que `coreId` coincide con el del QR.
 
@@ -190,16 +196,7 @@ Las definiciones systemd y launchd de `packaging/` son plantillas de sistema, no
 
 Por defecto los secretos usan Credential Manager, Keychain o Secret Service, aislados por el `coreId` persistente. Para un host headless configura explicitamente `KAKUNE_SECRET_STORE=vault` y proporciona `KAKUNE_VAULT_PASSPHRASE` desde el gestor de servicios. No existe fallback a texto plano ni se oculta un fallo del keyring con una copia vault. No copies tokens a unidades, archivos plist, logs o argumentos de comandos.
 
-Los backups excluyen secretos por estar ligados a usuario y maquina. Incluyen workflows, ejecuciones, artefactos, workspace y configuracion; el restore exige otro directorio vacio:
-
-```powershell
-kakune storage backup .\kakune-backup.tar.gz --data-dir .\data
-kakune storage restore .\kakune-backup.tar.gz .\restored-data
-kakune storage retain --execution-days 90 --event-days 90 --artifact-limit-bytes 5368709120 --data-dir .\data
-kakune storage compact --data-dir .\data
-```
-
-La retencion conserva ejecuciones fijadas, borra ejecuciones completas y eventos vencidos, y elimina artefactos sin referencias solo al superar el limite de disco. `scripts/measure-idle.ps1` conserva mediciones de memoria privada, CPU y procesos hijo para la evidencia de la fase.
+Usa los procedimientos de backup consistente y retencion admitidos por el despliegue; backup, restore, retencion, compactacion y fijado de ejecuciones no son operaciones del CLI canonico. Los procedimientos de restore deben usar un destino aislado y distinto. La [guia de migracion del CLI](docs/cli-migration.md) enumera estas eliminaciones e indica que no hay comandos CLI equivalentes. `scripts/measure-idle.ps1` conserva mediciones de memoria privada, CPU y procesos hijo para la evidencia de la fase.
 
 ## Verificar
 

@@ -49,13 +49,9 @@ kakune context import <file>
 kakune context export <name> --output <file> [--replace]
 ```
 
-`init`, `doctor`, context management, storage maintenance, and Core API authentication (`auth`) are local operations. `doctor` is read-only: it reports configuration, storage, database, credentials, Core, service, compatibility, and platform findings without setup, repair, or migration. Any failed finding or required unknown finding exits 1; optional warnings/unknown findings alone exit 0; invalid arguments exit 2. `kakune version` and `kakune --version` report the same local build version without reading installation files or contacting a Core.
+`init`, `doctor`, context management, and lifecycle controls are local operations. `doctor` is read-only: it reports configuration, storage, database, credentials, Core, service, compatibility, and platform findings without setup, repair, or migration. Any failed finding or required unknown finding exits 1; optional warnings/unknown findings alone exit 0; invalid arguments exit 2. `kakune version` and `kakune --version` report the same local build version without reading installation files or contacting a Core.
 
-Initialization remains safe to repeat. It creates only missing valid resources and preserves existing configuration, credential history, custom connection fields, unrelated contexts, and active selection. Initial access is saved and verified in the OS credential manager; failure is reported as partial setup, never as a printed-token fallback. Recovery remains explicit:
-
-```text
-kakune --context-file <contexts-file> auth recover --data-dir <directory> --config <config-file>
-```
+Initialization remains safe to repeat. It creates only missing valid resources and preserves existing configuration, credential history, custom connection fields, unrelated contexts, and active selection. Initial access is saved and verified in the OS credential manager; failure is reported as partial setup, never as a printed-token fallback. Re-running `init` does not recover lost access or replace credentials. If access is lost, follow the deployment's existing authorized administrative recovery procedure; no canonical recovery CLI command exists. See the [CLI migration guide](docs/cli-migration.md).
 
 Unless overridden, configuration is `<data-dir>/kakune.yaml` and connection metadata is `<data-dir>/cli/contexts.json`. `init` configures the loopback listener, explicit browser-origin allowlist, 1 MiB API request limit, and request rate limit:
 
@@ -73,7 +69,7 @@ Use `daemon start|status|stop` for the current-user background Core; `service in
 
 - Core-backed workflow, execution, trigger, provider, named MCP, and secret commands use the active context, or `--context <id>` to select one. `--context-file <path>` selects a connection collection and `--ca <file>` supplies a TLS CA. Missing selection, identity mismatch, authorization failure, and unreachable Cores fail; there is no implicit localhost or local-Store fallback.
 - `--data-dir` selects local data for commands that support it; it **does not** make a Core-backed command standalone. Use `--standalone` only for a documented direct-local execution. Local authoring/checks and context/doctor operations disclose their local scope.
-- Canonical commands use human-readable output by default and `--json` for machine-readable outcomes where available. Every canonical provider, named MCP, and secret command supports both modes; `--json` does not change the separate legacy `provider` or one-shot `mcp call` contracts. Canonical argument errors exit 2; validation, authorization, unsupported requested capability, and operation failures exit 1; success and explicit no-op outcomes exit 0. Legacy extras retain their own output and exit contracts.
+- Canonical commands use human-readable output by default and `--json` for machine-readable outcomes where available. Every canonical provider, named MCP, and secret command supports both modes. Canonical argument errors exit 2; validation, authorization, unsupported requested capability, and operation failures exit 1; success and explicit no-op outcomes exit 0. Unlisted legacy CLI paths are rejected; their migration mappings and behavioral differences are documented in the [CLI migration guide](docs/cli-migration.md).
 - Canonical list commands return one bounded page. Use `--limit <n>` and `--cursor <opaque>` to continue; a cursor is opaque and must be reused with the same query. Results are not silently fetched without a bound.
 - File output is create-only unless `--replace` is supplied. Provide `--output <file>` where required; parent directories are not created automatically. Imports validate before changing a Core. File paths must use the command's documented positional argument or explicit `--file`/`--input` option; a workflow file is never guessed from its name.
 
@@ -139,24 +135,11 @@ kakune secret remove <name> [--json]
 
 Provider add is create-only. MiniMax authentication accepts hidden terminal input or explicit bounded `--stdin`; Codex uses its supported browser flow. Neither current provider supports live model discovery: `provider models` labels configured/static data and reports discovery as unsupported rather than inventing results. MCP uses the existing stdio and HTTP transports; tool input is validated against the discovered schema before one named call. `mcp auth --secret <reference>` binds an existing secret reference and never accepts secret values or stdin. Run `secret set <name> --stdin` separately when needed. Secret values are never accepted as ordinary arguments, included in output, or shown by `secret list`.
 
-Without `--json`, provider, named MCP, and secret commands print human-readable summaries/tables. Use `--json` on any canonical command in these three families for typed JSON output, including paginated list results and operation outcomes. Secret values are excluded from both modes. This option does not apply to legacy `provider upsert|status|remove|login` or the one-shot `mcp call` command.
+Without `--json`, provider, named MCP, and secret commands print human-readable summaries/tables. Use `--json` on any canonical command in these three families for typed JSON output, including paginated list results and operation outcomes. Secret values are excluded from both modes.
 
-### Legacy extras and migration
+### CLI migration
 
-Legacy entry points remain available; they are **not** aliases for the canonical commands. Their compatibility ledger and per-command evidence are in [`specs/003-complete-command-surface/command-review.md`](specs/003-complete-command-surface/command-review.md).
-
-| Legacy invocation | Possible canonical migration | Difference to account for |
-| --- | --- | --- |
-| `kakune run flow.yaml` | `workflow import flow.yaml`, then `workflow run id:flow` | Legacy run registers/enables; canonical import starts disabled and manual run does not enable. Explicitly `workflow enable` only if that old side effect is desired. |
-| `kakune executions --data-dir data` | `execution list --limit 100 --json` | Only if the selected Core is the intended target; canonical list is Core-backed and paginated. |
-| `kakune inspect E --data-dir data` | `execution inspect E --json` | Target and output schema differ; canonical detail includes explicit availability/continuation. |
-| `provider upsert profile.json` | `provider add id --file profile.json` | Only for create; canonical add rejects duplicates. Existing-profile update has no canonical replacement. |
-| `provider login codex-id` | `provider auth codex-id` | Codex browser auth overlaps, but target and outcome/presentation contracts differ. |
-| `provider status id` | No exact replacement | Cached diagnostics are not equivalent to active `provider test`. |
-| `mcp call call.json` | `mcp add name --file connection.json`, then `mcp tool call name tool --input args.json` | Converts a one-shot file into persistent named configuration and adds discovery/schema validation; convert credentials to references deliberately. |
-| `provider remove`, `auth recover|pair|tokens|revoke`, `storage backup|restore|retain|compact|pin` | No exact replacement | These operations have distinct profile, Core-access, pairing, backup, retention, compaction, or pinning effects. Keep their existing invocations. |
-
-The legacy `provider upsert|status|remove|login`, `mcp call`, top-level `run|executions|inspect`, `auth`, and `storage` contracts remain separate. No extra is removed or newly deprecated. Existing Plugin commands remain unchanged and Plugin expansion is outside this scope.
+The CLI accepts the canonical paths listed in this guide and rejects unlisted legacy alternatives rather than aliasing them. The [breaking-change migration guide](docs/cli-migration.md) maps every removed path, describes former arguments/output/effects, and gives a canonical migration where one exists. It also identifies operations with no CLI equivalent. Rejected commands do not change existing workflows, plugin installations, credentials, or storage.
 
 Measure the release Core's idle private memory and CPU on Windows with `powershell -ExecutionPolicy Bypass -File .\scripts\measure-idle.ps1`. The script also fails if an empty Core has a Codex, Node, or Python child process.
 
@@ -330,7 +313,7 @@ triggers:
 
 ## External plugin nodes
 
-External nodes are opt-in process plugins. Installations always use a two-phase review: `kakune plugin prepare <local-path|npm:package@version|git:url#ref>` copies or downloads bytes, validates only static manifests and definitions, and returns a digest; `kakune plugin commit <prepared-id> --digest <digest>` activates exactly those bytes. Package scripts, dependency installers, and plugin processes are never run during preparation. The same flow is available through `POST /api/v1/plugins/prepare` and `POST /api/v1/plugin-installations/{id}/commit`.
+External nodes are opt-in process plugins. `kakune plugin install <local-path|npm:package@version|git:url#ref>` and `plugin update` review a package's identity, version, digest, content, and requested capabilities before activating only the explicitly approved digest. Package scripts, dependency installers, and plugin processes are not run during review. The management API exposes separate prepare/commit endpoints for clients implementing that protocol; those endpoints are not additional CLI commands.
 
 An embedding Rust caller can also explicitly load a static manifest and register its declared definitions before using `run_workflow_with_plugins`:
 
@@ -378,9 +361,9 @@ The versioned API is rooted at `/api/v1`:
 - `GET, POST /api/v1/executions`
 - `GET /api/v1/executions/{id}`
 
-`kakune init` provisions initial administrative access in the operating system's credential manager and configures the local CLI context; normal local CLI use does not require copying a token. The database stores only SHA-256 token digests. If local access is lost, run `kakune auth recover --data-dir <directory>` on the Core machine to deliberately issue a new credential and revoke previous active tokens. Recovery remains distinct from initialization; if the OS credential manager is unavailable, the recovery command retains its existing behavior of showing the new token once for use through `KAKUNE_TOKEN`. Initialization never uses that plaintext fallback.
+`kakune init` provisions initial administrative access in the operating system's credential manager and configures the local CLI context; normal local CLI use does not require copying a token. The database stores only SHA-256 token digests. The canonical CLI has no access-recovery, pairing-invitation, token-list, or token-revocation commands. Re-running initialization does not recover access or revoke/replace existing credentials. If local access is lost, follow the deployment's existing authorized administrative recovery procedure and preserve the current data directory; do not use a removed command or delete storage.
 
-To connect a GUI, run `kakune auth pair --data-dir <directory>` in a Core terminal, scan its QR from the GUI, then approve the named device in that terminal. Updating an existing Core and restarting it once enables these endpoints; the database migration and pre-upgrade backup run automatically. The invitation expires after five minutes and can be claimed once. The resulting device token has `read`, `run`, and `manage` scopes by default; `--admin` explicitly grants full administration. For a GUI on another machine, provide its reachable HTTPS Core URL with `--endpoint https://core.example.com:8787`. Configure the Core's `api.allowedHosts` and, for browser-based GUIs, the GUI origin in `api.allowedOrigins` before pairing. The GUI should poll the pairing status until approval, exchange the approved claim for its token, and keep that token in its own OS credential manager. Use `kakune auth tokens --data-dir <directory>` to list credentials and `kakune auth revoke <token-id> --data-dir <directory>` to revoke one device. The pairing endpoints are unauthenticated by design, but require the high-entropy QR code, a GUI-generated claim secret, the local approval, and HTTPS for non-loopback endpoints.
+The HTTP API retains token-management and GUI-pairing endpoints, but the removed interactive CLI commands are not available. API clients must use the documented `/api/v1/auth/tokens` and `/api/v1/auth/pair/*` protocol with the configured host/origin and TLS protections. Pairing claims require an invitation code, a GUI-generated claim secret, and local approval; the API protocol does not make `auth pair`, `auth tokens`, `auth revoke`, or `auth recover` valid CLI commands.
 
 The QR payload uses `format: "kakune-pairing/v1"` and includes `endpoint`, `coreId`, `pairingCode`, `expiresAt`, and granted `scopes`. The GUI generates a fresh `claimSecret` from at least 32 random bytes, posts `{ pairingCode, claimSecret, deviceName }` to `/api/v1/auth/pair/claim`, then polls `/api/v1/auth/pair/status` with `{ pairingCode, claimSecret }`. After the local approval, it posts the same proof to `/api/v1/auth/pair/exchange`; the one-time response contains `coreId`, `token`, `tokenId`, `name`, and `scopes`. The GUI should verify `coreId` matches the QR before saving the token.
 
@@ -417,15 +400,7 @@ KAKUNE_VAULT_PASSPHRASE=<secret supplied by the service manager>
 
 `KAKUNE_SECRET_STORE=native-with-vault-backup` writes both stores for a planned migration. There is no plaintext fallback, and a native-store read failure never silently serves the vault copy. Backups deliberately exclude secret records because OS credentials are user and machine bound; restore the provider credentials through the intended service identity.
 
-Create and restore consistent backups with SQLite's backup API. Restore always requires a distinct, empty directory.
-
-```powershell
-kakune storage backup .\kakune-backup.tar.gz --data-dir .\data
-kakune storage restore .\kakune-backup.tar.gz .\restored-data
-kakune storage retain --execution-days 90 --event-days 90 --artifact-limit-bytes 5368709120 --data-dir .\data
-kakune storage compact --data-dir .\data
-kakune storage pin <execution-id> --value true --data-dir .\data
-```
+Use the deployment's supported consistent-backup and retention procedures; storage backup, restore, retention, compaction, and pinning are not canonical CLI operations. Restore procedures must use a distinct isolated destination. The [CLI migration guide](docs/cli-migration.md) lists these removals and explicitly notes that no equivalent CLI commands exist.
 
 Retention keeps pinned executions, removes completed unpinned executions and expired events incrementally, deletes unreferenced artifacts only when the configured disk limit is exceeded, and checkpoints plus compacts SQLite. Backups include workflows, executions, artifacts, workspace data, and configuration, but not secrets.
 
