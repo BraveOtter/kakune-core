@@ -34,7 +34,7 @@ pub mod helper;
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
-mod native;
+pub(crate) mod native;
 #[cfg(windows)]
 pub mod windows;
 

@@ -13,7 +13,7 @@ use std::io::Write;
 use super::{LifecycleError, MonotonicClock};
 use crate::lifecycle::{Deadline, MAX_HELPER_DIAGNOSTIC_BYTES, process::BoundedCapture};
 
-pub(super) struct NativeCommandOutput {
+pub(crate) struct NativeCommandOutput {
     pub status_success: bool,
     pub code: Option<i32>,
     pub stdout: BoundedCapture,
@@ -39,7 +39,7 @@ impl NativeCommandOutput {
 /// Runs a native manager client as an owned child, with bounded output and an
 /// absolute deadline. Killing this client is not treated as cancellation of a
 /// manager request it may already have submitted.
-pub(super) fn run_owned_command(
+pub(crate) fn run_owned_command(
     command: &mut Command,
     deadline: Deadline,
     clock: &dyn MonotonicClock,

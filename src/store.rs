@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs, io,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -4621,6 +4622,132 @@ fn schema_version_before_migration(connection: &Connection) -> Result<u32, Strin
     }
 }
 
+#[cfg(windows)]
+fn open_observation_database(path: &Path) -> Result<Connection, String> {
+    open_observation_database_with_hook(path, || {})
+}
+
+#[cfg(windows)]
+fn open_observation_database_with_hook(
+    path: &Path,
+    after_lock: impl FnOnce(),
+) -> Result<Connection, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+    // Excluding FILE_SHARE_WRITE and FILE_SHARE_DELETE also rejects existing
+    // writer handles. Hold the handle until the complete snapshot is copied.
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1) // FILE_SHARE_READ
+        .open(path)
+        .map_err(|_| "safe snapshot unavailable".to_owned())?;
+    after_lock();
+    if ["-wal", "-shm", "-journal"]
+        .iter()
+        .any(|suffix| sidecar_state(&sidecar_path(path, suffix)).is_some())
+    {
+        return Err("safe snapshot unavailable".to_owned());
+    }
+    let length = file
+        .metadata()
+        .map_err(|_| "safe snapshot unavailable".to_owned())?
+        .len();
+    if length == 0 || length > MAX_SNAPSHOT_BYTES {
+        return Err("safe snapshot unavailable".to_owned());
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_SNAPSHOT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "safe snapshot unavailable".to_owned())?;
+    if bytes.len() as u64 != length {
+        return Err("safe snapshot unavailable".to_owned());
+    }
+    if bytes.len() >= 20 && (bytes[18] == 2 || bytes[19] == 2) {
+        return Err("safe snapshot unavailable".to_owned());
+    }
+    drop(file);
+    let mut connection = Connection::open_in_memory().map_err(database_error)?;
+    connection
+        .deserialize_read_exact(rusqlite::MAIN_DB, bytes.as_slice(), bytes.len(), true)
+        .map_err(database_error)?;
+    Ok(connection)
+}
+
+#[cfg(target_os = "linux")]
+fn open_observation_database(_path: &Path) -> Result<Connection, String> {
+    Err("safe snapshot unavailable".to_owned())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn open_linux_observation_database_with_hook(
+    path: &Path,
+    after_lock: impl FnOnce(),
+) -> Result<Connection, String> {
+    use nix::{
+        fcntl::{FcntlArg, fcntl},
+        libc,
+    };
+    use std::os::unix::fs::MetadataExt;
+
+    const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+    let mut file = fs::File::open(path).map_err(|_| "safe snapshot unavailable".to_owned())?;
+    // OFD locks conflict with SQLite's POSIX byte-range locks even within this
+    // process and remain attached to this handle when unrelated handles close.
+    let lock = libc::flock {
+        l_type: libc::F_RDLCK as _,
+        l_whence: libc::SEEK_SET as _,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    fcntl(&file, FcntlArg::F_OFD_SETLK(&lock))
+        .map_err(|_| "safe snapshot unavailable".to_owned())?;
+    after_lock();
+    if ["-wal", "-shm", "-journal"]
+        .iter()
+        .any(|suffix| sidecar_state(&sidecar_path(path, suffix)).is_some())
+    {
+        return Err("safe snapshot unavailable".to_owned());
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|_| "safe snapshot unavailable".to_owned())?;
+    let current = fs::metadata(path).map_err(|_| "safe snapshot unavailable".to_owned())?;
+    if metadata.dev() != current.dev()
+        || metadata.ino() != current.ino()
+        || metadata.len() == 0
+        || metadata.len() > MAX_SNAPSHOT_BYTES
+    {
+        return Err("safe snapshot unavailable".to_owned());
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_SNAPSHOT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "safe snapshot unavailable".to_owned())?;
+    let current = fs::metadata(path).map_err(|_| "safe snapshot unavailable".to_owned())?;
+    if bytes.len() as u64 != metadata.len()
+        || metadata.dev() != current.dev()
+        || metadata.ino() != current.ino()
+        || (bytes.len() >= 20 && (bytes[18] == 2 || bytes[19] == 2))
+    {
+        return Err("safe snapshot unavailable".to_owned());
+    }
+    drop(file);
+    let mut connection = Connection::open_in_memory().map_err(database_error)?;
+    connection
+        .deserialize_read_exact(rusqlite::MAIN_DB, bytes.as_slice(), bytes.len(), true)
+        .map_err(database_error)?;
+    Ok(connection)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn open_observation_database(_path: &Path) -> Result<Connection, String> {
+    Err("safe snapshot unavailable".to_owned())
+}
+
 /// Inspects an existing database without enabling WAL, creating a directory,
 /// running migrations, or using SQLite's `immutable=1` mode. Live WAL stores
 /// are deliberately reported unavailable: a read-only view cannot establish
@@ -4659,6 +4786,28 @@ pub(crate) fn observe_database_read_only(path: &Path) -> ReadOnlyDatabaseObserva
         );
     }
 
+    // Closing any descriptor for this inode can release this process's
+    // SQLite POSIX locks, even before attempting an OFD lock. Do not open it.
+    if cfg!(not(windows)) {
+        return unavailable(
+            "A safe local database snapshot is unavailable; use the running Core or a supported snapshot mechanism.",
+        );
+    }
+
+    // SQLite may create WAL and shared-memory files even for a read-only open.
+    // Inspect the fixed header first rather than letting observation publish them.
+    let mut header = [0_u8; 20];
+    match fs::File::open(path).and_then(|mut file| file.read_exact(&mut header)) {
+        Ok(()) if &header[..16] == b"SQLite format 3\0" && (header[18] == 2 || header[19] == 2) => {
+            return unavailable(
+                "SQLite WAL mode cannot be safely observed without creating auxiliary files; use the running Core or close it and retry with a non-WAL snapshot.",
+            );
+        }
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+        Err(_) => return unavailable("Database access could not be verified without mutation."),
+    }
+
     let wal_path = sidecar_path(path, "-wal");
     let shm_path = sidecar_path(path, "-shm");
     if sidecar_state(&wal_path).is_some() || sidecar_state(&shm_path).is_some() {
@@ -4671,11 +4820,7 @@ pub(crate) fn observe_database_read_only(path: &Path) -> ReadOnlyDatabaseObserva
     let before_wal = file_state(&wal_path);
     let before_shm = file_state(&shm_path);
     let inspection = (|| -> Result<ReadOnlyDatabaseObservation, String> {
-        let connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|_| "database could not be opened read-only".to_owned())?;
+        let connection = open_observation_database(path)?;
         connection
             .busy_timeout(MAX_STORE_WAIT)
             .map_err(|_| "database read-only wait policy could not be configured".to_owned())?;
@@ -4683,29 +4828,36 @@ pub(crate) fn observe_database_read_only(path: &Path) -> ReadOnlyDatabaseObserva
             .pragma_update(None, "query_only", "ON")
             .map_err(|_| "database could not be restricted to queries".to_owned())?;
 
-        let tables = connection
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
-            .and_then(|mut statement| {
-                statement
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .map_err(|_| "database catalog could not be read".to_owned())?;
-        let has_table = |name: &str| tables.iter().any(|table| table == name);
-        let recognized_legacy = ["workflows", "node_runs", "auth_tokens"]
-            .iter()
-            .all(|name| has_table(name));
-        if !recognized_legacy {
+        let (workflows, node_runs, auth_tokens, migrations, executions): (bool, bool, bool, bool, bool) = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='workflows'),
+                        EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='node_runs'),
+                        EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_tokens'),
+                        EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'),
+                        EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='executions')",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .map_err(|error| {
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ) {
+                    "database is busy".to_owned()
+                } else {
+                    "database catalog could not be read".to_owned()
+                }
+            })?;
+        if !(workflows && node_runs && auth_tokens) {
             return Err("database does not contain a recognized Kakune schema".to_owned());
         }
 
-        let version = if has_table("schema_migrations") {
+        let version = if migrations {
             schema_version(&connection)?
         } else {
             0
         };
-        let count = |table: &str| -> Result<Option<u64>, String> {
-            if !has_table(table) {
+        let count = |table: &str, present: bool| -> Result<Option<u64>, String> {
+            if !present {
                 return Ok(None);
             }
             let value: i64 = connection
@@ -4717,8 +4869,8 @@ pub(crate) fn observe_database_read_only(path: &Path) -> ReadOnlyDatabaseObserva
                 .map(Some)
                 .map_err(|_| format!("{table} catalog count is invalid"))
         };
-        let workflow_count = count("workflows")?;
-        let execution_count = count("executions")?;
+        let workflow_count = count("workflows", workflows)?;
+        let execution_count = count("executions", executions)?;
         let (status, guidance) = if version > LATEST_SCHEMA_VERSION {
             (
                 ReadOnlyDatabaseStatus::Newer,
@@ -4759,6 +4911,12 @@ pub(crate) fn observe_database_read_only(path: &Path) -> ReadOnlyDatabaseObserva
     }
     match inspection {
         Ok(observation) => observation,
+        Err(guidance) if guidance == "database is busy" => {
+            unavailable("The database is busy; retry observation after the lock is released.")
+        }
+        Err(guidance) if guidance == "safe snapshot unavailable" => unavailable(
+            "A safe local database snapshot is unavailable; use the running Core or a supported snapshot mechanism.",
+        ),
         Err(guidance) if guidance == "database does not contain a recognized Kakune schema" => {
             corrupt(
                 "The database schema is not recognized; preserve it and use a compatible recovery path.",
@@ -4768,6 +4926,152 @@ pub(crate) fn observe_database_read_only(path: &Path) -> ReadOnlyDatabaseObserva
             "The database is unreadable or corrupt; preserve it and investigate before repair.",
         ),
     }
+}
+
+pub(crate) fn observe_plugins_read_only(
+    path: &Path,
+) -> Result<Vec<(String, String, String)>, String> {
+    let observation = observe_database_read_only(path);
+    if observation.status != ReadOnlyDatabaseStatus::Current {
+        return Err(observation.guidance);
+    }
+    let connection = open_observation_database(path)?;
+    connection
+        .busy_timeout(MAX_STORE_WAIT)
+        .map_err(database_error)?;
+    connection
+        .pragma_update(None, "query_only", "ON")
+        .map_err(database_error)?;
+    connection.execute_batch("BEGIN").map_err(database_error)?;
+    if schema_version(&connection)? != LATEST_SCHEMA_VERSION {
+        return Err("plugin catalog schema changed during observation".to_owned());
+    }
+    let mut statement = connection
+        .prepare("SELECT substr(id,1,4097), substr(version,1,4097), substr(name,1,4097) FROM installed_plugins ORDER BY id LIMIT 10001")
+        .map_err(database_error)?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .map_err(database_error)?;
+    let mut result = Vec::new();
+    let mut bytes = 0_usize;
+    for row in rows {
+        let (id, version, name): (String, String, String) = row.map_err(database_error)?;
+        if [id.len(), version.len(), name.len()]
+            .iter()
+            .any(|size| *size > 4096)
+        {
+            return Err("plugin metadata exceeds the observation limit".to_owned());
+        }
+        bytes = bytes
+            .saturating_add(id.len())
+            .saturating_add(version.len())
+            .saturating_add(name.len());
+        if result.len() >= 10_000 || bytes > 1_048_576 {
+            return Err("plugin catalog exceeds the observation limit".to_owned());
+        }
+        result.push((id, version, name));
+    }
+    Ok(result)
+}
+
+pub(crate) fn observe_plugin_catalog_read_only(
+    path: &Path,
+) -> Result<Vec<crate::observation::PluginCatalogEntry>, String> {
+    let observation = observe_database_read_only(path);
+    if observation.status != ReadOnlyDatabaseStatus::Current {
+        return Err(observation.guidance);
+    }
+    let connection = open_observation_database(path)?;
+    connection
+        .busy_timeout(MAX_STORE_WAIT)
+        .map_err(database_error)?;
+    connection
+        .pragma_update(None, "query_only", "ON")
+        .map_err(database_error)?;
+    connection.execute_batch("BEGIN").map_err(database_error)?;
+    if schema_version(&connection)? != LATEST_SCHEMA_VERSION {
+        return Err("plugin catalog schema changed during observation".to_owned());
+    }
+    let pin_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM plugin_execution_pins LIMIT 100001)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    if pin_rows > 100_000 {
+        return Err("plugin execution pins exceed the observation limit".to_owned());
+    }
+    let mut statement = connection
+        .prepare(
+            "WITH pin_counts AS (
+                SELECT plugin_id, COUNT(*) AS active_count
+                FROM plugin_execution_pins GROUP BY plugin_id
+             )
+             SELECT substr(p.id,1,4097), substr(p.name,1,4097), substr(p.version,1,4097),
+                    p.enabled, substr(l.status,1,65), substr(l.failure_details,1,257),
+                    COALESCE(pin_counts.active_count, 0)
+             FROM installed_plugins p
+             LEFT JOIN plugin_lifecycle l ON l.plugin_id=p.id
+             LEFT JOIN pin_counts ON pin_counts.plugin_id=p.id
+             ORDER BY p.id LIMIT 10001",
+        )
+        .map_err(database_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(database_error)?;
+    let mut result = Vec::new();
+    let mut bytes = 0_usize;
+    for row in rows {
+        let (id, name, version, enabled, status, failure_details, active_executions) =
+            row.map_err(database_error)?;
+        let status = status.ok_or_else(|| "plugin lifecycle record is missing".to_owned())?;
+        if [id.len(), name.len(), version.len(), status.len()]
+            .iter()
+            .any(|size| *size > 4096)
+            || failure_details
+                .as_ref()
+                .is_some_and(|details| details.len() > 256)
+        {
+            return Err("plugin metadata exceeds the observation limit".to_owned());
+        }
+        if !matches!(
+            status.as_str(),
+            "active" | "pending removal" | "removal failed"
+        ) {
+            return Err("plugin catalog contains an unsupported lifecycle status".to_owned());
+        }
+        bytes = bytes
+            .saturating_add(id.len())
+            .saturating_add(name.len())
+            .saturating_add(version.len())
+            .saturating_add(status.len())
+            .saturating_add(failure_details.as_ref().map_or(0, String::len));
+        if result.len() >= 10_000 || bytes > 1_048_576 {
+            return Err("plugin catalog exceeds the observation limit".to_owned());
+        }
+        result.push(crate::observation::PluginCatalogEntry {
+            id,
+            name,
+            version,
+            enabled,
+            status,
+            failure_details,
+            active_executions: u64::try_from(active_executions)
+                .map_err(|_| "plugin catalog contains an invalid pin count".to_owned())?,
+        });
+    }
+    Ok(result)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6480,6 +6784,175 @@ mod tests {
         AuthScope, ProviderAuth, ProviderInvocation, ProviderProfileDiagnostic,
         ProviderProfileStatus, ProviderProfileUpsert, ProviderType, Store, WorkflowSourceUpdate,
     };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_snapshot_blocks_sqlite_writer_and_preserves_queryable_copy() {
+        let directory = std::env::temp_dir()
+            .join("opencode")
+            .join(format!("kakune-linux-snapshot-{}", uuid::Uuid::new_v4()));
+        drop(Store::open(directory.clone()).unwrap());
+        let path = directory.join("kakune.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.pragma_update(None, "journal_mode", "DELETE").unwrap();
+        drop(db);
+        let writer_path = path.clone();
+        let snapshot = super::open_linux_observation_database_with_hook(&path, move || {
+            let result = std::thread::spawn(move || {
+                let writer = rusqlite::Connection::open(writer_path)?;
+                writer.busy_timeout(std::time::Duration::ZERO)?;
+                writer.execute_batch("BEGIN EXCLUSIVE")
+            })
+            .join()
+            .unwrap();
+            assert!(
+                result.is_err(),
+                "SQLite writer must not acquire an exclusive lock during the copy"
+            );
+        })
+        .unwrap();
+        let version: i64 = snapshot
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 17);
+        assert!(!directory.join("kakune.sqlite3-wal").exists());
+        assert!(!directory.join("kakune.sqlite3-shm").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_isolated_snapshot_preserves_parent_sqlite_read_lock() {
+        const CHILD_MODE: &str = "KAKUNE_TEST_SNAPSHOT_CHILD";
+        const DATABASE: &str = "KAKUNE_TEST_SNAPSHOT_DATABASE";
+        if let Some(mode) = std::env::var_os(CHILD_MODE) {
+            let path = std::path::PathBuf::from(std::env::var_os(DATABASE).unwrap());
+            if mode == "snapshot" {
+                let snapshot =
+                    super::open_linux_observation_database_with_hook(&path, || {}).unwrap();
+                let version: i64 = snapshot
+                    .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(version, 17);
+            } else {
+                let db = rusqlite::Connection::open(path).unwrap();
+                db.busy_timeout(std::time::Duration::ZERO).unwrap();
+                assert!(
+                    db.execute_batch("BEGIN EXCLUSIVE").is_err(),
+                    "parent read lock was released"
+                );
+            }
+            return;
+        }
+        let directory = std::env::temp_dir()
+            .join("opencode")
+            .join(format!("kakune-isolated-snapshot-{}", uuid::Uuid::new_v4()));
+        drop(Store::open(directory.clone()).unwrap());
+        let path = directory.join("kakune.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.pragma_update(None, "journal_mode", "DELETE").unwrap();
+        db.execute_batch("BEGIN; SELECT COUNT(*) FROM workflows;")
+            .unwrap();
+        for mode in ["snapshot", "writer"] {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "store::tests::linux_isolated_snapshot_preserves_parent_sqlite_read_lock",
+                ])
+                .env(CHILD_MODE, mode)
+                .env(DATABASE, &path)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{mode}: {} {}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        db.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_snapshot_rejects_wal_mode_before_open_without_creating_sidecars() {
+        let directory = std::env::temp_dir()
+            .join("opencode")
+            .join(format!("kakune-linux-wal-{}", uuid::Uuid::new_v4()));
+        drop(Store::open(directory.clone()).unwrap());
+        let path = directory.join("kakune.sqlite3");
+        assert!(super::open_observation_database(&path).is_err());
+        assert!(!directory.join("kakune.sqlite3-wal").exists());
+        assert!(!directory.join("kakune.sqlite3-shm").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn observation_snapshot_blocks_mode_change_during_copy() {
+        let directory = std::env::temp_dir()
+            .join("opencode")
+            .join(format!("kakune-snapshot-{}", uuid::Uuid::new_v4()));
+        drop(Store::open(directory.clone()).unwrap());
+        let path = directory.join("kakune.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.pragma_update(None, "journal_mode", "DELETE").unwrap();
+        drop(db);
+        let writer_path = path.clone();
+        let snapshot = super::open_observation_database_with_hook(&path, move || {
+            let result = std::thread::spawn(move || {
+                let writer = rusqlite::Connection::open(writer_path)?;
+                writer.pragma_update(None, "journal_mode", "WAL")
+            })
+            .join()
+            .unwrap();
+            assert!(
+                result.is_err(),
+                "writer must not change mode while the snapshot is copied"
+            );
+        })
+        .unwrap();
+        assert!(!directory.join("kakune.sqlite3-wal").exists());
+        assert!(!directory.join("kakune.sqlite3-shm").exists());
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        let version: i64 = snapshot
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 17);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn observation_snapshot_rejects_wal_mode_changed_before_open() {
+        let directory = std::env::temp_dir()
+            .join("opencode")
+            .join(format!("kakune-snapshot-wal-{}", uuid::Uuid::new_v4()));
+        drop(Store::open(directory.clone()).unwrap());
+        let path = directory.join("kakune.sqlite3");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.pragma_update(None, "journal_mode", "DELETE").unwrap();
+        drop(db);
+        assert_eq!(
+            (fs::read(&path).unwrap()[18], fs::read(&path).unwrap()[19]),
+            (1, 1)
+        );
+        let writer = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let db = rusqlite::Connection::open(path).unwrap();
+                db.pragma_update(None, "journal_mode", "WAL").unwrap();
+            }
+        });
+        writer.join().unwrap();
+        assert!(super::open_observation_database(&path).is_err());
+        assert!(!directory.join("kakune.sqlite3-wal").exists());
+        assert!(!directory.join("kakune.sqlite3-shm").exists());
+    }
 
     #[test]
     fn persists_workflows_and_executions() {
