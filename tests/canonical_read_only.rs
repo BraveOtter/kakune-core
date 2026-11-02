@@ -319,8 +319,15 @@ fn plugin_list_under_exclusive_writer_lock_does_not_change_store() {
     drop(Store::open(data.clone()).unwrap());
     let db = Connection::open(data.join("kakune.sqlite3")).unwrap();
     db.pragma_update(None, "journal_mode", "DELETE").unwrap();
-    db.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    // Snapshot before acquiring SQLite's process-scoped POSIX locks: opening
+    // and closing the database here would release those locks on Unix.
     let before = FilesystemSnapshot::capture(&data).unwrap();
+    db.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let _: i64 = db
+        .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
     let start = std::time::Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_kakune"))
         .args(["plugin", "list", "--data-dir"])
@@ -329,7 +336,12 @@ fn plugin_list_under_exclusive_writer_lock_does_not_change_store() {
         .env("KAKUNE_TOKEN", "busy-writer-fake-secret")
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert!(
+        !output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(start.elapsed() < std::time::Duration::from_secs(12));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("busy-writer-fake-secret"));
     before.ensure_unchanged(&data).unwrap();

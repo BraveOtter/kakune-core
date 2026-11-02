@@ -189,7 +189,7 @@ async fn provider_test_verifies_tls_and_authentication_through_cli_and_core() {
             auth: kakune_core::ProviderAuth::ApiKeySecret {
                 secret_ref: "provider-key".into(),
             },
-            config: serde_json::json!({"baseUrl": format!("https://localhost:{port}")}),
+            config: serde_json::json!({"baseUrl": format!("https://127.0.0.1:{port}")}),
         })
         .unwrap();
     store
