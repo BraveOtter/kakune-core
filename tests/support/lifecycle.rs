@@ -36,7 +36,11 @@ fn approved_fixture_root() -> io::Result<PathBuf> {
     }
     #[cfg(not(windows))]
     {
-        Ok(std::env::temp_dir().join("opencode"))
+        // The temporary directory can sit behind a symbolic link, for example
+        // `/var` on macOS. The lifecycle protection rejects redirected
+        // ancestors, so the fixture resolves the real path before it writes.
+        let temporary = fs::canonicalize(std::env::temp_dir())?;
+        Ok(temporary.join("opencode"))
     }
 }
 
