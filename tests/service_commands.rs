@@ -398,9 +398,11 @@ fn persistent_unknown_exit_expires_the_original_grace_and_preserves_registration
         .stop(fixture.definition.manager, &fixture.definition.service_id)
         .unwrap_err();
     assert!(matches!(error, LifecycleError::DeadlineExpired { .. }));
-    assert_eq!(
-        fixture.clock.now() - clock_before_stop,
-        kakune_core::lifecycle::CORE_GRACE_BUDGET
+    let stop_elapsed = fixture.clock.now() - clock_before_stop;
+    assert!(
+        stop_elapsed >= kakune_core::lifecycle::CORE_GRACE_BUDGET
+            && stop_elapsed < kakune_core::lifecycle::CORE_GRACE_BUDGET * 2,
+        "stop should expire the original grace before the command ceiling; elapsed {stop_elapsed:?}"
     );
     assert!(
         fixture

@@ -218,8 +218,9 @@ async fn provider_test_verifies_tls_and_authentication_through_cli_and_core() {
     let result = invoke();
     assert!(
         result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&result.stderr),
+        String::from_utf8_lossy(&result.stdout),
     );
     let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(report["connectivity"]["status"], "passed");
