@@ -170,6 +170,7 @@ async fn provider_test_verifies_tls_and_authentication_through_cli_and_core() {
         .await
         .unwrap();
     });
+    // Apple platforms reject TLS server certificates valid for more than 825 days.
     let ca =
         reqwest::Certificate::from_pem(include_bytes!("fixtures/provider-test-ca.pem")).unwrap();
     // Verify the local TLS fixture without ambient proxy settings so a later
