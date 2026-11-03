@@ -112,7 +112,19 @@ fn native_registration_keeps_the_legacy_host_argv_and_fingerprint() {
     assert!(definition.equivalent_to(&restored));
 
     let rendered = render_service_definition(&restored).unwrap();
-    assert!(rendered.contains("service run"));
+    let host_arguments_are_rendered = match definition.manager {
+        ServiceManagerKind::MacosLaunchd => {
+            rendered.contains("<string>service</string>")
+                && rendered.contains("<string>run</string>")
+        }
+        ServiceManagerKind::LinuxSystemd | ServiceManagerKind::WindowsScm => {
+            rendered.contains("service run")
+        }
+    };
+    assert!(
+        host_arguments_are_rendered,
+        "rendered service definition omitted the legacy host arguments: {rendered}"
+    );
     assert!(rendered.contains("--data-dir"));
     let rendered_data_dir = match definition.manager {
         ServiceManagerKind::LinuxSystemd => data_dir.to_string_lossy().replace(' ', "\\x20"),

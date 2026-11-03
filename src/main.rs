@@ -5839,7 +5839,13 @@ mod tests {
         let invalid_access = run_initialization_with(paths.clone(), &unusable)
             .expect_err("a non-authorizing existing credential should fail");
         assert!(invalid_access.starts_with("initialization incomplete"));
-        assert!(invalid_access.contains("authorized administration channel"));
+        let safe_invalid_access = invalid_access
+            .replace(&original_secret, "[REDACTED]")
+            .replace("kakune_secret_bearing_fixture_value", "[REDACTED]");
+        assert!(
+            invalid_access.contains("authorized administration channel"),
+            "unexpected invalid-access diagnostic: {safe_invalid_access}"
+        );
         assert!(invalid_access.contains(paths.data_dir.to_string_lossy().as_ref()));
         assert!(invalid_access.contains(paths.config_file.to_string_lossy().as_ref()));
         assert!(invalid_access.contains(paths.context_file.to_string_lossy().as_ref()));
