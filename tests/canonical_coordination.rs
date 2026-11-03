@@ -272,7 +272,13 @@ fn busy_sqlite_rejects_removal_with_bounded_wait_and_no_partial_state() {
             .request_plugin_removal("example", &["protected"])
             .is_err()
     );
-    assert!(start.elapsed() < Duration::from_secs(8));
+    // Keep the five-second Store budget covered by unit tests, but allow
+    // additional wall-clock slack for heavily scheduled CI runners.
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(12),
+        "bounded SQLite wait exceeded its scheduling allowance: {elapsed:?}"
+    );
     blocker.execute_batch("ROLLBACK").unwrap();
     assert_eq!(
         store

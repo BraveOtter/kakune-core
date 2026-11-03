@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use kakune_core::lifecycle::service::{ServiceDefinition, render_service_definition};
+use kakune_core::lifecycle::service::{
+    ServiceDefinition, ServiceManagerKind, render_service_definition,
+};
 use serde_json::Value;
 
 fn fixture_dir() -> PathBuf {
@@ -112,7 +114,16 @@ fn native_registration_keeps_the_legacy_host_argv_and_fingerprint() {
     let rendered = render_service_definition(&restored).unwrap();
     assert!(rendered.contains("service run"));
     assert!(rendered.contains("--data-dir"));
-    assert!(rendered.contains(&data_dir.to_string_lossy().to_string()));
+    let rendered_data_dir = match definition.manager {
+        ServiceManagerKind::LinuxSystemd => data_dir.to_string_lossy().replace(' ', "\\x20"),
+        ServiceManagerKind::WindowsScm | ServiceManagerKind::MacosLaunchd => {
+            data_dir.to_string_lossy().into_owned()
+        }
+    };
+    assert!(
+        rendered.contains(&rendered_data_dir),
+        "rendered service definition omitted the encoded data path: {rendered}"
+    );
 
     let mut changed = restored.clone();
     changed.arguments[1] = "start".to_owned();
