@@ -164,7 +164,15 @@ fn live_wal_is_reported_unavailable_without_touching_auxiliary_files() {
         FilesystemSnapshot::capture(&data_dir).expect("live-WAL fixture should be snapshot-able");
     let result = observation::observe_database(&database);
     assert_eq!(result.status, ObservationStatus::Unavailable);
-    assert!(result.guidance.contains("WAL"));
+    assert!(
+        if cfg!(windows) {
+            result.guidance.contains("WAL")
+        } else {
+            result.guidance.contains("safe local database snapshot")
+        },
+        "unexpected unavailable guidance: {}",
+        result.guidance
+    );
     before
         .ensure_unchanged(&data_dir)
         .expect("observer must not read or mutate live WAL sidecars");
@@ -1008,7 +1016,11 @@ fn doctor_filesystem_and_credential_observations_leave_schema_matrix_unchanged()
             )
             .expect("valid config fixture should be written");
             if case == "corrupt" {
-                fs::write(&database, b"not a SQLite database").unwrap();
+                let connection = Connection::open(&database).unwrap();
+                connection
+                    .execute("CREATE TABLE unrelated (id INTEGER)", [])
+                    .unwrap();
+                drop(connection);
             } else {
                 drop(Store::open(data_dir.clone()).expect("fixture database should initialize"));
                 if case == "wal" {

@@ -172,6 +172,26 @@ async fn provider_test_verifies_tls_and_authentication_through_cli_and_core() {
     });
     let ca =
         reqwest::Certificate::from_pem(include_bytes!("fixtures/provider-test-ca.pem")).unwrap();
+    // Verify the local TLS fixture without ambient proxy settings so a later
+    // CLI failure can distinguish endpoint setup from proxy routing.
+    let direct_tls_response = Client::builder()
+        .no_proxy()
+        .add_root_certificate(ca.clone())
+        .build()
+        .unwrap()
+        .post(format!("https://127.0.0.1:{port}/v1/messages"))
+        .bearer_auth("fake-provider-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&serde_json::json!({
+            "model": "fixture-model",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "Hi"}]
+        }))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("direct loopback TLS control failed: {error:?}"));
+    let direct_tls_status = direct_tls_response.status();
+    assert_eq!(direct_tls_status, StatusCode::OK);
     let store = Store::open_with_secret_backend(
         fixture.path("provider-success"),
         SecretBackendKind::Native,
@@ -218,7 +238,7 @@ async fn provider_test_verifies_tls_and_authentication_through_cli_and_core() {
     let result = invoke();
     assert!(
         result.status.success(),
-        "stderr: {}\nstdout: {}",
+        "stderr: {}\nstdout: {}\nloopback TLS control status: {direct_tls_status}",
         String::from_utf8_lossy(&result.stderr),
         String::from_utf8_lossy(&result.stdout),
     );
