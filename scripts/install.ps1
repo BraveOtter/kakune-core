@@ -46,6 +46,7 @@ if ($Version -eq "latest") {
 
 $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("kakune-install-" + [guid]::NewGuid().ToString("N"))
 $stagedBinary = $null
+$backupBinary = $null
 $serviceStopped = $false
 New-Item -ItemType Directory -Force -Path $temporaryDirectory | Out-Null
 
@@ -127,10 +128,13 @@ try {
 
     if (Test-Path -LiteralPath $binaryPath) {
       try {
-        [System.IO.File]::Replace($stagedBinary, $binaryPath, $null)
+        $backupBinary = Join-Path $InstallDir ("kakune.exe.backup-" + [guid]::NewGuid().ToString("N"))
+        [System.IO.File]::Replace($stagedBinary, $binaryPath, $backupBinary)
       } catch {
         throw "Could not replace '$binaryPath'. Stop any foreground Kakune process and retry. $($_.Exception.Message)"
       }
+      Remove-Item -LiteralPath $backupBinary -Force -ErrorAction SilentlyContinue
+      $backupBinary = $null
     } else {
       [System.IO.File]::Move($stagedBinary, $binaryPath)
     }
@@ -176,6 +180,9 @@ try {
 } finally {
   if ($stagedBinary -and (Test-Path -LiteralPath $stagedBinary)) {
     Remove-Item -LiteralPath $stagedBinary -Force -ErrorAction SilentlyContinue
+  }
+  if ($backupBinary -and (Test-Path -LiteralPath $backupBinary)) {
+    Remove-Item -LiteralPath $backupBinary -Force -ErrorAction SilentlyContinue
   }
   Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force -ErrorAction SilentlyContinue
 }
